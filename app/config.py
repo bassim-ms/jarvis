@@ -1,0 +1,24 @@
+"""
+Central configuration for Jarvis.
+
+All settings are read from environment variables (or a local .env file).
+Nothing sensitive is hard-coded here — see .env.example for the list of
+variables Jarvis understands.
+"""
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    # Basic app info
+    app_name: str = "Jarvis"
+    environment: str = "development"  # development | production
+
+    # Server
+    host: str = "0.0.0.0"
+    port: int = 8000
+
+    model_config = SettingsConfigDict(env_file=".env", env_prefix="JARVIS_")
+
+
+settings = Settings()
