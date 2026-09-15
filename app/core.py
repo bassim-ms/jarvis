@@ -11,6 +11,7 @@ from app.memory.base import MemoryStore, Message
 from app.memory.sqlite_store import SQLiteMemoryStore
 from app.providers.base import AIProvider
 from app.providers.gemini import GeminiProvider
+from app.tools.registry import ToolRegistry
 
 
 class ConversationNotFoundError(RuntimeError):
@@ -25,9 +26,14 @@ class JarvisCore:
         self,
         provider: AIProvider | None = None,
         memory: MemoryStore | None = None,
+        tools: ToolRegistry | None = None,
     ):
         self.provider = provider or GeminiProvider()
         self.memory = memory or SQLiteMemoryStore(settings.memory_db_path)
+        # Empty by default - no real tools exist yet (M5 is architecture
+        # only). AI tool-calling isn't wired up here either; Core just has
+        # a place to reach the registry without knowing any tool's type.
+        self.tools = tools or ToolRegistry()
 
     def handle_chat(
         self, message: str, conversation_id: str | None = None
