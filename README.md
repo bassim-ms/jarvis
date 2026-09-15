@@ -1,10 +1,12 @@
 # Jarvis
 
-Personal AI assistant project. This is **Milestone 5: Tool System +
-Permissions** — Jarvis Core, conversation memory, and Gemini integration
-now sit alongside a Tool Registry and permission model that future tools
-(web, email, calendar, smart home, robotics, etc.) will plug into. No real
-tools, AI tool-calling, dashboard, agents, voice, or hardware control yet.
+Personal AI assistant project. This is **Milestone 6.1: Web Search
+Foundation** — the first real tool, `web_search`, is registered behind the
+Tool Registry and permission model from Milestone 5. It's backed by a
+provider-independent `SearchProvider` interface, with SearXNG as the first
+implementation (Brave, Tavily, etc. can be added later without touching the
+tool or Jarvis Core). No AI tool-calling, dashboard, agents, voice, or
+hardware control yet.
 
 ## Stack
 
@@ -13,8 +15,9 @@ tools, AI tool-calling, dashboard, agents, voice, or hardware control yet.
   machine.
 - **pydantic-settings** for configuration — reads settings from environment
   variables / a `.env` file, so no secrets are ever hard-coded.
-- **httpx** talks directly to the Gemini REST API — no extra AI SDK needed
-  for a single HTTP call.
+- **httpx** talks directly to the Gemini REST API and to a SearXNG
+  instance's JSON search API — no extra AI or search SDK needed for a
+  single HTTP call.
 - **pytest** for tests.
 
 ## Setup
@@ -40,7 +43,9 @@ Run these from inside the `jarvis` folder.
    ```
    Then open `.env` and set `JARVIS_GEMINI_API_KEY` to your key from
    https://aistudio.google.com/apikey (`.env` is git-ignored and never
-   committed).
+   committed). To use the `web_search` tool, also set `JARVIS_SEARXNG_URL`
+   to the base URL of a SearXNG instance you run or trust (see
+   [Web Search](#web-search) below).
 
 ## Run the server
 
@@ -78,11 +83,12 @@ pytest
 
 Expected output ends with something like:
 ```
-8 passed in 0.XXs
+64 passed in 0.XXs
 ```
 
-Tests never call the real Gemini API — `ask_gemini` / `httpx.post` are
-monkeypatched, so they run without a network connection or a real API key.
+Tests never call the real Gemini or SearXNG APIs — `httpx.post` / `httpx.get`
+are monkeypatched, so they run without a network connection or real
+credentials.
 
 ## Folder structure
 
@@ -102,6 +108,11 @@ jarvis/
     tools/
       base.py           - Tool interface, PermissionLevel, ToolResult, ToolRequirements
       registry.py       - ToolRegistry: register/lookup/list/execute, permission enforcement
+      web_search.py      - WebSearchTool: adapts a SearchProvider into the Tool interface
+      defaults.py        - register_default_tools: wires the app's default tools (web_search) into a registry
+    search/
+      base.py           - SearchProvider interface and the SearchResult type
+      searxng.py         - SearXNG implementation of SearchProvider
   tests/
     test_health.py         - proves the server starts and /health works
     test_chat.py            - proves /chat works, with Jarvis Core mocked out
@@ -109,6 +120,9 @@ jarvis/
     test_gemini_provider.py - unit tests for the Gemini provider, with HTTP mocked out
     test_memory.py          - unit tests for the SQLite memory store
     test_tools.py           - unit tests for the Tool Registry and permission model
+    test_searxng_provider.py - unit tests for the SearXNG provider, with HTTP mocked out
+    test_web_search_tool.py  - unit tests for WebSearchTool, through the Tool Registry
+    test_default_tools.py    - proves web_search is in the default/application tool registry
   requirements.txt    - exact dependency versions
   .env.example         - template for your local .env (never commit .env itself)
   .gitignore
@@ -147,10 +161,14 @@ architecture in `app/tools/`:
 - **`ToolResult`** is a typed result, not a string: `status` is one of
   `SUCCESS`, `ERROR`, `DENIED`, or `CONFIRMATION_REQUIRED`, plus `data`,
   `message`, and (when relevant) `permission`.
-- `JarvisCore` holds a `ToolRegistry` (`core.tools`), empty by default, so
-  it has a place to reach tools without importing or knowing about any of
-  them. AI tool-calling (letting Gemini decide which tool to invoke) is
-  not wired up yet - that's a later milestone.
+- `JarvisCore` holds a `ToolRegistry` (`core.tools`). `JarvisCore()` on its
+  own always starts with an *empty* registry - the class has no idea which
+  tools exist, SearXNG included. The application populates it: `app/main.py`
+  calls `register_default_tools(core.tools)` (`app/tools/defaults.py`) at
+  startup, so the actual running app's registry ends up with `web_search`
+  even though `JarvisCore`'s own default stays empty. AI tool-calling
+  (letting Gemini decide which tool to invoke) is not wired up yet - that's
+  a later milestone.
 
 ### Adding a new tool
 
@@ -159,8 +177,39 @@ architecture in `app/tools/`:
    `description`, `permission`, optionally `parameters`/`requirements`,
    and `execute`.
 2. Register an instance with a registry: `registry.register(MyTool())`.
+   To make it part of the application's default set, register it in
+   `app/tools/defaults.py::register_default_tools` instead.
 3. That's it - no changes needed to `app/tools/base.py`,
    `app/tools/registry.py`, or `app/core.py`.
+
+## Web Search
+
+`web_search` is the first real tool, implementing the pattern above. It
+follows the same "interface + swappable backend" shape as `AIProvider` /
+`GeminiProvider`:
+
+- **`SearchProvider`** (`app/search/base.py`) is the interface a search
+  backend implements: `search(query, max_results) -> list[SearchResult]`.
+  `SearchResult` is a standardized `title` / `url` / `snippet` triple, the
+  same regardless of which backend produced it.
+- **`SearXNGProvider`** (`app/search/searxng.py`) is the first
+  implementation, calling a SearXNG instance's JSON search API
+  (`GET {JARVIS_SEARXNG_URL}/search?q=...&format=json`) over `httpx`.
+  Network errors and unexpected response shapes both raise `SearXNGError`
+  (a `SearchProviderError`), never a bare exception.
+- **`WebSearchTool`** (`app/tools/web_search.py`) implements `Tool`,
+  taking a `SearchProvider` in its constructor (defaulting to
+  `SearXNGProvider`). It has `permission = PermissionLevel.READ`, so the
+  Registry runs it immediately with no confirmation step. `execute` turns
+  a `SearchProviderError` into a `ToolResult.error(...)` rather than
+  letting it propagate.
+- Neither `WebSearchTool` nor `JarvisCore` import anything SearXNG-specific
+  - swapping in a future `BraveProvider` or `TavilyProvider` only means
+    constructing `WebSearchTool(provider=BraveProvider())` instead.
+
+Configuration: set `JARVIS_SEARXNG_URL` to the base URL of a SearXNG
+instance (self-hosted or a trusted public one) - see `.env.example`. There
+is no default URL and no key is hard-coded anywhere in the code.
 
 ## Postponed decisions (on purpose)
 
@@ -170,8 +219,11 @@ These were not decided now, to avoid overbuilding before they're needed:
 - Conversation memory / multi-turn context — not in this milestone; `/chat`
   is stateless, one message in, one reply out.
 - Dashboard framework — decided when we build the actual dashboard.
-- AI tool-calling (an AI provider choosing which tool to invoke) and real
-  tool implementations — the Tool System is architecture only for now;
-  actual tools get added once this milestone's foundation is in place.
+- AI tool-calling (an AI provider choosing which tool to invoke) — Gemini
+  doesn't decide when to call `web_search` yet; tools are invoked directly
+  through the Registry for now.
+- Additional search providers (Brave, Tavily), fallback between providers,
+  result caching, search modes, and autonomous research/agents — left for
+  later milestones now that `SearchProvider` gives them a place to plug in.
 - Remote access / security design — deferred until that milestone, since it
   needs deliberate design rather than a quick default.

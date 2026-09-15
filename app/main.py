@@ -14,8 +14,14 @@ from pydantic import BaseModel
 from app.config import settings
 from app.core import ConversationNotFoundError, core
 from app.providers.base import ProviderError
+from app.tools.defaults import register_default_tools
 
 app = FastAPI(title=settings.app_name)
+
+# Application-level wiring: populate the running app's tool registry with
+# Jarvis's default tools. JarvisCore's own default (when no registry is
+# injected) stays empty - see app/tools/defaults.py.
+register_default_tools(core.tools)
 
 
 @app.get("/health")

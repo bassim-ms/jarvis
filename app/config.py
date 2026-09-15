@@ -25,6 +25,9 @@ class Settings(BaseSettings):
     # Memory (local SQLite persistence for conversations and user facts)
     memory_db_path: str = "jarvis_memory.db"
 
+    # SearXNG (web search provider) - base URL of a running SearXNG instance
+    searxng_url: str = ""
+
     model_config = SettingsConfigDict(env_file=".env", env_prefix="JARVIS_")
 
 

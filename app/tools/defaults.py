@@ -1,0 +1,30 @@
+"""
+Default tool registration for the running application.
+
+This is the one place that knows the concrete set of tools Jarvis ships
+with by default (currently just `web_search`). It exists so the actual
+application (app/main.py) can get a fully-populated ToolRegistry, while
+JarvisCore itself (app/core.py) stays unaware of any specific tool - its
+own default, when no registry is injected, stays an empty ToolRegistry
+(see test_tools.py::test_core_exposes_a_tool_registry_by_default).
+"""
+
+from app.tools.registry import ToolRegistry
+from app.tools.web_search import WebSearchTool
+
+
+def register_default_tools(registry: ToolRegistry) -> None:
+    """Register every tool Jarvis ships with by default onto `registry`.
+
+    Takes a registry rather than owning one, so callers - the application
+    singleton, tests, or a future dashboard - decide what registry gets
+    the defaults, instead of this module hardcoding where they end up.
+    """
+    registry.register(WebSearchTool())
+
+
+def create_default_registry() -> ToolRegistry:
+    """Build a fresh ToolRegistry populated with the default tools."""
+    registry = ToolRegistry()
+    register_default_tools(registry)
+    return registry
