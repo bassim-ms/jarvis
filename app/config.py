@@ -22,6 +22,9 @@ class Settings(BaseSettings):
     gemini_api_key: str = ""
     gemini_model: str = "gemini-3.8-flash"
 
+    # Memory (local SQLite persistence for conversations and user facts)
+    memory_db_path: str = "jarvis_memory.db"
+
     model_config = SettingsConfigDict(env_file=".env", env_prefix="JARVIS_")
 
 

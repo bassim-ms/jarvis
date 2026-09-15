@@ -3,15 +3,16 @@ Jarvis - entry point.
 
 FastAPI server with a health check endpoint and a /chat endpoint backed by
 Jarvis Core, which routes to an AI provider (Gemini for now) through the
-AIProvider interface. No dashboard, memory, agents, voice, or hardware
-control yet - those come in later milestones.
+AIProvider interface, and persists conversation history and user facts
+through a MemoryStore. No dashboard, agents, voice, or hardware control yet
+- those come in later milestones.
 """
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from app.config import settings
-from app.core import core
+from app.core import ConversationNotFoundError, core
 from app.providers.base import ProviderError
 
 app = FastAPI(title=settings.app_name)
@@ -29,17 +30,27 @@ def health_check() -> dict:
 
 class ChatRequest(BaseModel):
     message: str
+    conversation_id: str | None = None
 
 
 class ChatResponse(BaseModel):
     reply: str
+    conversation_id: str
 
 
 @app.post("/chat", response_model=ChatResponse)
 def chat(request: ChatRequest) -> ChatResponse:
-    """Send a user message to Jarvis Core and return its reply."""
+    """Send a user message to Jarvis Core and return its reply.
+
+    Omit conversation_id to start a new conversation; pass back the
+    conversation_id from a previous response to continue it with history.
+    """
     try:
-        reply = core.handle_chat(request.message)
+        reply, conversation_id = core.handle_chat(
+            request.message, request.conversation_id
+        )
+    except ConversationNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
     except ProviderError as exc:
         raise HTTPException(status_code=502, detail=str(exc))
-    return ChatResponse(reply=reply)
+    return ChatResponse(reply=reply, conversation_id=conversation_id)
