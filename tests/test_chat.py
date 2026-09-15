@@ -1,17 +1,18 @@
 """
-Tests for POST /chat. Gemini is monkeypatched, so no real API call is made.
+Tests for POST /chat. Jarvis Core's provider is monkeypatched, so no real
+API call is made.
 """
 
 from fastapi.testclient import TestClient
 
 from app import main
-from app.ai_service import GeminiError
+from app.providers.base import ProviderError
 
 client = TestClient(main.app)
 
 
-def test_chat_returns_gemini_reply(monkeypatch):
-    monkeypatch.setattr(main, "ask_gemini", lambda message: f"echo: {message}")
+def test_chat_returns_provider_reply(monkeypatch):
+    monkeypatch.setattr(main.core, "handle_chat", lambda message: f"echo: {message}")
 
     response = client.post("/chat", json={"message": "hello"})
 
@@ -19,11 +20,11 @@ def test_chat_returns_gemini_reply(monkeypatch):
     assert response.json() == {"reply": "echo: hello"}
 
 
-def test_chat_returns_502_when_gemini_fails(monkeypatch):
+def test_chat_returns_502_when_provider_fails(monkeypatch):
     def raise_error(message):
-        raise GeminiError("boom")
+        raise ProviderError("boom")
 
-    monkeypatch.setattr(main, "ask_gemini", raise_error)
+    monkeypatch.setattr(main.core, "handle_chat", raise_error)
 
     response = client.post("/chat", json={"message": "hello"})
 

@@ -88,14 +88,18 @@ monkeypatched, so they run without a network connection or a real API key.
 ```
 jarvis/
   app/
-    __init__.py     - marks app/ as a Python package
-    main.py          - the FastAPI app, /health and /chat endpoints
-    config.py        - all configuration, read from environment variables
-    ai_service.py    - minimal Gemini API client (ask_gemini)
+    __init__.py       - marks app/ as a Python package
+    main.py            - the FastAPI app, /health and /chat endpoints
+    config.py          - all configuration, read from environment variables
+    core.py            - Jarvis Core: orchestrates a chat request via an AIProvider
+    providers/
+      base.py           - AIProvider interface, so Core doesn't depend on any vendor
+      gemini.py         - Gemini implementation of AIProvider
   tests/
-    test_health.py     - proves the server starts and /health works
-    test_chat.py        - proves /chat works, with Gemini mocked out
-    test_ai_service.py  - unit tests for the Gemini client, with HTTP mocked out
+    test_health.py         - proves the server starts and /health works
+    test_chat.py            - proves /chat works, with Jarvis Core mocked out
+    test_core.py            - unit tests for Jarvis Core's provider delegation
+    test_gemini_provider.py - unit tests for the Gemini provider, with HTTP mocked out
   requirements.txt    - exact dependency versions
   .env.example         - template for your local .env (never commit .env itself)
   .gitignore

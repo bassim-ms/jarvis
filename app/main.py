@@ -2,15 +2,17 @@
 Jarvis - entry point.
 
 FastAPI server with a health check endpoint and a /chat endpoint backed by
-Gemini. No dashboard, memory, agents, voice, or hardware control yet -
-those come in later milestones.
+Jarvis Core, which routes to an AI provider (Gemini for now) through the
+AIProvider interface. No dashboard, memory, agents, voice, or hardware
+control yet - those come in later milestones.
 """
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-from app.ai_service import GeminiError, ask_gemini
 from app.config import settings
+from app.core import core
+from app.providers.base import ProviderError
 
 app = FastAPI(title=settings.app_name)
 
@@ -35,9 +37,9 @@ class ChatResponse(BaseModel):
 
 @app.post("/chat", response_model=ChatResponse)
 def chat(request: ChatRequest) -> ChatResponse:
-    """Send a user message to Gemini and return its reply."""
+    """Send a user message to Jarvis Core and return its reply."""
     try:
-        reply = ask_gemini(request.message)
-    except GeminiError as exc:
+        reply = core.handle_chat(request.message)
+    except ProviderError as exc:
         raise HTTPException(status_code=502, detail=str(exc))
     return ChatResponse(reply=reply)
