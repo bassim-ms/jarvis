@@ -145,12 +145,13 @@ def test_web_search_tool_falls_back_through_the_manager():
     result = tool.execute(query="python")
 
     assert result.status == ToolResultStatus.SUCCESS
-    assert result.data == [
+    assert result.data["results"] == [
         {
             "title": "Python",
             "url": "https://python.org",
             "snippet": "lang",
             "source": "",
+            "query": "",
         }
     ]
     assert first.calls == 1

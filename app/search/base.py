@@ -27,12 +27,19 @@ class SearchResult:
     original, unmodified, user-clickable link - normalization for
     deduplication purposes (see app/search/url_utils.py) never touches
     this field, only a separate comparison key.
+
+    `query` is the exact planned query (see app/search/planner.py) that
+    produced this result - stamped on by the concrete provider that
+    created it (e.g. SearXNGProvider), then carried unchanged through
+    every wrapping layer (fallback, caching, dedup) above it. It defaults
+    to "" for the same backward-compatibility reason as `source`.
     """
 
     title: str
     url: str
     snippet: str
     source: str = ""
+    query: str = ""
 
 
 class SearchProvider(ABC):

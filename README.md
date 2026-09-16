@@ -1,15 +1,15 @@
 # Jarvis
 
-Personal AI assistant project. This is **Milestone 6.6: Search Planning** —
-`RESEARCH`/`CRITICAL` modes no longer search the exact same query multiple
-times. A deterministic `SearchPlanner` now decides *which* distinct queries
-`web_search` runs for a mode (e.g. adding the current year, or "student"/
-"official" suffixes), all still fixed and non-AI; results from every
-planned query are combined through the existing M6.5 deduplication before
-the final limit is applied. No AI-based search routing, autonomous
-research, dashboard, agents, voice, or hardware control yet - see
-[Web Search](#web-search) for the general knowledge vs. web search
-distinction and what modes/planning/result quality actually do.
+Personal AI assistant project. This is **Milestone 6.7: Search Context +
+Provenance** — every `SearchResult` now records the exact planned query
+that produced it, and a successful `web_search` call returns structured
+search context (`query`, resolved `mode`, `queries_used`, and `results`,
+each still carrying its own `query`) instead of a flat result list. This
+is only data preparation - no answer-generation layer reads it yet. No
+AI-based search routing, autonomous research, citations UI, dashboard,
+agents, voice, or hardware control yet - see [Web Search](#web-search) for
+the general knowledge vs. web search distinction and what
+modes/planning/result quality/provenance actually do.
 
 ## Stack
 
@@ -89,7 +89,7 @@ pytest
 
 Expected output ends with something like:
 ```
-158 passed in 0.XXs
+177 passed in 0.XXs
 ```
 
 Tests never call the real Gemini or SearXNG APIs — `httpx.post` / `httpx.get`
@@ -129,6 +129,7 @@ jarvis/
       planner.py            - SearchPlan/SearchPlanner/DeterministicSearchPlanner: which queries to run
       url_utils.py          - normalize_url: conservative comparison-key normalization
       quality.py            - deduplicate_results/ResultQualityProvider: URL-based dedup
+      response.py            - SearchResponse: structured query/mode/queries_used/results context
       factory.py          - builds the default SearchProvider/SearchCache from config
   tests/
     test_health.py         - proves the server starts and /health works
@@ -147,6 +148,7 @@ jarvis/
     test_search_modes.py     - unit tests for SearchMode limits and fallback/caching under a mode
     test_search_quality.py   - unit tests for URL normalization, deduplication, and limit-after-dedup
     test_search_planner.py   - unit tests for DeterministicSearchPlanner's per-mode query plans
+    test_search_response.py  - unit tests for SearchResponse and provenance through the whole chain
   requirements.txt    - exact dependency versions
   .env.example         - template for your local .env (never commit .env itself)
   .gitignore
@@ -224,7 +226,9 @@ into; it just searches whatever query it's given.
 - **`SearchProvider`** (`app/search/base.py`) is the interface a search
   backend implements: `search(query, max_results) -> list[SearchResult]`.
   `SearchResult` is a standardized `title` / `url` / `snippet` triple, the
-  same regardless of which backend produced it.
+  same regardless of which backend produced it, plus `source` and `query`
+  metadata (see Search Result Quality and Search Context + Provenance
+  below).
 - **`SearXNGProvider`** (`app/search/searxng.py`) is the first
   implementation, calling a SearXNG instance's JSON search API
   (`GET {JARVIS_SEARXNG_URL}/search?q=...&format=json`) over `httpx`.
@@ -388,6 +392,44 @@ milestone only makes sure the data is there for it.
   pass (see Search Modes above) before applying the result limit, so
   limits are always applied **after** deduplication, not before.
 
+### Search Context + Provenance (M6.7)
+
+A successful `web_search` no longer returns a flat list of results - it
+returns structured search context, so a future answer-generation layer can
+tell not just *what* came back but *which query found it* and *under what
+mode*. Nothing reads this yet; M6.7 only prepares the data.
+
+- **`SearchResult.query`** (`app/search/base.py`) records the exact
+  planned query that produced that specific result - stamped on by the
+  concrete provider that created it (`SearXNGProvider` sets it to the
+  query it was actually asked), then carried unchanged through every
+  wrapping layer above it (`ResultQualityProvider`, `CachedSearchProvider`,
+  `SearchProviderManager`) since none of them construct new `SearchResult`
+  objects, only filter/cache/forward the ones they're given.
+  `SQLiteSearchCache` serializes/deserializes it like every other field,
+  so it survives cache round-trips too.
+- **`SearchResponse`** (`app/search/response.py`) is a small, provider-
+  agnostic dataclass - `query` (the original user query), `mode` (the
+  resolved `SearchMode`), `queries_used` (every query the `SearchPlanner`
+  actually ran), and `results` (the final deduplicated, limit-applied
+  list). It has no Gemini or provider logic of its own.
+- `WebSearchTool.execute` builds one `SearchResponse` per call and puts a
+  plain-dict rendering of it in the successful `ToolResult.data`:
+  `{"query", "mode", "queries_used", "results"}`, where each entry in
+  `results` is `{"title", "url", "snippet", "source", "query"}`. This is
+  the one place the domain object is flattened to JSON-friendly types
+  (`mode` becomes its string value) - `ToolResult` itself is untouched.
+- Deduplication already kept the first occurrence's object completely
+  unchanged (see Search Result Quality above), so provenance falls out of
+  that for free: if the same URL is found by two different planned
+  queries, the kept result's `query` is whichever query found it *first*.
+- None of this required changing `SearchProviderManager`,
+  `CachedSearchProvider`, `ResultQualityProvider`, `SearchPlanner`, or
+  `JarvisCore` - provenance flows through the existing chain because
+  every layer already just passes `SearchResult` objects through
+  unmodified; only the source (`SearXNGProvider`) and the final assembly
+  point (`WebSearchTool`) needed to change.
+
 Configuration:
 - `JARVIS_SEARXNG_URL` - base URL of a SearXNG instance (self-hosted or a
   trusted public one). No default URL and no key is hard-coded anywhere.
@@ -420,9 +462,12 @@ These were not decided now, to avoid overbuilding before they're needed:
   later milestones now that `SearchProvider`, `SearchProviderManager`, and
   `CachedSearchProvider` give them a place to plug in.
 - Result ranking, source credibility scoring, and any source-button/link
-  UI — `ResultQualityProvider` only deduplicates by URL today; the `source`
-  metadata is preserved for a future presentation layer, but no UI renders
-  it yet.
+  UI — `ResultQualityProvider` only deduplicates by URL today; the
+  `source`/`query` metadata is preserved for a future presentation layer,
+  but no UI renders it yet.
+- A grounded-answer layer that reads `SearchResponse`/provenance to write
+  a cited reply — M6.7 only makes the structured data available; nothing
+  consumes it yet.
 - Cache eviction/cleanup of expired rows, background cache refresh, cache
   warming, and semantic/embedding-based cache lookups — `SearchCache` is a
   plain TTL key/value store for now; expired rows are treated as misses but

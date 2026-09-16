@@ -73,6 +73,22 @@ def test_source_metadata_survives_a_round_trip():
     assert cache.get("python::5")[0].source == "searxng"
 
 
+def test_query_provenance_survives_a_round_trip():
+    cache = SQLiteSearchCache(db_path=":memory:")
+    result = SearchResult(
+        title="Python",
+        url="https://python.org",
+        snippet="lang",
+        source="searxng",
+        query="python 2026",
+    )
+
+    cache.set("python 2026::5", [result])
+
+    assert cache.get("python 2026::5") == [result]
+    assert cache.get("python 2026::5")[0].query == "python 2026"
+
+
 def test_cache_persists_across_instances_pointed_at_the_same_file(tmp_path):
     db_path = str(tmp_path / "cache.db")
 

@@ -16,12 +16,20 @@ Results from every planned query are deduplicated by normalized URL (see
 app/search/quality.py) before the final result limit is applied, so a
 multi-query mode's limit reflects unique results, not raw duplicate-laden
 ones.
+
+The successful ToolResult's `data` carries structured search context (see
+app/search/response.py): the original query, resolved mode, every query
+actually planned/run, and the final results - each still tagged with the
+specific planned query that produced it (provenance stamped by the
+concrete provider, e.g. SearXNGProvider, and preserved unchanged by every
+layer above it).
 """
 
 from app.search.base import SearchProvider, SearchProviderError, SearchResult
 from app.search.modes import SEARCH_MODE_CONFIGS, SearchMode
 from app.search.planner import DeterministicSearchPlanner, SearchPlanner
 from app.search.quality import deduplicate_results
+from app.search.response import SearchResponse
 from app.search.searxng import SearXNGProvider
 from app.tools.base import (
     PermissionLevel,
@@ -100,15 +108,30 @@ class WebSearchTool(Tool):
         # Deduplicate across every planned query before applying the final
         # limit, so duplicates (within one query's results, or repeated
         # across queries) never squeeze out otherwise-unique results.
+        # deduplicate_results keeps the first occurrence untouched, so the
+        # kept result's own `query` field - its provenance - survives too.
         combined = deduplicate_results(results)[:limit]
 
-        data = [
-            {
-                "title": r.title,
-                "url": r.url,
-                "snippet": r.snippet,
-                "source": r.source,
-            }
-            for r in combined
-        ]
+        response = SearchResponse(
+            query=query,
+            mode=mode,
+            queries_used=plan.queries,
+            results=combined,
+        )
+
+        data = {
+            "query": response.query,
+            "mode": response.mode.value,
+            "queries_used": response.queries_used,
+            "results": [
+                {
+                    "title": r.title,
+                    "url": r.url,
+                    "snippet": r.snippet,
+                    "source": r.source,
+                    "query": r.query,
+                }
+                for r in response.results
+            ],
+        }
         return ToolResult.success(data=data)

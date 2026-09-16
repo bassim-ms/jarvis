@@ -282,7 +282,13 @@ def test_web_search_tool_applies_limit_after_dedup_not_before():
     result = tool.execute(query="python", max_results=5)
 
     assert result.status == ToolResultStatus.SUCCESS
-    assert [item["title"] for item in result.data] == ["A", "B", "C", "D", "E"]
+    assert [item["title"] for item in result.data["results"]] == [
+        "A",
+        "B",
+        "C",
+        "D",
+        "E",
+    ]
 
 
 def test_web_search_tool_combines_and_dedupes_multiple_planned_queries():
@@ -298,7 +304,7 @@ def test_web_search_tool_combines_and_dedupes_multiple_planned_queries():
     result = tool.execute(query="python", mode="research", max_results=10)
 
     assert result.status == ToolResultStatus.SUCCESS
-    assert [item["title"] for item in result.data] == [
+    assert [item["title"] for item in result.data["results"]] == [
         "A",
         "B",
         "C",
@@ -321,7 +327,7 @@ def test_web_search_tool_final_limit_truncates_the_deduped_combined_list():
 
     result = tool.execute(query="python", mode="research", max_results=3)
 
-    assert [item["title"] for item in result.data] == ["A", "B", "C"]
+    assert [item["title"] for item in result.data["results"]] == ["A", "B", "C"]
 
 
 def test_web_search_tool_on_empty_results_stays_empty():
@@ -331,7 +337,7 @@ def test_web_search_tool_on_empty_results_stays_empty():
     result = tool.execute(query="python")
 
     assert result.status == ToolResultStatus.SUCCESS
-    assert result.data == []
+    assert result.data["results"] == []
 
 
 def test_web_search_tool_leaves_already_unique_results_untouched():
@@ -340,7 +346,7 @@ def test_web_search_tool_leaves_already_unique_results_untouched():
 
     result = tool.execute(query="python", max_results=10)
 
-    assert [item["title"] for item in result.data] == ["A", "B", "C"]
+    assert [item["title"] for item in result.data["results"]] == ["A", "B", "C"]
 
 
 # --- Future source/link metadata availability ---------------------------------
@@ -357,6 +363,7 @@ def test_web_search_tool_output_exposes_source_and_the_original_clickable_url():
                 url="https://www.nasa.gov/news",
                 snippet="Official site",
                 source="searxng",
+                query="nasa",
             )
         ]
     )
@@ -364,11 +371,12 @@ def test_web_search_tool_output_exposes_source_and_the_original_clickable_url():
 
     result = tool.execute(query="nasa")
 
-    assert result.data == [
+    assert result.data["results"] == [
         {
             "title": "NASA",
             "url": "https://www.nasa.gov/news",
             "snippet": "Official site",
             "source": "searxng",
+            "query": "nasa",
         }
     ]

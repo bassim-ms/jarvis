@@ -112,7 +112,7 @@ def test_research_performs_multiple_deterministic_passes():
     assert query_count > 1
     assert provider.calls == [config.result_limit] * query_count
     assert result.status == ToolResultStatus.SUCCESS
-    assert len(result.data) == query_count  # one fake result per planned query
+    assert len(result.data["results"]) == query_count  # one fake result per query
 
 
 def test_critical_performs_multiple_deterministic_passes():
@@ -126,7 +126,7 @@ def test_critical_performs_multiple_deterministic_passes():
     assert query_count > 1
     assert provider.calls == [config.result_limit] * query_count
     assert result.status == ToolResultStatus.SUCCESS
-    assert len(result.data) == query_count
+    assert len(result.data["results"]) == query_count
 
 
 def test_explicit_max_results_overrides_the_mode_default_limit():
@@ -203,7 +203,7 @@ def test_fallback_still_works_under_research_mode():
     # those falls back from the failing provider to the working one
     query_count = len(tool.planner.plan("python", SearchMode.RESEARCH).queries)
     assert len(failing.calls) == query_count
-    assert len(result.data) == query_count
+    assert len(result.data["results"]) == query_count
 
 
 def test_caching_works_independently_per_planned_query():

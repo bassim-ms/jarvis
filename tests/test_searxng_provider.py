@@ -53,14 +53,36 @@ def test_search_returns_standardized_results(monkeypatch):
             url="https://python.org",
             snippet="The Python language",
             source="searxng",
+            query="python",
         ),
         SearchResult(
             title="Docs",
             url="https://docs.python.org",
             snippet="Python docs",
             source="searxng",
+            query="python",
         ),
     ]
+
+
+def test_search_stamps_the_query_used_onto_each_result(monkeypatch):
+    """M6.7 provenance: the query field records the exact query SearXNG
+    was asked, not the original user query (they can differ once a
+    SearchPlanner varies the query - see app/search/planner.py)."""
+    monkeypatch.setattr(searxng.settings, "searxng_url", "http://localhost:8080")
+
+    def fake_get(url, params, timeout):
+        return httpx.Response(
+            200,
+            json={"results": [{"title": "T", "url": "https://x.com", "content": ""}]},
+            request=httpx.Request("GET", url),
+        )
+
+    monkeypatch.setattr(searxng.httpx, "get", fake_get)
+
+    results = SearXNGProvider().search("python student")
+
+    assert results[0].query == "python student"
 
 
 def test_search_strips_trailing_slash_from_base_url(monkeypatch):

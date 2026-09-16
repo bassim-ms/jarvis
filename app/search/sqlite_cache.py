@@ -66,6 +66,7 @@ class SQLiteSearchCache(SearchCache):
                     "url": r.url,
                     "snippet": r.snippet,
                     "source": r.source,
+                    "query": r.query,
                 }
                 for r in results
             ]

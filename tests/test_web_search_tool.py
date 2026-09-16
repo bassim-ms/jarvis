@@ -66,14 +66,20 @@ def test_execute_returns_standardized_results():
     result = tool.execute(query="python")
 
     assert result.status == ToolResultStatus.SUCCESS
-    assert result.data == [
-        {
-            "title": "Python",
-            "url": "https://python.org",
-            "snippet": "lang",
-            "source": "",
-        }
-    ]
+    assert result.data == {
+        "query": "python",
+        "mode": "normal",
+        "queries_used": ["python"],
+        "results": [
+            {
+                "title": "Python",
+                "url": "https://python.org",
+                "snippet": "lang",
+                "source": "",
+                "query": "",
+            }
+        ],
+    }
     assert provider.last_query == "python"
 
 
@@ -111,7 +117,7 @@ def test_web_search_runs_through_registry_automatically_as_a_read_tool():
     result = registry.execute("web_search", params={"query": "python"})
 
     assert result.status == ToolResultStatus.SUCCESS
-    assert result.data[0]["title"] == "Python"
+    assert result.data["results"][0]["title"] == "Python"
 
 
 def test_web_search_registry_execute_needs_no_confirmation():
