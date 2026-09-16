@@ -98,16 +98,21 @@ def test_normal_performs_one_pass_with_its_configured_limit():
 
 
 def test_research_performs_multiple_deterministic_passes():
+    """Since M6.6, the number of provider calls is driven by the
+    SearchPlanner's distinct planned queries, not SearchModeConfig.passes
+    (which stays in place for backward compatibility but no longer drives
+    execution - see app/search/planner.py)."""
     provider = CountingProvider()
     tool = WebSearchTool(provider=provider)
 
     result = tool.execute(query="python", mode="research")
 
     config = SEARCH_MODE_CONFIGS[SearchMode.RESEARCH]
-    assert config.passes > 1
-    assert provider.calls == [config.result_limit] * config.passes
+    query_count = len(tool.planner.plan("python", SearchMode.RESEARCH).queries)
+    assert query_count > 1
+    assert provider.calls == [config.result_limit] * query_count
     assert result.status == ToolResultStatus.SUCCESS
-    assert len(result.data) == config.passes  # one fake result per pass
+    assert len(result.data) == query_count  # one fake result per planned query
 
 
 def test_critical_performs_multiple_deterministic_passes():
@@ -117,10 +122,11 @@ def test_critical_performs_multiple_deterministic_passes():
     result = tool.execute(query="python", mode="critical")
 
     config = SEARCH_MODE_CONFIGS[SearchMode.CRITICAL]
-    assert config.passes > 1
-    assert provider.calls == [config.result_limit] * config.passes
+    query_count = len(tool.planner.plan("python", SearchMode.CRITICAL).queries)
+    assert query_count > 1
+    assert provider.calls == [config.result_limit] * query_count
     assert result.status == ToolResultStatus.SUCCESS
-    assert len(result.data) == config.passes
+    assert len(result.data) == query_count
 
 
 def test_explicit_max_results_overrides_the_mode_default_limit():
@@ -129,8 +135,8 @@ def test_explicit_max_results_overrides_the_mode_default_limit():
 
     tool.execute(query="python", mode="research", max_results=2)
 
-    config = SEARCH_MODE_CONFIGS[SearchMode.RESEARCH]
-    assert provider.calls == [2] * config.passes
+    query_count = len(tool.planner.plan("python", SearchMode.RESEARCH).queries)
+    assert provider.calls == [2] * query_count
 
 
 # --- Backward compatibility --------------------------------------------------
@@ -193,29 +199,31 @@ def test_fallback_still_works_under_research_mode():
     result = tool.execute(query="python", mode="research")
 
     assert result.status == ToolResultStatus.SUCCESS
-    # each of the 2 research passes calls manager.search() independently,
-    # and each of those falls back from the failing provider to the
-    # working one
-    config = SEARCH_MODE_CONFIGS[SearchMode.RESEARCH]
-    assert len(failing.calls) == config.passes
-    assert len(result.data) == config.passes
+    # each planned query calls manager.search() independently, and each of
+    # those falls back from the failing provider to the working one
+    query_count = len(tool.planner.plan("python", SearchMode.RESEARCH).queries)
+    assert len(failing.calls) == query_count
+    assert len(result.data) == query_count
 
 
-def test_caching_still_works_under_research_mode():
-    """Every pass uses the identical query and result limit, so the second
-    pass onward is served from the cache rather than the wrapped provider -
-    this is expected, documented behavior for this milestone (see
-    app/search/modes.py). Since a cache hit returns byte-identical results
-    to the first pass, the M6.5 result-quality dedup (app/search/quality.py)
-    correctly collapses the combined multi-pass list down to the one truly
-    unique result - this is the intended interaction between M6.4 caching
-    and M6.5 deduplication, not a regression."""
+def test_caching_works_independently_per_planned_query():
+    """Since M6.6, RESEARCH/CRITICAL run distinct planned queries (see
+    app/search/planner.py) rather than repeating the identical one, so
+    each planned query is its own cache key: within a single execute()
+    call, every planned query reaches the wrapped provider once (nothing
+    to dedup-via-cache there anymore). Calling with the exact same
+    query+mode again is where caching pays off - nothing new reaches the
+    provider the second time."""
     provider = CountingProvider()
     cached = CachedSearchProvider(provider, FakeCache())
     tool = WebSearchTool(provider=cached)
 
-    result = tool.execute(query="python", mode="research")
+    query_count = len(tool.planner.plan("python", SearchMode.RESEARCH).queries)
 
-    assert result.status == ToolResultStatus.SUCCESS
-    assert len(provider.calls) == 1  # only the first pass reached the provider
-    assert len(result.data) == 1  # cache-repeated passes dedup down to 1
+    first = tool.execute(query="python", mode="research")
+    assert len(provider.calls) == query_count
+
+    second = tool.execute(query="python", mode="research")
+    assert len(provider.calls) == query_count  # no new calls - fully cached
+
+    assert first.data == second.data

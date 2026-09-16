@@ -11,6 +11,7 @@ Uses fake SearchProviders throughout - no real network calls.
 """
 
 from app.search.base import SearchProvider, SearchResult
+from app.search.planner import SearchPlan, SearchPlanner
 from app.search.quality import ResultQualityProvider, deduplicate_results
 from app.search.url_utils import normalize_url
 from app.tools.base import ToolResultStatus
@@ -49,6 +50,18 @@ class ScriptedProvider(SearchProvider):
         response = self.responses[self.calls]
         self.calls += 1
         return response
+
+
+class FixedPlanner(SearchPlanner):
+    """Always plans the same fixed list of queries, regardless of mode -
+    decouples these dedup/combine tests from any particular SearchMode's
+    actual planned-query count (see app/search/planner.py for that)."""
+
+    def __init__(self, queries: list[str]):
+        self.queries = list(queries)
+
+    def plan(self, query, mode):
+        return SearchPlan(queries=self.queries)
 
 
 # --- SearchResult source metadata -------------------------------------------
@@ -272,14 +285,15 @@ def test_web_search_tool_applies_limit_after_dedup_not_before():
     assert [item["title"] for item in result.data] == ["A", "B", "C", "D", "E"]
 
 
-def test_web_search_tool_combines_and_dedupes_multiple_research_passes():
+def test_web_search_tool_combines_and_dedupes_multiple_planned_queries():
     provider = ScriptedProvider(
         [
             [r("A"), r("B"), r("C"), r("D"), r("E")],
             [r("C"), r("D"), r("E"), r("F"), r("G")],
         ]
     )
-    tool = WebSearchTool(provider=provider)
+    planner = FixedPlanner(["python", "python 2026"])
+    tool = WebSearchTool(provider=provider, planner=planner)
 
     result = tool.execute(query="python", mode="research", max_results=10)
 
@@ -302,7 +316,8 @@ def test_web_search_tool_final_limit_truncates_the_deduped_combined_list():
             [r("C"), r("D"), r("E"), r("F"), r("G")],
         ]
     )
-    tool = WebSearchTool(provider=provider)
+    planner = FixedPlanner(["python", "python 2026"])
+    tool = WebSearchTool(provider=provider, planner=planner)
 
     result = tool.execute(query="python", mode="research", max_results=3)
 

@@ -1,15 +1,15 @@
 # Jarvis
 
-Personal AI assistant project. This is **Milestone 6.5: Search Result
-Quality** — `web_search` results are now deduplicated by normalized URL
-(first-occurrence-wins, limit applied after dedup) via a
-`ResultQualityProvider` sitting above the `CachedSearchProvider ->
-SearchProviderManager` chain, and each result carries a generic `source`
-identifier alongside its title/url/snippet, kept for a future text UI to
-render clickable sources (no such UI exists yet). No AI-based search
-routing, autonomous research, dashboard, agents, voice, or hardware control
-yet - see [Web Search](#web-search) for the general knowledge vs. web
-search distinction and what search modes/result quality actually do.
+Personal AI assistant project. This is **Milestone 6.6: Search Planning** —
+`RESEARCH`/`CRITICAL` modes no longer search the exact same query multiple
+times. A deterministic `SearchPlanner` now decides *which* distinct queries
+`web_search` runs for a mode (e.g. adding the current year, or "student"/
+"official" suffixes), all still fixed and non-AI; results from every
+planned query are combined through the existing M6.5 deduplication before
+the final limit is applied. No AI-based search routing, autonomous
+research, dashboard, agents, voice, or hardware control yet - see
+[Web Search](#web-search) for the general knowledge vs. web search
+distinction and what modes/planning/result quality actually do.
 
 ## Stack
 
@@ -89,7 +89,7 @@ pytest
 
 Expected output ends with something like:
 ```
-143 passed in 0.XXs
+158 passed in 0.XXs
 ```
 
 Tests never call the real Gemini or SearXNG APIs — `httpx.post` / `httpx.get`
@@ -125,7 +125,8 @@ jarvis/
       cache.py            - SearchCache interface: provider-independent get/set
       sqlite_cache.py      - SQLiteSearchCache: SQLite-backed, TTL-aware SearchCache
       cached.py            - CachedSearchProvider: caches a wrapped SearchProvider's results
-      modes.py             - SearchMode/SearchModeConfig: deterministic pass count + result limit
+      modes.py             - SearchMode/SearchModeConfig: deterministic result limit per query
+      planner.py            - SearchPlan/SearchPlanner/DeterministicSearchPlanner: which queries to run
       url_utils.py          - normalize_url: conservative comparison-key normalization
       quality.py            - deduplicate_results/ResultQualityProvider: URL-based dedup
       factory.py          - builds the default SearchProvider/SearchCache from config
@@ -143,8 +144,9 @@ jarvis/
     test_search_factory.py   - proves the provider/cache config wiring
     test_search_cache.py     - unit tests for SQLiteSearchCache (hit/miss/TTL/persistence)
     test_cached_search_provider.py - unit tests for CachedSearchProvider's cache/fallback logic
-    test_search_modes.py     - unit tests for SearchMode pass counts, limits, and fallback/caching under a mode
+    test_search_modes.py     - unit tests for SearchMode limits and fallback/caching under a mode
     test_search_quality.py   - unit tests for URL normalization, deduplication, and limit-after-dedup
+    test_search_planner.py   - unit tests for DeterministicSearchPlanner's per-mode query plans
   requirements.txt    - exact dependency versions
   .env.example         - template for your local .env (never commit .env itself)
   .gitignore
@@ -302,31 +304,10 @@ WebSearchTool -> ResultQualityProvider -> CachedSearchProvider -> SearchProvider
 pre-mode behavior exactly, so existing callers that only pass `query` are
 unaffected). `SearchMode` and `SearchModeConfig` (`app/search/modes.py`)
 are a small, fully deterministic strategy layer *above* the provider
-chain: a mode only decides how many times `WebSearchTool` calls its
-`SearchProvider` (`passes`) and how many results each call asks for by
-default (`result_limit`, overridden if the caller passes an explicit
-`max_results`). Modes never know about SearXNG, never touch caching or
-fallback, and never call Gemini to decide anything - `SearchMode` doesn't
-even import `SearchProvider`.
-
-| Mode | Passes | Result limit | Purpose |
-|------|--------|---------------|---------|
-| `fast` | 1 | 3 | quick lookups |
-| `normal` (default) | 1 | 5 | the original one-pass behavior |
-| `research` | 2 | 5 | broader coverage |
-| `critical` | 3 | 5 | redundant coverage |
-
-`research` and `critical` are **not** an autonomous research agent and
-**not** fact-checking: every pass reuses the identical query (no LLM- or
-rule-generated query variations), and results from every pass are simply
-concatenated, with no deduplication, ranking, or source-credibility
-scoring - those are left for a later milestone. Because every pass uses
-the same query and result limit, and `CachedSearchProvider` sits under the
-mode layer, the first pass is normally the only one that reaches the
-wrapped provider; later passes are typically served straight from cache.
-Multi-pass modes still exercise the real chain (each pass still fully
-walks `CachedSearchProvider -> SearchProviderManager`, so a first-pass
-cache miss retries the underlying provider(s) on every pass).
+chain: a mode picks the `result_limit` requested per query (overridden if
+the caller passes an explicit `max_results`). Modes never know about
+SearXNG, never touch caching or fallback, and never call Gemini to decide
+anything - `SearchMode` doesn't even import `SearchProvider`.
 
 Invalid mode values aren't specially validated: `WebSearchTool.execute`
 constructs `SearchMode(mode)` directly, so an unknown string raises
@@ -334,6 +315,51 @@ constructs `SearchMode(mode)` directly, so an unknown string raises
 isn't pre-validated - through the Tool Registry that becomes a normal
 `ToolResult` error via its existing generic exception handling (see
 `ToolRegistry.execute`), not any special-cased code in `WebSearchTool`.
+
+### Search Query Planning (M6.6)
+
+Originally, `research`/`critical` ran multiple passes of the *identical*
+query - which `CachedSearchProvider` then mostly absorbed, so extra passes
+added little real coverage. `SearchPlanner` (`app/search/planner.py`) fixes
+this: it decides *which distinct queries* to run for a mode, so multi-query
+modes actually diversify what's searched.
+
+- **`SearchPlan`** is just an ordered `list[str]` of queries to run.
+- **`SearchPlanner`** is the interface (`plan(query, mode) -> SearchPlan`).
+  It knows nothing about `SearchProvider`, caching, or result quality -
+  only `SearchMode` and plain strings.
+- **`DeterministicSearchPlanner`** is the only implementation: fixed,
+  non-AI suffixes, never a generic filler word like "research":
+
+  | Mode | Queries planned |
+  |------|------------------|
+  | `fast` | original |
+  | `normal` (default) | original |
+  | `research` | original, `{query} {current_year}`, `{query} student` |
+  | `critical` | original, `{query} {current_year}`, `{query} student`, `{query} official` |
+
+  `current_year` defaults to the real current year but is injectable
+  (`DeterministicSearchPlanner(current_year=2026)`) for deterministic
+  tests.
+- `WebSearchTool` takes an injected `planner` (defaulting to
+  `DeterministicSearchPlanner()`, same pattern as `provider`), calls the
+  wrapped `SearchProvider` once per planned query at the mode's result
+  limit, then runs the existing M6.5 deduplication over *all* combined
+  results before applying the final limit - so a mode's limit still
+  reflects unique results across every planned query, not just one.
+- Each planned query is still just a normal call into
+  `ResultQualityProvider -> CachedSearchProvider -> SearchProviderManager`,
+  so it's cached, deduplicated, and falls back exactly like any other
+  query - the planner adds no new caching or fallback logic of its own,
+  and nothing below `WebSearchTool` knows planning exists. Because planned
+  queries are now genuinely distinct strings, caching pays off across
+  repeated `web_search` calls with the same query+mode (identical plan,
+  every planned query already cached), not within a single call the way
+  identical repeated passes used to be absorbed.
+- `SearchModeConfig.passes` (`app/search/modes.py`) is unchanged and still
+  present for compatibility, but no longer drives how many queries
+  `WebSearchTool` runs - `SearchPlanner` is now the source of truth for
+  that.
 
 ### Search Result Quality (M6.5)
 

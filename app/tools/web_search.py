@@ -4,19 +4,23 @@ etc. later) into the Tool interface. The Tool Registry and Jarvis Core
 depend only on Tool, never on SearchProvider or any concrete provider -
 see app/search/base.py.
 
-Supports deterministic search modes (see app/search/modes.py) that decide
-how many search passes to run and how many results each pass asks for by
-default. Modes never change which provider answers, or how caching/fallback
-behave - those stay entirely inside the injected SearchProvider chain.
+Supports deterministic search modes (see app/search/modes.py) that pick a
+result limit per query, and a deterministic SearchPlanner (see
+app/search/planner.py) that decides WHICH queries to actually run for that
+mode - RESEARCH/CRITICAL run more than one *distinct* query rather than
+repeating the identical one. Neither modes nor the planner change which
+provider answers, or how caching/fallback behave - those stay entirely
+inside the injected SearchProvider chain.
 
-Results from every pass are deduplicated by normalized URL (see
+Results from every planned query are deduplicated by normalized URL (see
 app/search/quality.py) before the final result limit is applied, so a
-multi-pass mode's limit reflects unique results, not raw duplicate-laden
+multi-query mode's limit reflects unique results, not raw duplicate-laden
 ones.
 """
 
 from app.search.base import SearchProvider, SearchProviderError, SearchResult
 from app.search.modes import SEARCH_MODE_CONFIGS, SearchMode
+from app.search.planner import DeterministicSearchPlanner, SearchPlanner
 from app.search.quality import deduplicate_results
 from app.search.searxng import SearXNGProvider
 from app.tools.base import (
@@ -40,8 +44,13 @@ class WebSearchTool(Tool):
     permission = PermissionLevel.READ
     requirements = ToolRequirements(network=True)
 
-    def __init__(self, provider: SearchProvider | None = None):
+    def __init__(
+        self,
+        provider: SearchProvider | None = None,
+        planner: SearchPlanner | None = None,
+    ):
         self.provider = provider or SearXNGProvider()
+        self.planner = planner or DeterministicSearchPlanner()
 
     @property
     def parameters(self) -> list[ToolParameter]:
@@ -77,16 +86,20 @@ class WebSearchTool(Tool):
         config = SEARCH_MODE_CONFIGS[mode]
         limit = max_results if max_results is not None else config.result_limit
 
+        plan = self.planner.plan(query, mode)
+
         try:
             results: list[SearchResult] = []
-            for _ in range(config.passes):
-                results.extend(self.provider.search(query, max_results=limit))
+            for planned_query in plan.queries:
+                results.extend(
+                    self.provider.search(planned_query, max_results=limit)
+                )
         except SearchProviderError as exc:
             return ToolResult.error(str(exc))
 
-        # Deduplicate across all passes before applying the final limit, so
-        # duplicates (within one pass, or repeated across passes) never
-        # squeeze out otherwise-unique results.
+        # Deduplicate across every planned query before applying the final
+        # limit, so duplicates (within one query's results, or repeated
+        # across queries) never squeeze out otherwise-unique results.
         combined = deduplicate_results(results)[:limit]
 
         data = [
