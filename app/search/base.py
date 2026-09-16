@@ -17,11 +17,22 @@ class SearchProviderError(RuntimeError):
 
 @dataclass
 class SearchResult:
-    """One search hit, in a shape common to every provider."""
+    """One search hit, in a shape common to every provider.
+
+    `source` is a simple, generic provider identifier (e.g. "searxng") -
+    kept so a future presentation layer can render something like
+    "Source 1 - Wikipedia" without needing to know which SearchProvider
+    produced the result. It defaults to "" so existing code that only
+    cares about title/url/snippet is unaffected. `url` is always the
+    original, unmodified, user-clickable link - normalization for
+    deduplication purposes (see app/search/url_utils.py) never touches
+    this field, only a separate comparison key.
+    """
 
     title: str
     url: str
     snippet: str
+    source: str = ""
 
 
 class SearchProvider(ABC):

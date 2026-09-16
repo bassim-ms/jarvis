@@ -61,6 +61,18 @@ def test_default_ttl_is_ten_minutes():
     assert SQLiteSearchCache(db_path=":memory:").ttl_seconds == 600
 
 
+def test_source_metadata_survives_a_round_trip():
+    cache = SQLiteSearchCache(db_path=":memory:")
+    result = SearchResult(
+        title="Python", url="https://python.org", snippet="lang", source="searxng"
+    )
+
+    cache.set("python::5", [result])
+
+    assert cache.get("python::5") == [result]
+    assert cache.get("python::5")[0].source == "searxng"
+
+
 def test_cache_persists_across_instances_pointed_at_the_same_file(tmp_path):
     db_path = str(tmp_path / "cache.db")
 

@@ -17,8 +17,10 @@ from app.tools.web_search import WebSearchTool
 
 
 class CountingProvider(SearchProvider):
-    """Records every call's max_results and returns one fixed result per
-    call, so passes are distinguishable and countable."""
+    """Records every call's max_results and returns one result per call,
+    with a call-index-based URL so passes are distinguishable, countable,
+    and - importantly - not deduplicated against each other by the M6.5
+    result-quality layer (each call's result is a genuinely distinct URL)."""
 
     def __init__(self, error=None):
         self.error = error
@@ -28,7 +30,11 @@ class CountingProvider(SearchProvider):
         self.calls.append(max_results)
         if self.error:
             raise self.error
-        return [SearchResult(title="r", url="https://example.com", snippet="")]
+        return [
+            SearchResult(
+                title="r", url=f"https://example.com/{len(self.calls)}", snippet=""
+            )
+        ]
 
 
 class FakeCache(SearchCache):
@@ -199,8 +205,11 @@ def test_caching_still_works_under_research_mode():
     """Every pass uses the identical query and result limit, so the second
     pass onward is served from the cache rather than the wrapped provider -
     this is expected, documented behavior for this milestone (see
-    app/search/modes.py); result variation/deduplication is left for
-    later."""
+    app/search/modes.py). Since a cache hit returns byte-identical results
+    to the first pass, the M6.5 result-quality dedup (app/search/quality.py)
+    correctly collapses the combined multi-pass list down to the one truly
+    unique result - this is the intended interaction between M6.4 caching
+    and M6.5 deduplication, not a regression."""
     provider = CountingProvider()
     cached = CachedSearchProvider(provider, FakeCache())
     tool = WebSearchTool(provider=cached)
@@ -209,5 +218,4 @@ def test_caching_still_works_under_research_mode():
 
     assert result.status == ToolResultStatus.SUCCESS
     assert len(provider.calls) == 1  # only the first pass reached the provider
-    config = SEARCH_MODE_CONFIGS[SearchMode.RESEARCH]
-    assert len(result.data) == config.passes  # still combined from every pass
+    assert len(result.data) == 1  # cache-repeated passes dedup down to 1

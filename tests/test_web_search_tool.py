@@ -67,7 +67,12 @@ def test_execute_returns_standardized_results():
 
     assert result.status == ToolResultStatus.SUCCESS
     assert result.data == [
-        {"title": "Python", "url": "https://python.org", "snippet": "lang"}
+        {
+            "title": "Python",
+            "url": "https://python.org",
+            "snippet": "lang",
+            "source": "",
+        }
     ]
     assert provider.last_query == "python"
 

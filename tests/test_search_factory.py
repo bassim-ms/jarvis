@@ -2,10 +2,11 @@
 Tests for the search provider/cache factory: proves the ordered provider
 list is driven by JARVIS_SEARCH_PROVIDER_ORDER (configuration), not
 hardcoded, that the default cache is built from JARVIS_SEARCH_CACHE_TTL,
-and that WebSearchTool ends up using CachedSearchProvider wrapping a
-SearchProviderManager fallback chain through the application's default
-wiring - without WebSearchTool or JarvisCore knowing any provider's name or
-anything about SQLite.
+and that WebSearchTool ends up using ResultQualityProvider wrapping
+CachedSearchProvider wrapping a SearchProviderManager fallback chain
+through the application's default wiring - without WebSearchTool or
+JarvisCore knowing any provider's name or anything about SQLite or
+deduplication.
 """
 
 import pytest
@@ -13,6 +14,7 @@ import pytest
 from app.search import factory
 from app.search.cached import CachedSearchProvider
 from app.search.manager import SearchProviderManager
+from app.search.quality import ResultQualityProvider
 from app.search.searxng import SearXNGProvider
 from app.search.sqlite_cache import SQLiteSearchCache
 from app.tools.defaults import create_default_registry
@@ -76,11 +78,14 @@ def test_create_default_search_cache_uses_configured_ttl_and_path(monkeypatch, t
     assert cache.ttl_seconds == 42
 
 
-def test_default_registry_web_search_tool_uses_cached_provider_manager():
+def test_default_registry_web_search_tool_uses_quality_cached_provider_manager():
     registry = create_default_registry()
 
     tool = registry.get("web_search")
 
-    assert isinstance(tool.provider, CachedSearchProvider)
-    assert isinstance(tool.provider.provider, SearchProviderManager)
-    assert isinstance(tool.provider.provider.providers[0], SearXNGProvider)
+    assert isinstance(tool.provider, ResultQualityProvider)
+    assert isinstance(tool.provider.provider, CachedSearchProvider)
+    assert isinstance(tool.provider.provider.provider, SearchProviderManager)
+    assert isinstance(
+        tool.provider.provider.provider.providers[0], SearXNGProvider
+    )

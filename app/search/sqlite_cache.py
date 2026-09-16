@@ -60,7 +60,15 @@ class SQLiteSearchCache(SearchCache):
 
     def set(self, key: str, results: list[SearchResult]) -> None:
         value = json.dumps(
-            [{"title": r.title, "url": r.url, "snippet": r.snippet} for r in results]
+            [
+                {
+                    "title": r.title,
+                    "url": r.url,
+                    "snippet": r.snippet,
+                    "source": r.source,
+                }
+                for r in results
+            ]
         )
         expires_at = (
             datetime.now(timezone.utc) + timedelta(seconds=self.ttl_seconds)

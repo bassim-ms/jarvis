@@ -1,14 +1,15 @@
 # Jarvis
 
-Personal AI assistant project. This is **Milestone 6.4: Search Modes** —
-the one `web_search` tool now accepts an optional, deterministic `mode`
-(`fast` / `normal` / `critical` / `research`, `normal` by default) that
-picks how many search passes to run and how many results each asks for,
-sitting above the `CachedSearchProvider -> SearchProviderManager` fallback
-chain from Milestones 6.2/6.3 (SearXNG is still the only real provider). No
-AI-based search routing, autonomous research, dashboard, agents, voice, or
-hardware control yet - see [Web Search](#web-search) for the general
-knowledge vs. web search distinction and what each mode actually does.
+Personal AI assistant project. This is **Milestone 6.5: Search Result
+Quality** — `web_search` results are now deduplicated by normalized URL
+(first-occurrence-wins, limit applied after dedup) via a
+`ResultQualityProvider` sitting above the `CachedSearchProvider ->
+SearchProviderManager` chain, and each result carries a generic `source`
+identifier alongside its title/url/snippet, kept for a future text UI to
+render clickable sources (no such UI exists yet). No AI-based search
+routing, autonomous research, dashboard, agents, voice, or hardware control
+yet - see [Web Search](#web-search) for the general knowledge vs. web
+search distinction and what search modes/result quality actually do.
 
 ## Stack
 
@@ -88,7 +89,7 @@ pytest
 
 Expected output ends with something like:
 ```
-112 passed in 0.XXs
+143 passed in 0.XXs
 ```
 
 Tests never call the real Gemini or SearXNG APIs — `httpx.post` / `httpx.get`
@@ -125,6 +126,8 @@ jarvis/
       sqlite_cache.py      - SQLiteSearchCache: SQLite-backed, TTL-aware SearchCache
       cached.py            - CachedSearchProvider: caches a wrapped SearchProvider's results
       modes.py             - SearchMode/SearchModeConfig: deterministic pass count + result limit
+      url_utils.py          - normalize_url: conservative comparison-key normalization
+      quality.py            - deduplicate_results/ResultQualityProvider: URL-based dedup
       factory.py          - builds the default SearchProvider/SearchCache from config
   tests/
     test_health.py         - proves the server starts and /health works
@@ -141,6 +144,7 @@ jarvis/
     test_search_cache.py     - unit tests for SQLiteSearchCache (hit/miss/TTL/persistence)
     test_cached_search_provider.py - unit tests for CachedSearchProvider's cache/fallback logic
     test_search_modes.py     - unit tests for SearchMode pass counts, limits, and fallback/caching under a mode
+    test_search_quality.py   - unit tests for URL normalization, deduplication, and limit-after-dedup
   requirements.txt    - exact dependency versions
   .env.example         - template for your local .env (never commit .env itself)
   .gitignore
@@ -256,7 +260,7 @@ into; it just searches whatever query it's given.
 The full default chain, wired in `app/tools/defaults.py`, is:
 
 ```
-WebSearchTool -> CachedSearchProvider -> SearchProviderManager -> SearXNGProvider (, ...)
+WebSearchTool -> ResultQualityProvider -> CachedSearchProvider -> SearchProviderManager -> SearXNGProvider (, ...)
 ```
 
 - **`SearchCache`** (`app/search/cache.py`) is the caching interface:
@@ -331,6 +335,33 @@ isn't pre-validated - through the Tool Registry that becomes a normal
 `ToolResult` error via its existing generic exception handling (see
 `ToolRegistry.execute`), not any special-cased code in `WebSearchTool`.
 
+### Search Result Quality (M6.5)
+
+`SearchResult` (`app/search/base.py`) carries a fourth field alongside
+`title` / `url` / `snippet`: a generic `source` identifier (e.g.
+`"searxng"`), set by each provider. `url` is always left exactly as the
+provider returned it - it, together with `title` and `source`, is
+preserved specifically so a future text-interface presentation layer can
+render clickable sources (e.g. "Source 1 · Wikipedia") without needing to
+know which provider produced a result. **No such UI exists yet** - this
+milestone only makes sure the data is there for it.
+
+- **`normalize_url`** (`app/search/url_utils.py`) builds a conservative
+  comparison key for a URL - never the URL itself - by stripping
+  whitespace, lowercasing scheme/host, collapsing a trailing slash, and
+  removing obvious tracking parameters (`utm_*`, `fbclid`, `gclid`).
+- **`deduplicate_results`** (`app/search/quality.py`) removes results whose
+  normalized URLs match, keeping the *first* occurrence and preserving
+  order - no ranking or credibility scoring.
+- **`ResultQualityProvider`** (`app/search/quality.py`) is itself a
+  `SearchProvider` that wraps another one and deduplicates its results,
+  the same "transparent decorator" shape as `CachedSearchProvider` and
+  `SearchProviderManager`. It sits directly above `CachedSearchProvider` in
+  the default chain.
+- `WebSearchTool` deduplicates the *combined* results from every search
+  pass (see Search Modes above) before applying the result limit, so
+  limits are always applied **after** deduplication, not before.
+
 Configuration:
 - `JARVIS_SEARXNG_URL` - base URL of a SearXNG instance (self-hosted or a
   trusted public one). No default URL and no key is hard-coded anywhere.
@@ -362,9 +393,10 @@ These were not decided now, to avoid overbuilding before they're needed:
 - Real Brave/Tavily providers and autonomous research/agents — left for
   later milestones now that `SearchProvider`, `SearchProviderManager`, and
   `CachedSearchProvider` give them a place to plug in.
-- Result deduplication/ranking across search-mode passes and source
-  credibility scoring — `research`/`critical` just concatenate every
-  pass's results today; quality improvements are a later milestone.
+- Result ranking, source credibility scoring, and any source-button/link
+  UI — `ResultQualityProvider` only deduplicates by URL today; the `source`
+  metadata is preserved for a future presentation layer, but no UI renders
+  it yet.
 - Cache eviction/cleanup of expired rows, background cache refresh, cache
   warming, and semantic/embedding-based cache lookups — `SearchCache` is a
   plain TTL key/value store for now; expired rows are treated as misses but

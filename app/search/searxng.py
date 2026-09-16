@@ -46,6 +46,7 @@ class SearXNGProvider(SearchProvider):
                         title=item["title"],
                         url=item["url"],
                         snippet=item.get("content", ""),
+                        source="searxng",
                     )
                 )
             except (KeyError, TypeError) as exc:

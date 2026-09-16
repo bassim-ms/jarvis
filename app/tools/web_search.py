@@ -8,10 +8,16 @@ Supports deterministic search modes (see app/search/modes.py) that decide
 how many search passes to run and how many results each pass asks for by
 default. Modes never change which provider answers, or how caching/fallback
 behave - those stay entirely inside the injected SearchProvider chain.
+
+Results from every pass are deduplicated by normalized URL (see
+app/search/quality.py) before the final result limit is applied, so a
+multi-pass mode's limit reflects unique results, not raw duplicate-laden
+ones.
 """
 
 from app.search.base import SearchProvider, SearchProviderError, SearchResult
 from app.search.modes import SEARCH_MODE_CONFIGS, SearchMode
+from app.search.quality import deduplicate_results
 from app.search.searxng import SearXNGProvider
 from app.tools.base import (
     PermissionLevel,
@@ -78,7 +84,18 @@ class WebSearchTool(Tool):
         except SearchProviderError as exc:
             return ToolResult.error(str(exc))
 
+        # Deduplicate across all passes before applying the final limit, so
+        # duplicates (within one pass, or repeated across passes) never
+        # squeeze out otherwise-unique results.
+        combined = deduplicate_results(results)[:limit]
+
         data = [
-            {"title": r.title, "url": r.url, "snippet": r.snippet} for r in results
+            {
+                "title": r.title,
+                "url": r.url,
+                "snippet": r.snippet,
+                "source": r.source,
+            }
+            for r in combined
         ]
         return ToolResult.success(data=data)

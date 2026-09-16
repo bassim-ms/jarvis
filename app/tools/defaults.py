@@ -14,6 +14,7 @@ from app.search.factory import (
     create_default_search_cache,
     create_default_search_provider,
 )
+from app.search.quality import ResultQualityProvider
 from app.tools.registry import ToolRegistry
 from app.tools.web_search import WebSearchTool
 
@@ -25,15 +26,17 @@ def register_default_tools(registry: ToolRegistry) -> None:
     singleton, tests, or a future dashboard - decide what registry gets
     the defaults, instead of this module hardcoding where they end up.
 
-    web_search is wired as WebSearchTool -> CachedSearchProvider ->
-    SearchProviderManager -> (SearXNGProvider, ...), built from
-    app/search/factory.py, so JARVIS_SEARCH_PROVIDER_ORDER and
+    web_search is wired as WebSearchTool -> ResultQualityProvider ->
+    CachedSearchProvider -> SearchProviderManager -> (SearXNGProvider, ...),
+    built from app/search/factory.py, so JARVIS_SEARCH_PROVIDER_ORDER and
     JARVIS_SEARCH_CACHE_TTL both take effect without WebSearchTool,
-    SearchProviderManager, or JarvisCore knowing anything about SQLite or
-    caching.
+    SearchProviderManager, or JarvisCore knowing anything about SQLite,
+    caching, or result deduplication.
     """
-    provider = CachedSearchProvider(
-        create_default_search_provider(), create_default_search_cache()
+    provider = ResultQualityProvider(
+        CachedSearchProvider(
+            create_default_search_provider(), create_default_search_cache()
+        )
     )
     registry.register(WebSearchTool(provider=provider))
 

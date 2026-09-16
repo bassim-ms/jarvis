@@ -146,7 +146,12 @@ def test_web_search_tool_falls_back_through_the_manager():
 
     assert result.status == ToolResultStatus.SUCCESS
     assert result.data == [
-        {"title": "Python", "url": "https://python.org", "snippet": "lang"}
+        {
+            "title": "Python",
+            "url": "https://python.org",
+            "snippet": "lang",
+            "source": "",
+        }
     ]
     assert first.calls == 1
     assert second.calls == 1

@@ -49,10 +49,16 @@ def test_search_returns_standardized_results(monkeypatch):
 
     assert results == [
         SearchResult(
-            title="Python", url="https://python.org", snippet="The Python language"
+            title="Python",
+            url="https://python.org",
+            snippet="The Python language",
+            source="searxng",
         ),
         SearchResult(
-            title="Docs", url="https://docs.python.org", snippet="Python docs"
+            title="Docs",
+            url="https://docs.python.org",
+            snippet="Python docs",
+            source="searxng",
         ),
     ]
 
