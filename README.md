@@ -1,13 +1,14 @@
 # Jarvis
 
-Personal AI assistant project. This is **Milestone 6.3: Smart Search
-Caching** — the `web_search` tool now runs its `SearchProvider` chain
-through a `CachedSearchProvider`, which checks a persistent, TTL-based
-SQLite cache before falling through to the `SearchProviderManager` fallback
-chain from Milestone 6.2 (SearXNG is still the only real provider; Brave,
-Tavily, etc. can still be added later as entries in that list, with no
-changes to `WebSearchTool` or Jarvis Core). No AI tool-calling, dashboard,
-agents, voice, or hardware control yet.
+Personal AI assistant project. This is **Milestone 6.4: Search Modes** —
+the one `web_search` tool now accepts an optional, deterministic `mode`
+(`fast` / `normal` / `critical` / `research`, `normal` by default) that
+picks how many search passes to run and how many results each asks for,
+sitting above the `CachedSearchProvider -> SearchProviderManager` fallback
+chain from Milestones 6.2/6.3 (SearXNG is still the only real provider). No
+AI-based search routing, autonomous research, dashboard, agents, voice, or
+hardware control yet - see [Web Search](#web-search) for the general
+knowledge vs. web search distinction and what each mode actually does.
 
 ## Stack
 
@@ -87,7 +88,7 @@ pytest
 
 Expected output ends with something like:
 ```
-98 passed in 0.XXs
+112 passed in 0.XXs
 ```
 
 Tests never call the real Gemini or SearXNG APIs — `httpx.post` / `httpx.get`
@@ -123,6 +124,7 @@ jarvis/
       cache.py            - SearchCache interface: provider-independent get/set
       sqlite_cache.py      - SQLiteSearchCache: SQLite-backed, TTL-aware SearchCache
       cached.py            - CachedSearchProvider: caches a wrapped SearchProvider's results
+      modes.py             - SearchMode/SearchModeConfig: deterministic pass count + result limit
       factory.py          - builds the default SearchProvider/SearchCache from config
   tests/
     test_health.py         - proves the server starts and /health works
@@ -138,6 +140,7 @@ jarvis/
     test_search_factory.py   - proves the provider/cache config wiring
     test_search_cache.py     - unit tests for SQLiteSearchCache (hit/miss/TTL/persistence)
     test_cached_search_provider.py - unit tests for CachedSearchProvider's cache/fallback logic
+    test_search_modes.py     - unit tests for SearchMode pass counts, limits, and fallback/caching under a mode
   requirements.txt    - exact dependency versions
   .env.example         - template for your local .env (never commit .env itself)
   .gitignore
@@ -201,7 +204,16 @@ architecture in `app/tools/`:
 
 `web_search` is the first real tool, implementing the pattern above. It
 follows the same "interface + swappable backend" shape as `AIProvider` /
-`GeminiProvider`:
+`GeminiProvider`.
+
+**General/stable knowledge vs. web search:** Jarvis does not automatically
+decide when to search - that's a deliberately postponed later milestone
+(see below). Questions about stable facts ("what is quantum entanglement?",
+"how does a transistor work?") are answered by Gemini directly, with no
+tool call. Questions needing current/external information ("what happened
+with NASA today?", "latest robotics news") go through `web_search`
+explicitly. `web_search` itself has no idea which category a query falls
+into; it just searches whatever query it's given.
 
 - **`SearchProvider`** (`app/search/base.py`) is the interface a search
   backend implements: `search(query, max_results) -> list[SearchResult]`.
@@ -279,6 +291,46 @@ WebSearchTool -> CachedSearchProvider -> SearchProviderManager -> SearXNGProvide
   create_default_search_cache())` as the application's default `web_search`
   provider.
 
+### Search Modes
+
+`web_search` takes an optional `mode` argument (`fast`, `normal`,
+`research`, or `critical`; `normal` is the default, matching the tool's
+pre-mode behavior exactly, so existing callers that only pass `query` are
+unaffected). `SearchMode` and `SearchModeConfig` (`app/search/modes.py`)
+are a small, fully deterministic strategy layer *above* the provider
+chain: a mode only decides how many times `WebSearchTool` calls its
+`SearchProvider` (`passes`) and how many results each call asks for by
+default (`result_limit`, overridden if the caller passes an explicit
+`max_results`). Modes never know about SearXNG, never touch caching or
+fallback, and never call Gemini to decide anything - `SearchMode` doesn't
+even import `SearchProvider`.
+
+| Mode | Passes | Result limit | Purpose |
+|------|--------|---------------|---------|
+| `fast` | 1 | 3 | quick lookups |
+| `normal` (default) | 1 | 5 | the original one-pass behavior |
+| `research` | 2 | 5 | broader coverage |
+| `critical` | 3 | 5 | redundant coverage |
+
+`research` and `critical` are **not** an autonomous research agent and
+**not** fact-checking: every pass reuses the identical query (no LLM- or
+rule-generated query variations), and results from every pass are simply
+concatenated, with no deduplication, ranking, or source-credibility
+scoring - those are left for a later milestone. Because every pass uses
+the same query and result limit, and `CachedSearchProvider` sits under the
+mode layer, the first pass is normally the only one that reaches the
+wrapped provider; later passes are typically served straight from cache.
+Multi-pass modes still exercise the real chain (each pass still fully
+walks `CachedSearchProvider -> SearchProviderManager`, so a first-pass
+cache miss retries the underlying provider(s) on every pass).
+
+Invalid mode values aren't specially validated: `WebSearchTool.execute`
+constructs `SearchMode(mode)` directly, so an unknown string raises
+`ValueError`, the same way any other unexpected input in this codebase
+isn't pre-validated - through the Tool Registry that becomes a normal
+`ToolResult` error via its existing generic exception handling (see
+`ToolRegistry.execute`), not any special-cased code in `WebSearchTool`.
+
 Configuration:
 - `JARVIS_SEARXNG_URL` - base URL of a SearXNG instance (self-hosted or a
   trusted public one). No default URL and no key is hard-coded anywhere.
@@ -304,11 +356,15 @@ These were not decided now, to avoid overbuilding before they're needed:
 - Dashboard framework — decided when we build the actual dashboard.
 - AI tool-calling (an AI provider choosing which tool to invoke) — Gemini
   doesn't decide when to call `web_search` yet; tools are invoked directly
-  through the Registry for now.
-- Real Brave/Tavily providers, search modes, and autonomous research/agents
-  — left for later milestones now that `SearchProvider`,
-  `SearchProviderManager`, and `CachedSearchProvider` give them a place to
-  plug in.
+  through the Registry for now. This includes automatic intent routing
+  (deciding *whether* a query needs `web_search` at all, or which `mode`
+  to use) - no AI classifier call is made just to make that decision.
+- Real Brave/Tavily providers and autonomous research/agents — left for
+  later milestones now that `SearchProvider`, `SearchProviderManager`, and
+  `CachedSearchProvider` give them a place to plug in.
+- Result deduplication/ranking across search-mode passes and source
+  credibility scoring — `research`/`critical` just concatenate every
+  pass's results today; quality improvements are a later milestone.
 - Cache eviction/cleanup of expired rows, background cache refresh, cache
   warming, and semantic/embedding-based cache lookups — `SearchCache` is a
   plain TTL key/value store for now; expired rows are treated as misses but

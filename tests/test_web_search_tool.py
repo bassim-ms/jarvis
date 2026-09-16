@@ -40,12 +40,12 @@ def test_web_search_tool_declares_name_description_and_read_permission():
     assert tool.requirements.network is True
 
 
-def test_web_search_tool_declares_query_and_max_results_parameters():
+def test_web_search_tool_declares_query_max_results_and_mode_parameters():
     tool = WebSearchTool(provider=FakeSearchProvider())
 
     names = {param.name for param in tool.parameters}
 
-    assert names == {"query", "max_results"}
+    assert names == {"query", "max_results", "mode"}
 
 
 def test_default_provider_is_searxng():
