@@ -1,15 +1,16 @@
 # Jarvis
 
-Personal AI assistant project. This is **Milestone 6.7: Search Context +
-Provenance** — every `SearchResult` now records the exact planned query
-that produced it, and a successful `web_search` call returns structured
-search context (`query`, resolved `mode`, `queries_used`, and `results`,
-each still carrying its own `query`) instead of a flat result list. This
-is only data preparation - no answer-generation layer reads it yet. No
-AI-based search routing, autonomous research, citations UI, dashboard,
-agents, voice, or hardware control yet - see [Web Search](#web-search) for
-the general knowledge vs. web search distinction and what
-modes/planning/result quality/provenance actually do.
+Personal AI assistant project. This is **Milestone 6.8: Search Answer
+Layer** — a standalone `SearchAnswerGenerator` can now turn the structured
+`SearchResponse` context from Milestone 6.7 into a grounded, free-text
+answer via the existing Gemini/`AIProvider` integration, with a
+deterministic, validated `sources` list (never AI-invented URLs). Nothing
+in Jarvis calls it yet - it's data preparation and a ready-to-use layer,
+not a wired-up feature. No automatic search routing, autonomous research,
+citations UI, dashboard, agents, voice, or hardware control yet - see
+[Web Search](#web-search) for the general knowledge vs. web search
+distinction and what modes/planning/result quality/provenance/answers
+actually do.
 
 ## Stack
 
@@ -89,7 +90,7 @@ pytest
 
 Expected output ends with something like:
 ```
-177 passed in 0.XXs
+190 passed in 0.XXs
 ```
 
 Tests never call the real Gemini or SearXNG APIs — `httpx.post` / `httpx.get`
@@ -130,6 +131,7 @@ jarvis/
       url_utils.py          - normalize_url: conservative comparison-key normalization
       quality.py            - deduplicate_results/ResultQualityProvider: URL-based dedup
       response.py            - SearchResponse: structured query/mode/queries_used/results context
+      answer.py              - SearchAnswerGenerator/GeminiSearchAnswerGenerator: grounded answers
       factory.py          - builds the default SearchProvider/SearchCache from config
   tests/
     test_health.py         - proves the server starts and /health works
@@ -149,6 +151,7 @@ jarvis/
     test_search_quality.py   - unit tests for URL normalization, deduplication, and limit-after-dedup
     test_search_planner.py   - unit tests for DeterministicSearchPlanner's per-mode query plans
     test_search_response.py  - unit tests for SearchResponse and provenance through the whole chain
+    test_search_answer.py    - unit tests for GeminiSearchAnswerGenerator and source validation
   requirements.txt    - exact dependency versions
   .env.example         - template for your local .env (never commit .env itself)
   .gitignore
@@ -395,9 +398,10 @@ milestone only makes sure the data is there for it.
 ### Search Context + Provenance (M6.7)
 
 A successful `web_search` no longer returns a flat list of results - it
-returns structured search context, so a future answer-generation layer can
-tell not just *what* came back but *which query found it* and *under what
-mode*. Nothing reads this yet; M6.7 only prepares the data.
+returns structured search context, so an answer-generation layer can tell
+not just *what* came back but *which query found it* and *under what
+mode*. `SearchAnswerGenerator` (Search Answer Layer, below) is the first
+consumer of this.
 
 - **`SearchResult.query`** (`app/search/base.py`) records the exact
   planned query that produced that specific result - stamped on by the
@@ -429,6 +433,41 @@ mode*. Nothing reads this yet; M6.7 only prepares the data.
   every layer already just passes `SearchResult` objects through
   unmodified; only the source (`SearXNGProvider`) and the final assembly
   point (`WebSearchTool`) needed to change.
+
+### Search Answer Layer (M6.8)
+
+A standalone, provider-agnostic layer that turns a `SearchResponse` into a
+grounded, free-text answer - **not wired into `WebSearchTool`, `JarvisCore`,
+or `/chat` yet**; it's a ready-to-use capability, tested on its own.
+
+- **`SearchAnswerGenerator`** (`app/search/answer.py`) is the interface:
+  `generate(response: SearchResponse) -> SearchAnswer`. It only imports
+  `SearchResponse`/`SearchResult` and the existing `AIProvider` interface -
+  never Gemini's HTTP details directly.
+- **`GeminiSearchAnswerGenerator`** is the only implementation, built
+  entirely on the existing `AIProvider` abstraction (defaulting to
+  `GeminiProvider()`, injectable like every other provider in this
+  codebase) - no separate API key, HTTP client, or AI integration of its
+  own. It prompts Gemini with the original query, resolved mode, every
+  query actually searched, and each result's title/URL/snippet as
+  evidence, with explicit instructions to answer only from that evidence,
+  never invent facts/sources/URLs/citations, and say so plainly if the
+  evidence is insufficient rather than guessing.
+- **`SearchAnswer`** (`answer: str`, `sources: list[SearchSource]`) and
+  **`SearchSource`** (`title`, `url`, `query`) are plain dataclasses.
+  Crucially, **Gemini's text is never trusted for source data**: a source
+  is only included if a real `SearchResult.url` from the `SearchResponse`
+  appears as an exact token in Gemini's answer text (trailing punctuation
+  like a sentence-ending period is stripped first, but a URL that merely
+  *extends* a real one, e.g. an extra path segment, does **not** match).
+  `title`/`url`/`query` on the returned `SearchSource` always come from
+  the real `SearchResult`, never from anything Gemini wrote, so invented
+  or modified URLs can never appear, and citing the same URL twice
+  produces one source, not two.
+- A `ProviderError` from the underlying `AIProvider` (e.g. a missing key
+  or network failure) is caught and re-raised as `SearchAnswerError`, the
+  answer layer's own domain error - matching how `SearXNGError` wraps
+  `httpx` errors at the search-provider boundary.
 
 Configuration:
 - `JARVIS_SEARXNG_URL` - base URL of a SearXNG instance (self-hosted or a
@@ -465,9 +504,10 @@ These were not decided now, to avoid overbuilding before they're needed:
   UI — `ResultQualityProvider` only deduplicates by URL today; the
   `source`/`query` metadata is preserved for a future presentation layer,
   but no UI renders it yet.
-- A grounded-answer layer that reads `SearchResponse`/provenance to write
-  a cited reply — M6.7 only makes the structured data available; nothing
-  consumes it yet.
+- Wiring `SearchAnswerGenerator` into `WebSearchTool`, `JarvisCore`, or
+  `/chat` — M6.8 built the standalone layer; nothing in the running app
+  calls it yet, and *whether/when* to generate an answer is still a
+  routing decision for a later milestone.
 - Cache eviction/cleanup of expired rows, background cache refresh, cache
   warming, and semantic/embedding-based cache lookups — `SearchCache` is a
   plain TTL key/value store for now; expired rows are treated as misses but
