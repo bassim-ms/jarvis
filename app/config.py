@@ -33,6 +33,12 @@ class Settings(BaseSettings):
     # and app/search/factory.py). Only "searxng" is implemented so far.
     search_provider_order: str = "searxng"
 
+    # Search result cache (SQLite-backed, see app/search/sqlite_cache.py) -
+    # how long a cached web_search result stays valid, in seconds, and
+    # where the cache file lives. Expired entries are treated as misses.
+    search_cache_ttl: int = 600
+    search_cache_db_path: str = "jarvis_search_cache.db"
+
     model_config = SettingsConfigDict(env_file=".env", env_prefix="JARVIS_")
 
 

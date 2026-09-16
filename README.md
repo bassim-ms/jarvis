@@ -1,13 +1,13 @@
 # Jarvis
 
-Personal AI assistant project. This is **Milestone 6.2: Search Provider
-Manager + Fallback** — the `web_search` tool from Milestone 6.1 now runs its
-`SearchProvider` through a `SearchProviderManager`, which tries an ordered,
-configurable list of providers and falls back to the next on failure
-(SearXNG is still the only real provider; Brave, Tavily, etc. can be added
-later as entries in that list, with no changes to `WebSearchTool` or
-Jarvis Core). No AI tool-calling, dashboard, agents, voice, or hardware
-control yet.
+Personal AI assistant project. This is **Milestone 6.3: Smart Search
+Caching** — the `web_search` tool now runs its `SearchProvider` chain
+through a `CachedSearchProvider`, which checks a persistent, TTL-based
+SQLite cache before falling through to the `SearchProviderManager` fallback
+chain from Milestone 6.2 (SearXNG is still the only real provider; Brave,
+Tavily, etc. can still be added later as entries in that list, with no
+changes to `WebSearchTool` or Jarvis Core). No AI tool-calling, dashboard,
+agents, voice, or hardware control yet.
 
 ## Stack
 
@@ -19,6 +19,8 @@ control yet.
 - **httpx** talks directly to the Gemini REST API and to a SearXNG
   instance's JSON search API — no extra AI or search SDK needed for a
   single HTTP call.
+- Python's stdlib **sqlite3** backs both conversation memory and the search
+  result cache — no separate cache service (e.g. Redis) is used.
 - **pytest** for tests.
 
 ## Setup
@@ -46,7 +48,8 @@ Run these from inside the `jarvis` folder.
    https://aistudio.google.com/apikey (`.env` is git-ignored and never
    committed). To use the `web_search` tool, also set `JARVIS_SEARXNG_URL`
    to the base URL of a SearXNG instance you run or trust, and optionally
-   `JARVIS_SEARCH_PROVIDER_ORDER` (see [Web Search](#web-search) below).
+   `JARVIS_SEARCH_PROVIDER_ORDER`, `JARVIS_SEARCH_CACHE_TTL`, and
+   `JARVIS_SEARCH_CACHE_DB_PATH` (see [Web Search](#web-search) below).
 
 ## Run the server
 
@@ -84,13 +87,14 @@ pytest
 
 Expected output ends with something like:
 ```
-80 passed in 0.XXs
+98 passed in 0.XXs
 ```
 
 Tests never call the real Gemini or SearXNG APIs — `httpx.post` / `httpx.get`
 are monkeypatched, so they run without a network connection or real
 credentials. Fallback behavior is proven with lightweight fake
-`SearchProvider`s, not real network calls to multiple backends.
+`SearchProvider`s, not real network calls to multiple backends. The cache
+is tested against real SQLite (`:memory:` or a temp file), not mocked.
 
 ## Folder structure
 
@@ -116,7 +120,10 @@ jarvis/
       base.py           - SearchProvider interface and the SearchResult type
       searxng.py         - SearXNG implementation of SearchProvider
       manager.py          - SearchProviderManager: ordered fallback across SearchProviders
-      factory.py          - builds the default SearchProvider from JARVIS_SEARCH_PROVIDER_ORDER
+      cache.py            - SearchCache interface: provider-independent get/set
+      sqlite_cache.py      - SQLiteSearchCache: SQLite-backed, TTL-aware SearchCache
+      cached.py            - CachedSearchProvider: caches a wrapped SearchProvider's results
+      factory.py          - builds the default SearchProvider/SearchCache from config
   tests/
     test_health.py         - proves the server starts and /health works
     test_chat.py            - proves /chat works, with Jarvis Core mocked out
@@ -128,7 +135,9 @@ jarvis/
     test_web_search_tool.py  - unit tests for WebSearchTool, through the Tool Registry
     test_default_tools.py    - proves web_search is in the default/application tool registry
     test_search_provider_manager.py - fallback ordering/short-circuiting, with fake providers
-    test_search_factory.py   - proves the provider list comes from configuration
+    test_search_factory.py   - proves the provider/cache config wiring
+    test_search_cache.py     - unit tests for SQLiteSearchCache (hit/miss/TTL/persistence)
+    test_cached_search_provider.py - unit tests for CachedSearchProvider's cache/fallback logic
   requirements.txt    - exact dependency versions
   .env.example         - template for your local .env (never commit .env itself)
   .gitignore
@@ -232,6 +241,44 @@ follows the same "interface + swappable backend" shape as `AIProvider` /
   `SearchProvider`, add one entry to `_PROVIDER_FACTORIES`, and list it in
   `JARVIS_SEARCH_PROVIDER_ORDER` - no other file changes.
 
+The full default chain, wired in `app/tools/defaults.py`, is:
+
+```
+WebSearchTool -> CachedSearchProvider -> SearchProviderManager -> SearXNGProvider (, ...)
+```
+
+- **`SearchCache`** (`app/search/cache.py`) is the caching interface:
+  `get(key) -> list[SearchResult] | None` and
+  `set(key, results) -> None`. It knows nothing about queries, providers,
+  or normalization - it's a plain key/value store with expiry, so the
+  backend can be swapped later without touching `CachedSearchProvider`.
+- **`SQLiteSearchCache`** (`app/search/sqlite_cache.py`) is the first
+  implementation, following the same pattern as `SQLiteMemoryStore`: one
+  held `sqlite3` connection guarded by a lock, a single `search_cache`
+  table (`key`, `value`, `expires_at`), and a local file so cached results
+  survive Jarvis restarts. No Redis or other external service. An entry
+  past its `expires_at` is returned as a plain miss (`None`), not an
+  error.
+- **`CachedSearchProvider`** (`app/search/cached.py`) is itself a
+  `SearchProvider` that wraps another one plus a `SearchCache`. The cache
+  key is the normalized query (`strip().lower()`) plus `max_results`, e.g.
+  `"python::5"` - no embeddings or semantic similarity, only exact
+  normalized matches hit the cache. On a hit it returns the cached results
+  without calling the wrapped provider; on a miss it calls the wrapped
+  provider and, only if that call *succeeds*, caches the result - an empty
+  result list (`[]`) is cached as a valid answer, but a
+  `SearchProviderError` is never cached and propagates unchanged, so
+  `SearchProviderManager`'s fallback behavior underneath is unaffected by
+  caching. Because it implements `SearchProvider` itself, it composes with
+  `SearchProviderManager` exactly like any other provider - neither
+  `WebSearchTool` nor `JarvisCore` know caching or SQLite are involved.
+- **`app/search/factory.py`** also builds the default `SearchCache` via
+  `create_default_search_cache()`, reading `JARVIS_SEARCH_CACHE_TTL` and
+  `JARVIS_SEARCH_CACHE_DB_PATH`. `app/tools/defaults.py` composes
+  `CachedSearchProvider(create_default_search_provider(),
+  create_default_search_cache())` as the application's default `web_search`
+  provider.
+
 Configuration:
 - `JARVIS_SEARXNG_URL` - base URL of a SearXNG instance (self-hosted or a
   trusted public one). No default URL and no key is hard-coded anywhere.
@@ -239,8 +286,13 @@ Configuration:
   provider names to try, e.g. `searxng` (default) or, once more providers
   exist, `searxng,brave`. Unknown names raise `UnknownSearchProviderError`
   at startup rather than failing silently.
+- `JARVIS_SEARCH_CACHE_TTL` - how long a cached `web_search` result stays
+  valid, in seconds. Defaults to `600` (10 minutes). Expired entries are
+  treated as cache misses.
+- `JARVIS_SEARCH_CACHE_DB_PATH` - local SQLite file the cache is stored in.
+  Defaults to `jarvis_search_cache.db`.
 
-See `.env.example` for both.
+See `.env.example` for all four.
 
 ## Postponed decisions (on purpose)
 
@@ -253,8 +305,13 @@ These were not decided now, to avoid overbuilding before they're needed:
 - AI tool-calling (an AI provider choosing which tool to invoke) — Gemini
   doesn't decide when to call `web_search` yet; tools are invoked directly
   through the Registry for now.
-- Real Brave/Tavily providers, result caching, search modes, and autonomous
-  research/agents — left for later milestones now that `SearchProvider` and
-  `SearchProviderManager` give them a place to plug in.
+- Real Brave/Tavily providers, search modes, and autonomous research/agents
+  — left for later milestones now that `SearchProvider`,
+  `SearchProviderManager`, and `CachedSearchProvider` give them a place to
+  plug in.
+- Cache eviction/cleanup of expired rows, background cache refresh, cache
+  warming, and semantic/embedding-based cache lookups — `SearchCache` is a
+  plain TTL key/value store for now; expired rows are treated as misses but
+  not deleted.
 - Remote access / security design — deferred until that milestone, since it
   needs deliberate design rather than a quick default.
