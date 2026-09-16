@@ -28,6 +28,11 @@ class Settings(BaseSettings):
     # SearXNG (web search provider) - base URL of a running SearXNG instance
     searxng_url: str = ""
 
+    # Ordered, comma-separated list of search provider names to try, with
+    # automatic fallback to the next on failure (see app/search/manager.py
+    # and app/search/factory.py). Only "searxng" is implemented so far.
+    search_provider_order: str = "searxng"
+
     model_config = SettingsConfigDict(env_file=".env", env_prefix="JARVIS_")
 
 

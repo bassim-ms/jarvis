@@ -9,6 +9,7 @@ own default, when no registry is injected, stays an empty ToolRegistry
 (see test_tools.py::test_core_exposes_a_tool_registry_by_default).
 """
 
+from app.search.factory import create_default_search_provider
 from app.tools.registry import ToolRegistry
 from app.tools.web_search import WebSearchTool
 
@@ -19,8 +20,13 @@ def register_default_tools(registry: ToolRegistry) -> None:
     Takes a registry rather than owning one, so callers - the application
     singleton, tests, or a future dashboard - decide what registry gets
     the defaults, instead of this module hardcoding where they end up.
+
+    web_search is given the configured provider fallback chain (see
+    app/search/factory.py) rather than WebSearchTool's own single-provider
+    default, so the application benefits from JARVIS_SEARCH_PROVIDER_ORDER
+    without WebSearchTool itself changing.
     """
-    registry.register(WebSearchTool())
+    registry.register(WebSearchTool(provider=create_default_search_provider()))
 
 
 def create_default_registry() -> ToolRegistry:

@@ -1,12 +1,13 @@
 # Jarvis
 
-Personal AI assistant project. This is **Milestone 6.1: Web Search
-Foundation** — the first real tool, `web_search`, is registered behind the
-Tool Registry and permission model from Milestone 5. It's backed by a
-provider-independent `SearchProvider` interface, with SearXNG as the first
-implementation (Brave, Tavily, etc. can be added later without touching the
-tool or Jarvis Core). No AI tool-calling, dashboard, agents, voice, or
-hardware control yet.
+Personal AI assistant project. This is **Milestone 6.2: Search Provider
+Manager + Fallback** — the `web_search` tool from Milestone 6.1 now runs its
+`SearchProvider` through a `SearchProviderManager`, which tries an ordered,
+configurable list of providers and falls back to the next on failure
+(SearXNG is still the only real provider; Brave, Tavily, etc. can be added
+later as entries in that list, with no changes to `WebSearchTool` or
+Jarvis Core). No AI tool-calling, dashboard, agents, voice, or hardware
+control yet.
 
 ## Stack
 
@@ -44,8 +45,8 @@ Run these from inside the `jarvis` folder.
    Then open `.env` and set `JARVIS_GEMINI_API_KEY` to your key from
    https://aistudio.google.com/apikey (`.env` is git-ignored and never
    committed). To use the `web_search` tool, also set `JARVIS_SEARXNG_URL`
-   to the base URL of a SearXNG instance you run or trust (see
-   [Web Search](#web-search) below).
+   to the base URL of a SearXNG instance you run or trust, and optionally
+   `JARVIS_SEARCH_PROVIDER_ORDER` (see [Web Search](#web-search) below).
 
 ## Run the server
 
@@ -83,12 +84,13 @@ pytest
 
 Expected output ends with something like:
 ```
-64 passed in 0.XXs
+80 passed in 0.XXs
 ```
 
 Tests never call the real Gemini or SearXNG APIs — `httpx.post` / `httpx.get`
 are monkeypatched, so they run without a network connection or real
-credentials.
+credentials. Fallback behavior is proven with lightweight fake
+`SearchProvider`s, not real network calls to multiple backends.
 
 ## Folder structure
 
@@ -113,6 +115,8 @@ jarvis/
     search/
       base.py           - SearchProvider interface and the SearchResult type
       searxng.py         - SearXNG implementation of SearchProvider
+      manager.py          - SearchProviderManager: ordered fallback across SearchProviders
+      factory.py          - builds the default SearchProvider from JARVIS_SEARCH_PROVIDER_ORDER
   tests/
     test_health.py         - proves the server starts and /health works
     test_chat.py            - proves /chat works, with Jarvis Core mocked out
@@ -123,6 +127,8 @@ jarvis/
     test_searxng_provider.py - unit tests for the SearXNG provider, with HTTP mocked out
     test_web_search_tool.py  - unit tests for WebSearchTool, through the Tool Registry
     test_default_tools.py    - proves web_search is in the default/application tool registry
+    test_search_provider_manager.py - fallback ordering/short-circuiting, with fake providers
+    test_search_factory.py   - proves the provider list comes from configuration
   requirements.txt    - exact dependency versions
   .env.example         - template for your local .env (never commit .env itself)
   .gitignore
@@ -198,18 +204,43 @@ follows the same "interface + swappable backend" shape as `AIProvider` /
   Network errors and unexpected response shapes both raise `SearXNGError`
   (a `SearchProviderError`), never a bare exception.
 - **`WebSearchTool`** (`app/tools/web_search.py`) implements `Tool`,
-  taking a `SearchProvider` in its constructor (defaulting to
-  `SearXNGProvider`). It has `permission = PermissionLevel.READ`, so the
-  Registry runs it immediately with no confirmation step. `execute` turns
-  a `SearchProviderError` into a `ToolResult.error(...)` rather than
-  letting it propagate.
-- Neither `WebSearchTool` nor `JarvisCore` import anything SearXNG-specific
-  - swapping in a future `BraveProvider` or `TavilyProvider` only means
-    constructing `WebSearchTool(provider=BraveProvider())` instead.
+  taking a `SearchProvider` in its constructor (defaulting to a bare
+  `SearXNGProvider` when none is given). It has
+  `permission = PermissionLevel.READ`, so the Registry runs it immediately
+  with no confirmation step. `execute` turns a `SearchProviderError` into a
+  `ToolResult.error(...)` rather than letting it propagate.
+- **`SearchProviderManager`** (`app/search/manager.py`) is itself a
+  `SearchProvider` that wraps an *ordered list* of other `SearchProvider`s
+  and adds fallback: it tries each in turn, moving to the next only when
+  one *raises* `SearchProviderError` (a network/provider failure). A
+  provider returning zero results is a valid answer, not a failure, so it's
+  returned as-is with no fallback. If every provider raises, the manager
+  raises one combined `SearchProviderError` rather than the caller seeing a
+  pile of separate exceptions. Because it implements `SearchProvider`
+  itself, `WebSearchTool(provider=SearchProviderManager([...]))` is
+  indistinguishable from `WebSearchTool(provider=SomeSingleProvider())` to
+  both `WebSearchTool` and `JarvisCore` - neither needed to change.
+- **`app/search/factory.py`** turns `JARVIS_SEARCH_PROVIDER_ORDER` (a
+  comma-separated list of provider names) into the actual ordered list of
+  `SearchProvider` instances, via one small name→class mapping
+  (`_PROVIDER_FACTORIES`), and wraps them in a `SearchProviderManager`.
+  This is the one place a provider's name is ever checked as a string.
+  `app/tools/defaults.py` uses it to build the application's default
+  `web_search` tool, so `JARVIS_SEARCH_PROVIDER_ORDER` controls fallback
+  order without touching `WebSearchTool` or `JarvisCore`.
+- Adding a real `BraveProvider` or `TavilyProvider` later means: implement
+  `SearchProvider`, add one entry to `_PROVIDER_FACTORIES`, and list it in
+  `JARVIS_SEARCH_PROVIDER_ORDER` - no other file changes.
 
-Configuration: set `JARVIS_SEARXNG_URL` to the base URL of a SearXNG
-instance (self-hosted or a trusted public one) - see `.env.example`. There
-is no default URL and no key is hard-coded anywhere in the code.
+Configuration:
+- `JARVIS_SEARXNG_URL` - base URL of a SearXNG instance (self-hosted or a
+  trusted public one). No default URL and no key is hard-coded anywhere.
+- `JARVIS_SEARCH_PROVIDER_ORDER` - comma-separated, ordered list of
+  provider names to try, e.g. `searxng` (default) or, once more providers
+  exist, `searxng,brave`. Unknown names raise `UnknownSearchProviderError`
+  at startup rather than failing silently.
+
+See `.env.example` for both.
 
 ## Postponed decisions (on purpose)
 
@@ -222,8 +253,8 @@ These were not decided now, to avoid overbuilding before they're needed:
 - AI tool-calling (an AI provider choosing which tool to invoke) — Gemini
   doesn't decide when to call `web_search` yet; tools are invoked directly
   through the Registry for now.
-- Additional search providers (Brave, Tavily), fallback between providers,
-  result caching, search modes, and autonomous research/agents — left for
-  later milestones now that `SearchProvider` gives them a place to plug in.
+- Real Brave/Tavily providers, result caching, search modes, and autonomous
+  research/agents — left for later milestones now that `SearchProvider` and
+  `SearchProviderManager` give them a place to plug in.
 - Remote access / security design — deferred until that milestone, since it
   needs deliberate design rather than a quick default.
