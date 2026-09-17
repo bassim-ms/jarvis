@@ -39,9 +39,20 @@ class ChatRequest(BaseModel):
     conversation_id: str | None = None
 
 
+class ChatSource(BaseModel):
+    """One citation backing a SEARCH-path reply - mirrors
+    app.search.answer.SearchSource verbatim (title/url/query), never
+    modified in transit. Always [] for a DIRECT reply."""
+
+    title: str
+    url: str
+    query: str
+
+
 class ChatResponse(BaseModel):
     reply: str
     conversation_id: str
+    sources: list[ChatSource] = []
 
 
 @app.post("/chat", response_model=ChatResponse)
@@ -52,11 +63,17 @@ def chat(request: ChatRequest) -> ChatResponse:
     conversation_id from a previous response to continue it with history.
     """
     try:
-        reply, conversation_id = core.handle_chat(
+        reply, conversation_id, sources = core.handle_chat(
             request.message, request.conversation_id
         )
     except ConversationNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except ProviderError as exc:
         raise HTTPException(status_code=502, detail=str(exc))
-    return ChatResponse(reply=reply, conversation_id=conversation_id)
+    return ChatResponse(
+        reply=reply,
+        conversation_id=conversation_id,
+        sources=[
+            ChatSource(title=s.title, url=s.url, query=s.query) for s in sources
+        ],
+    )

@@ -20,6 +20,7 @@ from app.search.answer import (
     GeminiSearchAnswerGenerator,
     SearchAnswerError,
     SearchAnswerGenerator,
+    SearchSource,
 )
 from app.search.base import SearchProviderError
 from app.search.router import SearchDecision, SearchRouter
@@ -66,7 +67,7 @@ class JarvisCore:
 
     def handle_chat(
         self, message: str, conversation_id: str | None = None
-    ) -> tuple[str, str]:
+    ) -> tuple[str, str, list[SearchSource]]:
         """Route a user message to the AI provider and return its reply.
 
         If conversation_id is None, a new conversation is started. If it's
@@ -83,6 +84,10 @@ class JarvisCore:
         reply is persisted exactly the same way. Both paths reuse the same
         `history`/`facts` already loaded below - the SEARCH path never
         issues its own memory query.
+
+        The third return value is the SearchAnswer's validated sources
+        (M6.11) - always `[]` for DIRECT, since it never produces a
+        SearchAnswer at all.
         """
         if conversation_id is None:
             conversation_id = self.memory.create_conversation()
@@ -95,23 +100,24 @@ class JarvisCore:
         facts = self.memory.get_facts()
 
         if self.router.route(message) is SearchDecision.SEARCH:
-            reply = self._handle_search(message, history, facts)
+            reply, sources = self._handle_search(message, history, facts)
         else:
             prompt = self._build_prompt(message, history, facts)
             reply = self.provider.generate_reply(prompt)
+            sources = []
 
         self.memory.add_message(conversation_id, "user", message)
         self.memory.add_message(conversation_id, "assistant", reply)
 
-        return reply, conversation_id
+        return reply, conversation_id, sources
 
     def _handle_search(
         self, message: str, history: list[Message], facts: dict[str, str]
-    ) -> str:
+    ) -> tuple[str, list[SearchSource]]:
         """SEARCH path: WebSearchTool -> SearchResponse ->
-        SearchAnswerGenerator, using SearchAnswer.answer as the reply.
-        Source metadata (SearchAnswer.sources) is intentionally not
-        surfaced here yet - that's presentation, for a later milestone.
+        SearchAnswerGenerator, using SearchAnswer.answer as the reply and
+        returning SearchAnswer.sources (M6.11) alongside it for the caller
+        to surface as it sees fit.
 
         The search query is `message` alone, exactly as before M6.10 -
         conversation context is never passed to SearchRouter.route() or
@@ -145,7 +151,7 @@ class JarvisCore:
         except SearchAnswerError as exc:
             raise ProviderError(f"Failed to generate a search answer: {exc}") from exc
 
-        return search_answer.answer
+        return search_answer.answer, search_answer.sources
 
     def save_memory(self, key: str, value: str) -> None:
         """Programmatic hook to save a user fact. Manual for now; automatic

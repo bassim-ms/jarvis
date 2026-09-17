@@ -15,6 +15,7 @@ from app.search.answer import (
     SearchAnswer,
     SearchAnswerError,
     SearchAnswerGenerator,
+    SearchSource,
 )
 from app.search.base import SearchProvider, SearchProviderError, SearchResult
 from app.search.router import SearchRouter
@@ -41,11 +42,12 @@ def make_core(reply: str = "hi there") -> tuple[JarvisCore, FakeProvider]:
 def test_handle_chat_delegates_to_provider():
     jarvis, provider = make_core("hi there")
 
-    reply, conversation_id = jarvis.handle_chat("hello")
+    reply, conversation_id, sources = jarvis.handle_chat("hello")
 
     assert reply == "hi there"
     assert provider.last_message == "hello"
     assert conversation_id
+    assert sources == []
 
 
 def test_default_provider_is_gemini():
@@ -55,8 +57,8 @@ def test_default_provider_is_gemini():
 def test_handle_chat_creates_new_conversation_when_none_given():
     jarvis, _ = make_core()
 
-    _, first_id = jarvis.handle_chat("hello")
-    _, second_id = jarvis.handle_chat("hello again")
+    _, first_id, _ = jarvis.handle_chat("hello")
+    _, second_id, _ = jarvis.handle_chat("hello again")
 
     assert first_id != second_id
 
@@ -64,7 +66,7 @@ def test_handle_chat_creates_new_conversation_when_none_given():
 def test_handle_chat_reuses_and_persists_conversation_history():
     jarvis, provider = make_core()
 
-    _, conversation_id = jarvis.handle_chat("my name is Bassim")
+    _, conversation_id, _ = jarvis.handle_chat("my name is Bassim")
     jarvis.handle_chat("what did I just say?", conversation_id=conversation_id)
 
     assert "my name is Bassim" in provider.last_message
@@ -119,8 +121,14 @@ class FakeAnswerGenerator(SearchAnswerGenerator):
     citation-matching/prompt logic, which is covered by
     tests/test_search_answer.py."""
 
-    def __init__(self, answer: str = "search answer", error: Exception | None = None):
+    def __init__(
+        self,
+        answer: str = "search answer",
+        sources: list[SearchSource] | None = None,
+        error: Exception | None = None,
+    ):
         self.answer = answer
+        self.sources = sources if sources is not None else []
         self.error = error
         self.last_response = None
         self.last_context = None
@@ -130,7 +138,7 @@ class FakeAnswerGenerator(SearchAnswerGenerator):
         self.last_context = conversation_context
         if self.error:
             raise self.error
-        return SearchAnswer(answer=self.answer, sources=[])
+        return SearchAnswer(answer=self.answer, sources=self.sources)
 
 
 class RecordingRouter(SearchRouter):
@@ -186,31 +194,33 @@ def test_handle_chat_uses_direct_path_for_a_stable_question():
         reply="gemini answer", answer_generator=answer_generator
     )
 
-    reply, _ = jarvis.handle_chat("what is quantum entanglement?")
+    reply, _, sources = jarvis.handle_chat("what is quantum entanglement?")
 
     assert reply == "gemini answer"
     assert provider.last_message is not None
     assert answer_generator.last_response is None  # SEARCH path never ran
     assert answer_generator.last_context is None  # never even called
+    assert sources == []
 
 
 def test_handle_chat_uses_search_path_for_a_search_triggering_message():
     answer_generator = FakeAnswerGenerator(answer="grounded answer")
     jarvis, provider, _ = make_search_core(answer_generator=answer_generator)
 
-    reply, _ = jarvis.handle_chat("what's the latest news on AI?")
+    reply, _, sources = jarvis.handle_chat("what's the latest news on AI?")
 
     assert reply == "grounded answer"
     assert provider.last_message is None  # DIRECT path never ran
     assert answer_generator.last_response is not None
     assert answer_generator.last_response.query == "what's the latest news on AI?"
+    assert sources == []
 
 
 def test_search_path_persists_the_final_reply_to_memory():
     answer_generator = FakeAnswerGenerator(answer="grounded answer")
     jarvis, _, _ = make_search_core(answer_generator=answer_generator)
 
-    _, conversation_id = jarvis.handle_chat("what's the weather today?")
+    _, conversation_id, _ = jarvis.handle_chat("what's the weather today?")
 
     messages = jarvis.memory.get_messages(conversation_id)
     assert [m.content for m in messages] == [
@@ -227,7 +237,7 @@ def test_search_path_mixes_correctly_with_direct_turns_in_one_conversation():
         reply="direct reply", answer_generator=answer_generator
     )
 
-    _, conversation_id = jarvis.handle_chat("hello")
+    _, conversation_id, _ = jarvis.handle_chat("hello")
     jarvis.handle_chat("what's the latest news?", conversation_id=conversation_id)
 
     messages = jarvis.memory.get_messages(conversation_id)
@@ -279,6 +289,42 @@ def test_search_path_without_a_registered_web_search_tool_raises_provider_error(
         jarvis.handle_chat("what's the latest news?")
 
 
+# --- M6.11: SearchAnswer.sources surfaced through handle_chat ---------------
+
+
+def test_search_path_surfaces_the_answer_generators_sources_verbatim():
+    sources = [
+        SearchSource(title="Python.org", url="https://python.org", query="python"),
+        SearchSource(
+            title="Python Docs", url="https://docs.python.org", query="python"
+        ),
+    ]
+    answer_generator = FakeAnswerGenerator(answer="grounded answer", sources=sources)
+    jarvis, _, _ = make_search_core(answer_generator=answer_generator)
+
+    _, _, returned_sources = jarvis.handle_chat("what's the latest news on AI?")
+
+    assert returned_sources == sources
+
+
+def test_search_path_with_no_cited_sources_returns_empty_list():
+    answer_generator = FakeAnswerGenerator(answer="grounded answer", sources=[])
+    jarvis, _, _ = make_search_core(answer_generator=answer_generator)
+
+    _, _, sources = jarvis.handle_chat("what's the latest news on AI?")
+
+    assert sources == []
+
+
+def test_direct_path_always_returns_empty_sources_even_with_facts_and_history():
+    jarvis, _, _ = make_search_core(reply="direct reply")
+    jarvis.save_memory("name", "Bassim")
+
+    _, _, sources = jarvis.handle_chat("what is quantum entanglement?")
+
+    assert sources == []
+
+
 # --- M6.10: conversation context for the SEARCH answer step -----------------
 
 
@@ -291,7 +337,7 @@ def test_search_path_passes_recent_conversation_context_to_the_answer_generator(
         reply="TUM is a university in Munich.", answer_generator=answer_generator
     )
 
-    _, conversation_id = jarvis.handle_chat("tell me about TUM")
+    _, conversation_id, _ = jarvis.handle_chat("tell me about TUM")
     jarvis.handle_chat(
         "what's the latest application deadline?", conversation_id=conversation_id
     )
@@ -306,7 +352,7 @@ def test_search_path_context_includes_the_earlier_relevant_turn():
         reply="TUM is a university in Munich.", answer_generator=answer_generator
     )
 
-    _, conversation_id = jarvis.handle_chat("tell me about TUM")
+    _, conversation_id, _ = jarvis.handle_chat("tell me about TUM")
     jarvis.handle_chat(
         "what's the latest application deadline?", conversation_id=conversation_id
     )
@@ -320,7 +366,7 @@ def test_search_path_context_is_bounded_to_the_configured_message_window():
     answer_generator = FakeAnswerGenerator()
     jarvis, _, _ = make_search_core(reply="ok", answer_generator=answer_generator)
 
-    _, conversation_id = jarvis.handle_chat("oldest message, should drop out")
+    _, conversation_id, _ = jarvis.handle_chat("oldest message, should drop out")
     for i in range(5):
         jarvis.handle_chat(f"filler {i}", conversation_id=conversation_id)
     jarvis.handle_chat("what's the latest news?", conversation_id=conversation_id)
@@ -338,7 +384,7 @@ def test_search_path_context_has_a_defensive_character_cap():
         reply="x" * 2000, answer_generator=answer_generator
     )
 
-    _, conversation_id = jarvis.handle_chat("tell me something long")
+    _, conversation_id, _ = jarvis.handle_chat("tell me something long")
     jarvis.handle_chat("what's the latest news?", conversation_id=conversation_id)
 
     assert len(answer_generator.last_context) <= JarvisCore._SEARCH_CONTEXT_MAX_CHARS
@@ -352,7 +398,7 @@ def test_search_router_still_receives_only_the_raw_current_message():
         reply="TUM is a university in Munich.", router=router
     )
 
-    _, conversation_id = jarvis.handle_chat("tell me about TUM")
+    _, conversation_id, _ = jarvis.handle_chat("tell me about TUM")
     jarvis.handle_chat(
         "what's the latest application deadline?", conversation_id=conversation_id
     )
@@ -369,7 +415,7 @@ def test_web_search_still_receives_only_the_raw_current_message():
         reply="TUM is a university in Munich.", search_provider=search_provider
     )
 
-    _, conversation_id = jarvis.handle_chat("tell me about TUM")
+    _, conversation_id, _ = jarvis.handle_chat("tell me about TUM")
     jarvis.handle_chat(
         "what's the latest application deadline?", conversation_id=conversation_id
     )

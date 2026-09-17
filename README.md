@@ -279,8 +279,14 @@ Both `router`/`answer_generator` are constructor-injectable on
 generation failed) on the SEARCH path is re-raised as `ProviderError` -
 the same error type the DIRECT path already raises on a Gemini failure -
 so `/chat`'s existing error handling (a 502) needed **no changes** to
-cover the new path. `SearchAnswer.sources` is deliberately **not** exposed
-through `/chat`/`ChatResponse` yet - see Postponed decisions.
+cover the new path. `SearchAnswer.sources` is exposed through
+`/chat`/`ChatResponse` as `sources: list[ChatSource]` (M6.11): each
+`ChatSource` carries `title`/`url`/`query` copied verbatim from the
+underlying `SearchSource`, so only citations already deterministically
+validated against real search results (see Search Answer Layer below) are
+ever returned - never a snippet, and never an invented or modified URL. A
+DIRECT reply always returns `sources: []`, since it never produces a
+`SearchAnswer` at all.
 
 - **`SearchProvider`** (`app/search/base.py`) is the interface a search
   backend implements: `search(query, max_results) -> list[SearchResult]`.
@@ -618,13 +624,10 @@ These were not decided now, to avoid overbuilding before they're needed:
   later milestones now that `SearchProvider`, `SearchProviderManager`, and
   `CachedSearchProvider` give them a place to plug in.
 - Result ranking, source credibility scoring, and any source-button/link
-  UI — `ResultQualityProvider` only deduplicates by URL today; the
-  `source`/`query` metadata is preserved for a future presentation layer,
-  but no UI renders it yet.
-- Exposing `SearchAnswer.sources` through `/chat`/`ChatResponse` — M6.9
-  uses `SearchAnswer.answer` as the reply but keeps `sources` internal;
-  `ChatResponse`'s shape is unchanged. Surfacing sources over HTTP is a
-  later milestone.
+  UI — `ResultQualityProvider` only deduplicates by URL today; `/chat`
+  exposes the validated `title`/`url`/`query` per source (M6.11), but
+  ranking, credibility scoring, and rendering it in a UI are still left for
+  later.
 - Cache eviction/cleanup of expired rows, background cache refresh, cache
   warming, and semantic/embedding-based cache lookups — `SearchCache` is a
   plain TTL key/value store for now; expired rows are treated as misses but
