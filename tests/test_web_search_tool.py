@@ -4,7 +4,11 @@ interface correctly - including through the Tool Registry's permission
 handling - without depending on SearXNG or any real network call.
 """
 
+import pytest
+
 from app.search.base import SearchProvider, SearchProviderError, SearchResult
+from app.search.modes import SearchMode
+from app.search.response import SearchResponse
 from app.search.searxng import SearXNGProvider
 from app.tools.base import PermissionLevel, ToolResultStatus
 from app.tools.registry import ToolRegistry
@@ -100,6 +104,69 @@ def test_execute_returns_error_result_on_provider_failure():
 
     assert result.status == ToolResultStatus.ERROR
     assert "boom" in result.message
+
+
+# --- The typed SearchResponse seam (M6.9) -----------------------------------
+
+
+def test_search_returns_a_typed_search_response():
+    provider = FakeSearchProvider(
+        results=[
+            SearchResult(title="Python", url="https://python.org", snippet="lang")
+        ]
+    )
+    tool = WebSearchTool(provider=provider)
+
+    response = tool.search("python")
+
+    assert isinstance(response, SearchResponse)
+    assert response.query == "python"
+    assert response.mode is SearchMode.NORMAL
+    assert response.queries_used == ["python"]
+    assert response.results == [
+        SearchResult(title="Python", url="https://python.org", snippet="lang")
+    ]
+
+
+def test_search_accepts_mode_as_a_string_like_execute_does():
+    provider = FakeSearchProvider(results=[])
+    tool = WebSearchTool(provider=provider)
+
+    response = tool.search("python", mode="fast")
+
+    assert response.mode is SearchMode.FAST
+    assert provider.last_max_results == 3  # FAST's configured result limit
+
+
+def test_search_raises_search_provider_error_instead_of_returning_a_tool_result():
+    """Unlike execute(), search() does not catch SearchProviderError - the
+    caller (e.g. JarvisCore's SEARCH path) decides how to handle it."""
+    provider = FakeSearchProvider(error=SearchProviderError("boom"))
+    tool = WebSearchTool(provider=provider)
+
+    with pytest.raises(SearchProviderError, match="boom"):
+        tool.search("python")
+
+
+def test_execute_builds_its_dict_from_the_same_search_response():
+    """execute() and search() must agree - execute() is a thin wrapper, not
+    a second implementation of the search pipeline."""
+    provider = FakeSearchProvider(
+        results=[
+            SearchResult(title="Python", url="https://python.org", snippet="lang")
+        ]
+    )
+    tool = WebSearchTool(provider=provider)
+
+    response = tool.search("python")
+    result = tool.execute(query="python")
+
+    assert result.data["query"] == response.query
+    assert result.data["mode"] == response.mode.value
+    assert result.data["queries_used"] == response.queries_used
+    assert [r["title"] for r in result.data["results"]] == [
+        r.title for r in response.results
+    ]
 
 
 # --- Through the Tool Registry --------------------------------------------

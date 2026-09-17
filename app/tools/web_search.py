@@ -83,12 +83,22 @@ class WebSearchTool(Tool):
             ),
         ]
 
-    def execute(
+    def search(
         self,
         query: str,
         max_results: int | None = None,
         mode: SearchMode | str = SearchMode.NORMAL,
-    ) -> ToolResult:
+    ) -> SearchResponse:
+        """Run a full search (planning, multi-query execution, dedup) and
+        return the typed SearchResponse.
+
+        This is the same object `execute()` flattens into `ToolResult.data`
+        - exposed as its own method so a caller that needs the structured
+        object directly (e.g. JarvisCore's SEARCH path, which hands it to
+        a SearchAnswerGenerator) can get it without reconstructing it from
+        a dict. Unlike `execute()`, this raises SearchProviderError on
+        failure rather than converting it to a ToolResult.
+        """
         if isinstance(mode, str):
             mode = SearchMode(mode)
         config = SEARCH_MODE_CONFIGS[mode]
@@ -96,14 +106,9 @@ class WebSearchTool(Tool):
 
         plan = self.planner.plan(query, mode)
 
-        try:
-            results: list[SearchResult] = []
-            for planned_query in plan.queries:
-                results.extend(
-                    self.provider.search(planned_query, max_results=limit)
-                )
-        except SearchProviderError as exc:
-            return ToolResult.error(str(exc))
+        results: list[SearchResult] = []
+        for planned_query in plan.queries:
+            results.extend(self.provider.search(planned_query, max_results=limit))
 
         # Deduplicate across every planned query before applying the final
         # limit, so duplicates (within one query's results, or repeated
@@ -112,12 +117,23 @@ class WebSearchTool(Tool):
         # kept result's own `query` field - its provenance - survives too.
         combined = deduplicate_results(results)[:limit]
 
-        response = SearchResponse(
+        return SearchResponse(
             query=query,
             mode=mode,
             queries_used=plan.queries,
             results=combined,
         )
+
+    def execute(
+        self,
+        query: str,
+        max_results: int | None = None,
+        mode: SearchMode | str = SearchMode.NORMAL,
+    ) -> ToolResult:
+        try:
+            response = self.search(query, max_results=max_results, mode=mode)
+        except SearchProviderError as exc:
+            return ToolResult.error(str(exc))
 
         data = {
             "query": response.query,

@@ -1,16 +1,16 @@
 # Jarvis
 
-Personal AI assistant project. This is **Milestone 6.8: Search Answer
-Layer** — a standalone `SearchAnswerGenerator` can now turn the structured
-`SearchResponse` context from Milestone 6.7 into a grounded, free-text
-answer via the existing Gemini/`AIProvider` integration, with a
-deterministic, validated `sources` list (never AI-invented URLs). Nothing
-in Jarvis calls it yet - it's data preparation and a ready-to-use layer,
-not a wired-up feature. No automatic search routing, autonomous research,
-citations UI, dashboard, agents, voice, or hardware control yet - see
-[Web Search](#web-search) for the general knowledge vs. web search
-distinction and what modes/planning/result quality/provenance/answers
-actually do.
+Personal AI assistant project. This is **Milestone 6.9: Automatic Search
+Routing** — `/chat` now decides *deterministically* (fixed keyword
+matching, no extra Gemini call) whether a message needs a web search:
+stable/general questions still go straight to Gemini exactly as before,
+while search-triggering messages run through `WebSearchTool ->
+SearchResponse -> SearchAnswerGenerator` (Milestones 6.1-6.8), using the
+grounded answer as the reply. Explicit search intent always overrides the
+topic. Sources aren't surfaced in the HTTP response yet, and routing is
+intentionally coarse - see [Web Search](#web-search) for what's still
+future work. No autonomous research, citations UI, dashboard, agents,
+voice, or hardware control yet.
 
 ## Stack
 
@@ -90,7 +90,7 @@ pytest
 
 Expected output ends with something like:
 ```
-190 passed in 0.XXs
+233 passed in 0.XXs
 ```
 
 Tests never call the real Gemini or SearXNG APIs — `httpx.post` / `httpx.get`
@@ -107,7 +107,7 @@ jarvis/
     __init__.py       - marks app/ as a Python package
     main.py            - the FastAPI app, /health and /chat endpoints
     config.py          - all configuration, read from environment variables
-    core.py            - Jarvis Core: orchestrates a chat request via an AIProvider
+    core.py            - Jarvis Core: routes a chat request DIRECT (AIProvider) or SEARCH (WebSearchTool + SearchAnswerGenerator)
     providers/
       base.py           - AIProvider interface, so Core doesn't depend on any vendor
       gemini.py         - Gemini implementation of AIProvider
@@ -132,11 +132,12 @@ jarvis/
       quality.py            - deduplicate_results/ResultQualityProvider: URL-based dedup
       response.py            - SearchResponse: structured query/mode/queries_used/results context
       answer.py              - SearchAnswerGenerator/GeminiSearchAnswerGenerator: grounded answers
+      router.py              - SearchRouter/SearchDecision: deterministic DIRECT vs SEARCH routing
       factory.py          - builds the default SearchProvider/SearchCache from config
   tests/
     test_health.py         - proves the server starts and /health works
     test_chat.py            - proves /chat works, with Jarvis Core mocked out
-    test_core.py            - unit tests for Jarvis Core's provider delegation
+    test_core.py            - unit tests for Jarvis Core's provider delegation and DIRECT/SEARCH routing
     test_gemini_provider.py - unit tests for the Gemini provider, with HTTP mocked out
     test_memory.py          - unit tests for the SQLite memory store
     test_tools.py           - unit tests for the Tool Registry and permission model
@@ -152,6 +153,7 @@ jarvis/
     test_search_planner.py   - unit tests for DeterministicSearchPlanner's per-mode query plans
     test_search_response.py  - unit tests for SearchResponse and provenance through the whole chain
     test_search_answer.py    - unit tests for GeminiSearchAnswerGenerator and source validation
+    test_search_router.py    - unit tests for SearchRouter's DIRECT/SEARCH decisions
   requirements.txt    - exact dependency versions
   .env.example         - template for your local .env (never commit .env itself)
   .gitignore
@@ -217,14 +219,68 @@ architecture in `app/tools/`:
 follows the same "interface + swappable backend" shape as `AIProvider` /
 `GeminiProvider`.
 
-**General/stable knowledge vs. web search:** Jarvis does not automatically
-decide when to search - that's a deliberately postponed later milestone
-(see below). Questions about stable facts ("what is quantum entanglement?",
-"how does a transistor work?") are answered by Gemini directly, with no
-tool call. Questions needing current/external information ("what happened
-with NASA today?", "latest robotics news") go through `web_search`
-explicitly. `web_search` itself has no idea which category a query falls
-into; it just searches whatever query it's given.
+**General/stable knowledge vs. web search:** Since Milestone 6.9,
+`JarvisCore` decides this automatically and deterministically for every
+`/chat` message - see Search Routing below. Questions about stable facts
+("what is quantum entanglement?", "how does a transistor work?") are
+answered by Gemini directly, with no tool call. Questions needing
+current/external information ("what happened with NASA today?", "latest
+robotics news") go through `web_search`. `web_search` itself still has no
+idea which category a query falls into; it just searches whatever query
+it's given - the decision lives entirely in `SearchRouter`, one layer up.
+
+### Search Routing (M6.9)
+
+`JarvisCore.handle_chat` picks one of two paths for every message, via
+**`SearchRouter`** (`app/search/router.py`) - **deterministic keyword/
+phrase matching only, never an extra Gemini call**:
+
+- **DIRECT** - the original, unchanged path: `_build_prompt` (history +
+  facts + message) -> `provider.generate_reply(...)`.
+- **SEARCH** - `WebSearchTool.search(message)` -> `SearchResponse` ->
+  `SearchAnswerGenerator.generate(response)` -> `SearchAnswer.answer` is
+  used as the reply. `WebSearchTool.execute()` (the `Tool`/`ToolResult`
+  path used by the Registry) is untouched; Core instead calls the new
+  `WebSearchTool.search(...)` method directly - the "minimal typed seam"
+  that returns a real `SearchResponse` instead of a dict, so Core never
+  reconstructs one from `ToolResult.data`.
+
+`SearchRouter.route(message)` returns a `SearchDecision` (`DIRECT` /
+`SEARCH`) by regex-matching three fixed categories - explicit search
+requests ("search for", "search the web", "please search", "look up",
+"google it", ...), freshness words ("latest", "current", "today",
+"recent", "now", "this week/month/year"), and live/external-information
+words ("weather", "scores", "results", "prices", "availability").
+**Explicit search intent always overrides the subject** - e.g. "search the
+web and explain quantum entanglement" is SEARCH - which falls out for free
+from doing one unconditional match over every pattern, not from any
+special override logic.
+
+The explicit-search trigger deliberately requires an actual request
+phrasing rather than the bare word "search": a bare `\bsearch\b` would
+match "search" used as a plain noun/algorithm name ("explain binary
+search", "how does depth-first search work") - a very plausible question
+for a programming-context assistant - and wrongly send a stable question
+down the SEARCH path. This was caught and fixed during verification (see
+`tests/test_search_router.py`).
+
+This routing is intentionally coarse (plain keyword matching, not intent
+understanding), and some trigger words are still genuinely ambiguous in
+isolation - "current" ("current events" vs. "electric current"),
+"results" ("latest results" vs. "results of a calculation"), "available"/
+"price"/"score" used in a stable, non-live sense. These are **accepted,
+documented trade-offs** of deterministic keyword matching (verified and
+pinned down by tests, not silently left unhandled), not something this
+milestone attempts to fix with added heuristics - see Postponed decisions.
+
+Both `router`/`answer_generator` are constructor-injectable on
+`JarvisCore`, same DI pattern as `provider`/`memory`/`tools`. A
+`SearchProviderError` (search failed) or `SearchAnswerError` (answer
+generation failed) on the SEARCH path is re-raised as `ProviderError` -
+the same error type the DIRECT path already raises on a Gemini failure -
+so `/chat`'s existing error handling (a 502) needed **no changes** to
+cover the new path. `SearchAnswer.sources` is deliberately **not** exposed
+through `/chat`/`ChatResponse` yet - see Postponed decisions.
 
 - **`SearchProvider`** (`app/search/base.py`) is the interface a search
   backend implements: `search(query, max_results) -> list[SearchResult]`.
@@ -241,8 +297,13 @@ into; it just searches whatever query it's given.
   taking a `SearchProvider` in its constructor (defaulting to a bare
   `SearXNGProvider` when none is given). It has
   `permission = PermissionLevel.READ`, so the Registry runs it immediately
-  with no confirmation step. `execute` turns a `SearchProviderError` into a
-  `ToolResult.error(...)` rather than letting it propagate.
+  with no confirmation step. `search(query, max_results, mode) ->
+  SearchResponse` runs the actual pipeline (planning, multi-query
+  execution, dedup) and is the one place that logic lives; `execute(...)
+  -> ToolResult` is a thin wrapper that calls `search()` and either
+  flattens the `SearchResponse` into `ToolResult.data` or turns a
+  `SearchProviderError` into `ToolResult.error(...)` - `execute()`'s
+  contract (shape and errors) is unchanged from before M6.9.
 - **`SearchProviderManager`** (`app/search/manager.py`) is itself a
   `SearchProvider` that wraps an *ordered list* of other `SearchProvider`s
   and adds fallback: it tries each in turn, moving to the next only when
@@ -493,10 +554,16 @@ These were not decided now, to avoid overbuilding before they're needed:
   is stateless, one message in, one reply out.
 - Dashboard framework — decided when we build the actual dashboard.
 - AI tool-calling (an AI provider choosing which tool to invoke) — Gemini
-  doesn't decide when to call `web_search` yet; tools are invoked directly
-  through the Registry for now. This includes automatic intent routing
-  (deciding *whether* a query needs `web_search` at all, or which `mode`
-  to use) - no AI classifier call is made just to make that decision.
+  still never decides when to call `web_search`; `SearchRouter` (M6.9) is a
+  fixed keyword matcher, not an AI classifier, and tools are still only
+  invoked directly through the Registry (or, for the SEARCH path, directly
+  via `WebSearchTool.search(...)`) - not through any AI-driven tool-calling
+  loop.
+- Smarter routing — mode selection (FAST/RESEARCH/CRITICAL) for a SEARCH
+  message, precision improvements beyond fixed keywords (e.g. "results" as
+  a live-info trigger is intentionally broad and can over-match), and
+  letting a SEARCH request see conversation history/facts the way DIRECT
+  does - `SearchRouter` and the SEARCH path are deliberately simple today.
 - Real Brave/Tavily providers and autonomous research/agents — left for
   later milestones now that `SearchProvider`, `SearchProviderManager`, and
   `CachedSearchProvider` give them a place to plug in.
@@ -504,10 +571,10 @@ These were not decided now, to avoid overbuilding before they're needed:
   UI — `ResultQualityProvider` only deduplicates by URL today; the
   `source`/`query` metadata is preserved for a future presentation layer,
   but no UI renders it yet.
-- Wiring `SearchAnswerGenerator` into `WebSearchTool`, `JarvisCore`, or
-  `/chat` — M6.8 built the standalone layer; nothing in the running app
-  calls it yet, and *whether/when* to generate an answer is still a
-  routing decision for a later milestone.
+- Exposing `SearchAnswer.sources` through `/chat`/`ChatResponse` — M6.9
+  uses `SearchAnswer.answer` as the reply but keeps `sources` internal;
+  `ChatResponse`'s shape is unchanged. Surfacing sources over HTTP is a
+  later milestone.
 - Cache eviction/cleanup of expired rows, background cache refresh, cache
   warming, and semantic/embedding-based cache lookups — `SearchCache` is a
   plain TTL key/value store for now; expired rows are treated as misses but
