@@ -35,6 +35,13 @@ class JarvisCore:
     """Handles chat requests: builds AI context from conversation history and
     stored facts, delegates to an AI provider, then persists the exchange."""
 
+    # Bounds for the conversation context passed to the SEARCH path's
+    # answer generator (M6.10) - small and fixed, so a search-answer prompt
+    # doesn't grow with conversation length the way DIRECT's prompt can.
+    # Not applied to DIRECT, which keeps its existing unbounded behavior.
+    _SEARCH_CONTEXT_MAX_MESSAGES = 6
+    _SEARCH_CONTEXT_MAX_CHARS = 800
+
     def __init__(
         self,
         provider: AIProvider | None = None,
@@ -73,7 +80,9 @@ class JarvisCore:
         generate_reply path unchanged; SEARCH runs the message through
         WebSearchTool -> SearchResponse -> SearchAnswerGenerator instead,
         using the generated answer as the reply. Either way, the final
-        reply is persisted exactly the same way.
+        reply is persisted exactly the same way. Both paths reuse the same
+        `history`/`facts` already loaded below - the SEARCH path never
+        issues its own memory query.
         """
         if conversation_id is None:
             conversation_id = self.memory.create_conversation()
@@ -86,7 +95,7 @@ class JarvisCore:
         facts = self.memory.get_facts()
 
         if self.router.route(message) is SearchDecision.SEARCH:
-            reply = self._handle_search(message)
+            reply = self._handle_search(message, history, facts)
         else:
             prompt = self._build_prompt(message, history, facts)
             reply = self.provider.generate_reply(prompt)
@@ -96,11 +105,19 @@ class JarvisCore:
 
         return reply, conversation_id
 
-    def _handle_search(self, message: str) -> str:
+    def _handle_search(
+        self, message: str, history: list[Message], facts: dict[str, str]
+    ) -> str:
         """SEARCH path: WebSearchTool -> SearchResponse ->
         SearchAnswerGenerator, using SearchAnswer.answer as the reply.
         Source metadata (SearchAnswer.sources) is intentionally not
         surfaced here yet - that's presentation, for a later milestone.
+
+        The search query is `message` alone, exactly as before M6.10 -
+        conversation context is never passed to SearchRouter.route() or
+        WebSearchTool.search(), only to the answer generator afterwards
+        (M6.10), so it can resolve references like "it" or "the deadline"
+        in the question without changing what was actually searched.
 
         Failures from either step are raised as ProviderError, the same
         error type the DIRECT path already raises on an AI-provider
@@ -116,8 +133,15 @@ class JarvisCore:
         except SearchProviderError as exc:
             raise ProviderError(f"Search failed: {exc}") from exc
 
+        context = self._format_context(
+            history, facts, max_messages=self._SEARCH_CONTEXT_MAX_MESSAGES
+        )
+        context = context[-self._SEARCH_CONTEXT_MAX_CHARS :]
+
         try:
-            search_answer = self.answer_generator.generate(response)
+            search_answer = self.answer_generator.generate(
+                response, conversation_context=context
+            )
         except SearchAnswerError as exc:
             raise ProviderError(f"Failed to generate a search answer: {exc}") from exc
 
@@ -133,23 +157,37 @@ class JarvisCore:
         return self.memory.get_facts()
 
     @staticmethod
+    def _format_context(
+        history: list[Message],
+        facts: dict[str, str],
+        max_messages: int | None = None,
+    ) -> str:
+        """Format stored facts and conversation history into plain text -
+        shared by `_build_prompt` (DIRECT, unbounded) and `_handle_search`
+        (SEARCH, bounded to a small recent window via `max_messages`) so
+        both build context the same way instead of duplicating this
+        formatting. Returns "" when there's nothing to include."""
+        parts = []
+        if facts:
+            facts_text = "\n".join(f"- {key}: {value}" for key, value in facts.items())
+            parts.append(f"Known facts about the user:\n{facts_text}")
+        if history:
+            recent = history if max_messages is None else history[-max_messages:]
+            history_text = "\n".join(f"{m.role}: {m.content}" for m in recent)
+            parts.append(f"Conversation so far:\n{history_text}")
+        return "\n\n".join(parts)
+
+    @staticmethod
     def _build_prompt(
         message: str, history: list[Message], facts: dict[str, str]
     ) -> str:
         """Combine stored facts and conversation history into context for
         the provider. With no facts or history, the raw message is sent
         unchanged, matching the original single-turn behavior."""
-        parts = []
-        if facts:
-            facts_text = "\n".join(f"- {key}: {value}" for key, value in facts.items())
-            parts.append(f"Known facts about the user:\n{facts_text}")
-        if history:
-            history_text = "\n".join(f"{m.role}: {m.content}" for m in history)
-            parts.append(f"Conversation so far:\n{history_text}")
-
-        if not parts:
+        context = JarvisCore._format_context(history, facts)
+        if not context:
             return message
-        return "\n\n".join(parts) + f"\n\nUser: {message}"
+        return f"{context}\n\nUser: {message}"
 
 
 core = JarvisCore()

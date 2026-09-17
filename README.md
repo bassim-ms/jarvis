@@ -1,16 +1,16 @@
 # Jarvis
 
-Personal AI assistant project. This is **Milestone 6.9: Automatic Search
-Routing** — `/chat` now decides *deterministically* (fixed keyword
-matching, no extra Gemini call) whether a message needs a web search:
-stable/general questions still go straight to Gemini exactly as before,
-while search-triggering messages run through `WebSearchTool ->
-SearchResponse -> SearchAnswerGenerator` (Milestones 6.1-6.8), using the
-grounded answer as the reply. Explicit search intent always overrides the
-topic. Sources aren't surfaced in the HTTP response yet, and routing is
-intentionally coarse - see [Web Search](#web-search) for what's still
-future work. No autonomous research, citations UI, dashboard, agents,
-voice, or hardware control yet.
+Personal AI assistant project. This is **Milestone 6.10: Conversation-Aware
+Search** — the SEARCH path's answer generation can now see recent
+conversation history/facts, so a follow-up like "what's the latest
+application deadline?" after "tell me about TUM" is understood correctly.
+The actual search query stays exactly the raw current message (still fully
+deterministic, no AI query rewriting), and `SearchRouter`'s DIRECT/SEARCH
+decision (Milestone 6.9) is unchanged - only the *answer* step gets more
+context, and only for reference resolution, never as a second source of
+facts. Sources aren't surfaced in the HTTP response yet - see
+[Web Search](#web-search) for what's still future work. No autonomous
+research, citations UI, dashboard, agents, voice, or hardware control yet.
 
 ## Stack
 
@@ -90,7 +90,7 @@ pytest
 
 Expected output ends with something like:
 ```
-233 passed in 0.XXs
+257 passed in 0.XXs
 ```
 
 Tests never call the real Gemini or SearXNG APIs — `httpx.post` / `httpx.get`
@@ -497,14 +497,15 @@ consumer of this.
 
 ### Search Answer Layer (M6.8)
 
-A standalone, provider-agnostic layer that turns a `SearchResponse` into a
-grounded, free-text answer - **not wired into `WebSearchTool`, `JarvisCore`,
-or `/chat` yet**; it's a ready-to-use capability, tested on its own.
+A provider-agnostic layer that turns a `SearchResponse` into a grounded,
+free-text answer. Since Milestone 6.9 it's the last step of `JarvisCore`'s
+SEARCH path (see Search Routing above); it was built and tested standalone
+first, before being wired in.
 
 - **`SearchAnswerGenerator`** (`app/search/answer.py`) is the interface:
-  `generate(response: SearchResponse) -> SearchAnswer`. It only imports
-  `SearchResponse`/`SearchResult` and the existing `AIProvider` interface -
-  never Gemini's HTTP details directly.
+  `generate(response: SearchResponse, conversation_context: str = "") ->
+  SearchAnswer`. It only imports `SearchResponse`/`SearchResult` and the
+  existing `AIProvider` interface - never Gemini's HTTP details directly.
 - **`GeminiSearchAnswerGenerator`** is the only implementation, built
   entirely on the existing `AIProvider` abstraction (defaulting to
   `GeminiProvider()`, injectable like every other provider in this
@@ -529,6 +530,51 @@ or `/chat` yet**; it's a ready-to-use capability, tested on its own.
   or network failure) is caught and re-raised as `SearchAnswerError`, the
   answer layer's own domain error - matching how `SearXNGError` wraps
   `httpx` errors at the search-provider boundary.
+
+### Conversation-Aware Search (M6.10)
+
+A SEARCH follow-up like "what's the latest application deadline?" right
+after "tell me about TUM" is ambiguous on its own. M6.10 lets the *answer*
+step understand it, without changing what gets searched:
+
+```
+history/facts (already loaded by handle_chat)
+    -> bounded conversation context (JarvisCore._format_context)
+    -> answer_generator.generate(response, conversation_context=...)
+```
+
+- `SearchAnswerGenerator.generate()` gained one optional parameter,
+  `conversation_context: str = ""` (both the abstract interface and
+  `GeminiSearchAnswerGenerator`). When empty (the default), the generated
+  prompt is byte-for-byte identical to before M6.10 - fully backward
+  compatible. When non-empty, the prompt gains a clearly labeled "Recent
+  conversation context (for understanding references only)" section, with
+  explicit instructions: use it *only* to resolve what the question refers
+  to, never as evidence, and never a source of facts/sources/URLs to
+  answer from - the existing M6.8 grounding guarantees (answer only from
+  search evidence, never invent citations) are unchanged and unweakened.
+- **The search query itself is untouched**: `SearchRouter.route(message)`
+  and `WebSearchTool.search(message)` still both receive exactly the raw
+  current message, nothing appended, no AI rewriting. Only
+  `JarvisCore._handle_search` additionally builds a context string and
+  passes it to the answer generator, *after* the search has already run.
+- `JarvisCore._format_context(history, facts, max_messages=None)` is a new
+  shared static helper factoring out the facts/history formatting that
+  `_build_prompt` (DIRECT) already did, so DIRECT and SEARCH don't
+  duplicate that logic. DIRECT still calls it unbounded
+  (`max_messages=None`), so its behavior is **byte-for-byte unchanged**;
+  SEARCH calls it bounded to `JarvisCore._SEARCH_CONTEXT_MAX_MESSAGES`
+  (6 recent messages) and then caps the result to
+  `_SEARCH_CONTEXT_MAX_CHARS` (800 characters) as a defensive backstop -
+  so a search-answer prompt never grows with conversation length the way
+  DIRECT's (still-unbounded) prompt can.
+- Routing (`SearchRouter`, Milestone 6.9) is completely unchanged - it
+  still decides DIRECT vs SEARCH from the current message alone, before
+  any context is built. M6.10 only affects what happens *after* SEARCH has
+  already been chosen; it cannot cause more messages to route to SEARCH.
+- AI-driven search-query rewriting (using context to change *what* gets
+  searched, not just how the answer is worded) is intentionally deferred -
+  see Postponed decisions.
 
 Configuration:
 - `JARVIS_SEARXNG_URL` - base URL of a SearXNG instance (self-hosted or a
@@ -560,10 +606,14 @@ These were not decided now, to avoid overbuilding before they're needed:
   via `WebSearchTool.search(...)`) - not through any AI-driven tool-calling
   loop.
 - Smarter routing — mode selection (FAST/RESEARCH/CRITICAL) for a SEARCH
-  message, precision improvements beyond fixed keywords (e.g. "results" as
-  a live-info trigger is intentionally broad and can over-match), and
-  letting a SEARCH request see conversation history/facts the way DIRECT
-  does - `SearchRouter` and the SEARCH path are deliberately simple today.
+  message, and precision improvements beyond fixed keywords (e.g. "results"
+  as a live-info trigger is intentionally broad and can over-match) -
+  `SearchRouter` is deliberately simple today, and M6.10 didn't change it.
+- AI-driven search-query rewriting/expansion using conversation context —
+  M6.10 only lets the *answer* step see recent context; `WebSearchTool.
+  search(message)` still receives exactly the raw current message. Using
+  context (or an LLM) to construct a better search query is a deliberate,
+  separate future milestone.
 - Real Brave/Tavily providers and autonomous research/agents — left for
   later milestones now that `SearchProvider`, `SearchProviderManager`, and
   `CachedSearchProvider` give them a place to plug in.

@@ -7,10 +7,15 @@ deterministic, validated list of sources - never the other way around.
 Provider-agnostic at the interface level: GeminiSearchAnswerGenerator is
 the only implementation, built entirely on the existing AIProvider
 abstraction (app/providers/base.py) - no separate API key, HTTP client, or
-AI integration of its own.
+AI integration of its own. JarvisCore's SEARCH path (app/core.py) is the
+caller, since M6.9.
 
-Nothing in Jarvis calls this yet - it's a standalone, testable layer ready
-for a future tool/endpoint to use.
+`generate()` also accepts optional `conversation_context` (M6.10): plain
+text built from recent conversation history/facts, used only so a
+follow-up question ("what's the latest deadline?" after "tell me about
+TUM") can be understood - never as a second source of facts to answer
+from, and never fed into the search query itself (that stays exactly the
+raw user message - see app/search/router.py and app/tools/web_search.py).
 """
 
 from abc import ABC, abstractmethod
@@ -54,8 +59,20 @@ class SearchAnswerGenerator(ABC):
     """Turns a SearchResponse into a grounded SearchAnswer."""
 
     @abstractmethod
-    def generate(self, response: SearchResponse) -> SearchAnswer:
-        """Answer the SearchResponse's original query using only its results."""
+    def generate(
+        self, response: SearchResponse, conversation_context: str = ""
+    ) -> SearchAnswer:
+        """Answer the SearchResponse's original query using only its
+        results.
+
+        `conversation_context`, if given, is recent prior conversation
+        (history/facts, formatted as plain text) - used only to resolve
+        references in the question (e.g. "it", "the deadline"), never as
+        evidence to answer from. The search query itself is never derived
+        from this context (see app/search/router.py and
+        app/tools/web_search.py) - it stays exactly the raw message the
+        user sent.
+        """
 
 
 class GeminiSearchAnswerGenerator(SearchAnswerGenerator):
@@ -65,8 +82,10 @@ class GeminiSearchAnswerGenerator(SearchAnswerGenerator):
     def __init__(self, provider: AIProvider | None = None):
         self.provider = provider or GeminiProvider()
 
-    def generate(self, response: SearchResponse) -> SearchAnswer:
-        prompt = self._build_prompt(response)
+    def generate(
+        self, response: SearchResponse, conversation_context: str = ""
+    ) -> SearchAnswer:
+        prompt = self._build_prompt(response, conversation_context)
 
         try:
             raw_answer = self.provider.generate_reply(prompt)
@@ -77,7 +96,7 @@ class GeminiSearchAnswerGenerator(SearchAnswerGenerator):
         return SearchAnswer(answer=raw_answer.strip(), sources=sources)
 
     @staticmethod
-    def _build_prompt(response: SearchResponse) -> str:
+    def _build_prompt(response: SearchResponse, conversation_context: str = "") -> str:
         if response.results:
             evidence = "\n\n".join(
                 f"[{i}] {result.title}\nURL: {result.url}\n{result.snippet}"
@@ -86,12 +105,30 @@ class GeminiSearchAnswerGenerator(SearchAnswerGenerator):
         else:
             evidence = "(no search results were found)"
 
+        # Empty when no context is given, so the prompt is byte-for-byte
+        # identical to the pre-M6.10 prompt in that case.
+        context_section = ""
+        if conversation_context:
+            context_section = (
+                "Recent conversation context (for understanding references "
+                "only):\n"
+                f"{conversation_context}\n\n"
+                "Use this context ONLY to understand what the user's "
+                "question refers to (e.g. a pronoun or an implied subject "
+                "from an earlier message). Do NOT treat it as external "
+                "evidence, and do NOT answer any factual or current claim "
+                "from it - factual/current claims must come only from the "
+                "search evidence below. Never invent facts, sources, or "
+                "URLs from the conversation context either.\n\n"
+            )
+
         return (
             "You are answering a user's question using ONLY the search "
             "evidence below. Do not use outside knowledge, and do not "
             "invent facts, sources, URLs, or citations that are not present "
             "in the evidence. If the evidence is insufficient to answer "
             "confidently, say so explicitly instead of guessing.\n\n"
+            f"{context_section}"
             f"User question: {response.query}\n"
             f"Search mode: {response.mode.value}\n"
             f"Queries searched: {', '.join(response.queries_used)}\n\n"

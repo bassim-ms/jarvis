@@ -104,28 +104,48 @@ class FakeSearchProvider(SearchProvider):
     def __init__(self, results=None, error=None):
         self.results = results if results is not None else []
         self.error = error
+        self.last_query = None
 
     def search(self, query, max_results=5):
+        self.last_query = query
         if self.error:
             raise self.error
         return self.results
 
 
 class FakeAnswerGenerator(SearchAnswerGenerator):
-    """Records the SearchResponse it was given and returns a fixed
-    SearchAnswer, or raises - decoupled from Gemini's citation-matching
-    logic, which is covered by tests/test_search_answer.py."""
+    """Records the SearchResponse and conversation_context it was given
+    and returns a fixed SearchAnswer, or raises - decoupled from Gemini's
+    citation-matching/prompt logic, which is covered by
+    tests/test_search_answer.py."""
 
     def __init__(self, answer: str = "search answer", error: Exception | None = None):
         self.answer = answer
         self.error = error
         self.last_response = None
+        self.last_context = None
 
-    def generate(self, response):
+    def generate(self, response, conversation_context=""):
         self.last_response = response
+        self.last_context = conversation_context
         if self.error:
             raise self.error
         return SearchAnswer(answer=self.answer, sources=[])
+
+
+class RecordingRouter(SearchRouter):
+    """Wraps the real deterministic routing but records the exact message
+    it was asked to route, to prove Core never appends conversation
+    context before routing - M6.10 only affects what happens AFTER a
+    SEARCH decision has already been made, never routing itself."""
+
+    def __init__(self):
+        super().__init__()
+        self.last_message = None
+
+    def route(self, message):
+        self.last_message = message
+        return super().route(message)
 
 
 def make_search_core(
@@ -133,6 +153,7 @@ def make_search_core(
     search_provider: SearchProvider | None = None,
     answer_generator: SearchAnswerGenerator | None = None,
     register_web_search: bool = True,
+    router: SearchRouter | None = None,
 ) -> tuple[JarvisCore, FakeProvider, ToolRegistry]:
     provider = FakeProvider(reply)
     tools = ToolRegistry()
@@ -142,6 +163,7 @@ def make_search_core(
         provider=provider,
         memory=SQLiteMemoryStore(":memory:"),
         tools=tools,
+        router=router,
         answer_generator=answer_generator,
     )
     return jarvis, provider, tools
@@ -169,6 +191,7 @@ def test_handle_chat_uses_direct_path_for_a_stable_question():
     assert reply == "gemini answer"
     assert provider.last_message is not None
     assert answer_generator.last_response is None  # SEARCH path never ran
+    assert answer_generator.last_context is None  # never even called
 
 
 def test_handle_chat_uses_search_path_for_a_search_triggering_message():
@@ -254,3 +277,122 @@ def test_search_path_without_a_registered_web_search_tool_raises_provider_error(
 
     with pytest.raises(ProviderError, match="web_search"):
         jarvis.handle_chat("what's the latest news?")
+
+
+# --- M6.10: conversation context for the SEARCH answer step -----------------
+
+
+def test_search_path_passes_recent_conversation_context_to_the_answer_generator():
+    """The TUM example: a follow-up SEARCH question gets the prior DIRECT
+    turn in its conversation_context, so "the latest application deadline"
+    can be understood to mean TUM's deadline."""
+    answer_generator = FakeAnswerGenerator(answer="grounded answer")
+    jarvis, _, _ = make_search_core(
+        reply="TUM is a university in Munich.", answer_generator=answer_generator
+    )
+
+    _, conversation_id = jarvis.handle_chat("tell me about TUM")
+    jarvis.handle_chat(
+        "what's the latest application deadline?", conversation_id=conversation_id
+    )
+
+    assert answer_generator.last_context
+    assert "TUM" in answer_generator.last_context
+
+
+def test_search_path_context_includes_the_earlier_relevant_turn():
+    answer_generator = FakeAnswerGenerator()
+    jarvis, _, _ = make_search_core(
+        reply="TUM is a university in Munich.", answer_generator=answer_generator
+    )
+
+    _, conversation_id = jarvis.handle_chat("tell me about TUM")
+    jarvis.handle_chat(
+        "what's the latest application deadline?", conversation_id=conversation_id
+    )
+
+    context = answer_generator.last_context
+    assert "tell me about TUM" in context
+    assert "TUM is a university in Munich." in context
+
+
+def test_search_path_context_is_bounded_to_the_configured_message_window():
+    answer_generator = FakeAnswerGenerator()
+    jarvis, _, _ = make_search_core(reply="ok", answer_generator=answer_generator)
+
+    _, conversation_id = jarvis.handle_chat("oldest message, should drop out")
+    for i in range(5):
+        jarvis.handle_chat(f"filler {i}", conversation_id=conversation_id)
+    jarvis.handle_chat("what's the latest news?", conversation_id=conversation_id)
+
+    context = answer_generator.last_context
+    assert "oldest message, should drop out" not in context
+    assert "filler 0" not in context
+    assert "filler 1" not in context
+    assert "filler 4" in context  # within the last _SEARCH_CONTEXT_MAX_MESSAGES
+
+
+def test_search_path_context_has_a_defensive_character_cap():
+    answer_generator = FakeAnswerGenerator()
+    jarvis, _, _ = make_search_core(
+        reply="x" * 2000, answer_generator=answer_generator
+    )
+
+    _, conversation_id = jarvis.handle_chat("tell me something long")
+    jarvis.handle_chat("what's the latest news?", conversation_id=conversation_id)
+
+    assert len(answer_generator.last_context) <= JarvisCore._SEARCH_CONTEXT_MAX_CHARS
+
+
+def test_search_router_still_receives_only_the_raw_current_message():
+    """M6.10 must not change what SearchRouter sees - routing is decided
+    entirely from the current message, same as M6.9."""
+    router = RecordingRouter()
+    jarvis, _, _ = make_search_core(
+        reply="TUM is a university in Munich.", router=router
+    )
+
+    _, conversation_id = jarvis.handle_chat("tell me about TUM")
+    jarvis.handle_chat(
+        "what's the latest application deadline?", conversation_id=conversation_id
+    )
+
+    assert router.last_message == "what's the latest application deadline?"
+
+
+def test_web_search_still_receives_only_the_raw_current_message():
+    """M6.10 must not change what WebSearchTool.search() is asked to
+    search - the search query stays exactly the current raw message,
+    never enriched with conversation context."""
+    search_provider = FakeSearchProvider(results=[])
+    jarvis, _, _ = make_search_core(
+        reply="TUM is a university in Munich.", search_provider=search_provider
+    )
+
+    _, conversation_id = jarvis.handle_chat("tell me about TUM")
+    jarvis.handle_chat(
+        "what's the latest application deadline?", conversation_id=conversation_id
+    )
+
+    assert search_provider.last_query == "what's the latest application deadline?"
+
+
+def test_search_response_propagation_to_the_answer_generator_is_unchanged():
+    """SearchResponse itself (query/mode/queries_used/results) still flows
+    through to the answer generator exactly as in M6.9 - only the new,
+    separate conversation_context argument was added."""
+    answer_generator = FakeAnswerGenerator()
+    search_provider = FakeSearchProvider(
+        results=[SearchResult(title="T", url="https://x.com", snippet="s")]
+    )
+    jarvis, _, _ = make_search_core(
+        search_provider=search_provider, answer_generator=answer_generator
+    )
+
+    jarvis.handle_chat("what's the latest news?")
+
+    response = answer_generator.last_response
+    assert response.query == "what's the latest news?"
+    assert response.results == [
+        SearchResult(title="T", url="https://x.com", snippet="s")
+    ]

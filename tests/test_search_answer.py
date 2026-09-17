@@ -220,6 +220,88 @@ def test_repeated_citation_of_the_same_url_is_deduplicated():
     ]
 
 
+# --- M6.10: conversation_context for reference resolution --------------------
+
+
+def test_conversation_context_appears_in_the_prompt_when_supplied():
+    provider = FakeAIProvider(reply="answer text")
+    generator = GeminiSearchAnswerGenerator(provider=provider)
+    response = make_response(results=[RESULT_A])
+
+    generator.generate(
+        response,
+        conversation_context=(
+            "user: tell me about TUM\nassistant: TUM is a university in Munich."
+        ),
+    )
+
+    prompt = provider.last_message
+    assert "tell me about TUM" in prompt
+    assert "TUM is a university in Munich." in prompt
+
+
+def test_conversation_context_section_is_clearly_labeled_for_reference_resolution_only():
+    provider = FakeAIProvider(reply="answer text")
+    generator = GeminiSearchAnswerGenerator(provider=provider)
+    response = make_response(results=[RESULT_A])
+
+    generator.generate(response, conversation_context="user: tell me about TUM")
+
+    prompt = provider.last_message
+    assert "Recent conversation context" in prompt
+    assert "for understanding references only" in prompt
+    assert "Do NOT treat it as external evidence" in prompt
+    assert "never invent facts" in prompt.lower()
+
+
+def test_conversation_context_section_is_absent_when_empty():
+    provider = FakeAIProvider(reply="answer text")
+    generator = GeminiSearchAnswerGenerator(provider=provider)
+    response = make_response(results=[RESULT_A])
+
+    generator.generate(response, conversation_context="")
+
+    assert "Recent conversation context" not in provider.last_message
+
+
+def test_generate_without_the_context_argument_is_backward_compatible():
+    """Omitting conversation_context entirely must produce the exact same
+    prompt as explicitly passing an empty one - existing callers (and
+    existing tests written before M6.10) keep working unchanged."""
+    provider_no_arg = FakeAIProvider(reply="answer text")
+    provider_empty_arg = FakeAIProvider(reply="answer text")
+    response = make_response(results=[RESULT_A])
+
+    GeminiSearchAnswerGenerator(provider=provider_no_arg).generate(response)
+    GeminiSearchAnswerGenerator(provider=provider_empty_arg).generate(
+        response, conversation_context=""
+    )
+
+    assert provider_no_arg.last_message == provider_empty_arg.last_message
+
+
+def test_urls_mentioned_only_in_conversation_context_are_not_treated_as_sources():
+    """Grounding guarantee (M6.8) holds even with conversation context
+    present: a URL that only appears in the conversation_context (not in
+    the actual search evidence) never becomes a SearchSource, even if
+    Gemini's reply happens to repeat it."""
+    provider = FakeAIProvider(
+        reply=(
+            f"Following up on https://not-a-search-result.example and "
+            f"{RESULT_A.url}, here is the answer."
+        )
+    )
+    generator = GeminiSearchAnswerGenerator(provider=provider)
+    response = make_response(results=[RESULT_A])
+
+    context = "user: check https://not-a-search-result.example\nassistant: ok"
+    answer = generator.generate(response, conversation_context=context)
+
+    assert answer.sources == [
+        SearchSource(title="Python.org", url="https://python.org", query="python")
+    ]
+
+
 # --- Provider/API failure handling --------------------------------------------
 
 
