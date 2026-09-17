@@ -1,11 +1,12 @@
 """
-Capability Decision Layer (M6.13, extended in M6.14 with TOOL).
+Capability Decision Layer (M6.13, extended in M6.14 with TOOL, and M6.15
+with hybrid/AI-fallback routing).
 
 The high-level "who should handle this message" decision - DIRECT, SEARCH,
-and (M6.14) TOOL today, more capabilities (MEMORY, EMAIL, CALENDAR,
-PRINTER, ROBOTIC_ARM, ...) later - lives here, not in JarvisCore.
-JarvisCore (app/core.py) only orchestrates: it asks a CapabilityRouter for
-a CapabilityDecision and dispatches on it, never encoding routing rules
+and TOOL today, more capabilities (MEMORY, EMAIL, CALENDAR, PRINTER,
+ROBOTIC_ARM, ...) later - lives here, not in JarvisCore. JarvisCore
+(app/core.py) only orchestrates: it asks a CapabilityRouter for a
+CapabilityDecision and dispatches on it, never encoding routing rules
 itself.
 
 Only DIRECT, SEARCH, and TOOL are implemented - no other Capability member
@@ -20,13 +21,27 @@ tests, tests/test_search_router.py) stays the single source of truth for
 that matching; it's no longer the top-level interface JarvisCore talks to
 directly for the decision. TOOL detection (M6.14) is a separate, narrow,
 purely textual check - see DeterministicCapabilityRouter's docstring.
+
+M6.15 adds HybridCapabilityRouter: deterministic routing stays the fast
+path for every message it can already confidently resolve (which is still
+almost every message); only a message the deterministic layer itself
+flags as genuinely ambiguous - see HybridCapabilityRouter's docstring for
+the exact, narrow boundary - falls back to GeminiCapabilityDecisionProvider,
+built entirely on the existing AIProvider/GeminiProvider (no second Gemini
+client, no new config, no paid API). Gemini only ever returns a decision;
+it never executes anything - JarvisCore._handle_tool and ToolRegistry
+remain the only things that ever run a tool, exactly as in M6.14, and a
+Gemini decision is strictly validated before JarvisCore ever sees it.
 """
 
+import json
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
 
+from app.providers.base import AIProvider, ProviderError
+from app.providers.gemini import GeminiProvider
 from app.search.router import SearchDecision, SearchRouter
 
 
@@ -145,3 +160,200 @@ class DeterministicCapabilityRouter(CapabilityRouter):
             else Capability.DIRECT
         )
         return CapabilityDecision(capability=capability)
+
+
+class CapabilityDecisionError(RuntimeError):
+    """Raised when a CapabilityDecisionProvider can't produce a valid
+    CapabilityDecision - a failed AI call, malformed output, or output
+    that fails strict schema validation. Never silently guessed around:
+    JarvisCore (app/core.py) catches this and re-raises it as
+    ProviderError, the same 502-producing convention SearchAnswerError
+    already uses at the SEARCH path's boundary (M6.8)."""
+
+
+class CapabilityDecisionProvider(ABC):
+    """Asks an AI for a CapabilityDecision on a message the deterministic
+    fast path couldn't confidently resolve on its own.
+
+    Only ever consulted for genuinely ambiguous messages - see
+    HybridCapabilityRouter - never for the deterministic fast path, and
+    never to execute anything: it only returns a decision for JarvisCore
+    to dispatch through the existing DIRECT/SEARCH/TOOL paths, exactly
+    like any other CapabilityDecision. It has no access to, and no
+    knowledge of, ToolRegistry or any tool's implementation.
+    """
+
+    @abstractmethod
+    def decide(self, message: str) -> CapabilityDecision:
+        """Return a validated CapabilityDecision for `message`, or raise
+        CapabilityDecisionError if the underlying AI call fails or its
+        output isn't valid, safe, structured output - never a guess."""
+
+
+# Only "capability"/"tool_name" - see GeminiCapabilityDecisionProvider's
+# docstring for the exact validation rules applied to each.
+_VALID_DECISION_KEYS = {"capability", "tool_name"}
+_VALID_CAPABILITY_NAMES = {member.name for member in Capability}
+
+# Deliberately small and fixed - the same message every time, no per-call
+# variation beyond the user's own message. No tool names, descriptions, or
+# registry contents are included: Gemini is never given enough to attempt
+# real tool selection, only enough to pick one of three capability names.
+_DECISION_PROMPT = (
+    "You are a strict capability classifier for a personal assistant. "
+    "Choose exactly ONE capability for the user's message:\n"
+    "- DIRECT: answerable directly from general knowledge, reasoning, "
+    "writing, or calculation - no current/external information or a tool "
+    "is needed.\n"
+    "- SEARCH: needs current, external, or live information from the web.\n"
+    "- TOOL: the user is explicitly asking to invoke a specific named "
+    "tool or action, not just asking a question about one.\n\n"
+    "Respond with ONLY one JSON object, no prose, no markdown formatting, "
+    'in exactly this shape: {"capability": "DIRECT|SEARCH|TOOL", '
+    '"tool_name": null or a string}. tool_name must be null unless '
+    "capability is TOOL, and if capability is TOOL, tool_name must be a "
+    "real, concrete, non-empty tool name - never TOOL with a null "
+    "tool_name.\n\n"
+    "User message: "
+)
+
+# Gemini often wraps JSON in a markdown code fence even when told not to;
+# stripping a leading/trailing fence is tolerant formatting cleanup, not
+# guessing at content - the JSON underneath still has to pass full
+# validation below.
+_CODE_FENCE_PATTERN = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
+
+
+class GeminiCapabilityDecisionProvider(CapabilityDecisionProvider):
+    """CapabilityDecisionProvider backed by the existing AIProvider/Gemini
+    integration - the same free-tier client GeminiProvider (and
+    GeminiSearchAnswerGenerator) already use. No second Gemini client, no
+    new API key/config, no billing.
+
+    `_parse_decision` enforces strict structured output before any
+    CapabilityDecision is ever constructed from it:
+    - the response must be valid JSON (after stripping an optional
+      markdown code fence) and must decode to an object.
+    - only "capability" and "tool_name" keys are allowed - any other key
+      makes the whole decision invalid.
+    - "capability" must be a string matching DIRECT/SEARCH/TOOL
+      case-insensitively; anything else is invalid.
+    - if capability is TOOL, "tool_name" must be a non-empty string -
+      TOOL with a null/missing/blank tool_name is invalid (this AI path
+      exists specifically to resolve that exact ambiguity, so an
+      unresolved TOOL answer is a failure, not a valid decision).
+    - if capability is DIRECT or SEARCH, "tool_name" must be null/absent -
+      a non-null tool_name there is invalid, not silently ignored.
+    Any failure raises CapabilityDecisionError - never a fallback guess.
+    """
+
+    def __init__(self, provider: AIProvider | None = None):
+        self.provider = provider or GeminiProvider()
+
+    def decide(self, message: str) -> CapabilityDecision:
+        prompt = _DECISION_PROMPT + message
+
+        try:
+            raw = self.provider.generate_reply(prompt)
+        except ProviderError as exc:
+            raise CapabilityDecisionError(
+                f"Failed to get a capability decision: {exc}"
+            ) from exc
+
+        return self._parse_decision(raw)
+
+    @staticmethod
+    def _parse_decision(raw: str) -> CapabilityDecision:
+        cleaned = _CODE_FENCE_PATTERN.sub("", raw.strip()).strip()
+
+        try:
+            payload = json.loads(cleaned)
+        except json.JSONDecodeError as exc:
+            raise CapabilityDecisionError(
+                f"Invalid JSON from capability decision provider: {raw!r}"
+            ) from exc
+
+        if not isinstance(payload, dict):
+            raise CapabilityDecisionError(
+                f"Expected a JSON object, got: {raw!r}"
+            )
+
+        extra_keys = set(payload) - _VALID_DECISION_KEYS
+        if extra_keys:
+            raise CapabilityDecisionError(
+                f"Unexpected fields in capability decision: {sorted(extra_keys)}"
+            )
+
+        capability_raw = payload.get("capability")
+        if not isinstance(capability_raw, str):
+            raise CapabilityDecisionError(
+                f"Missing or invalid 'capability' in decision: {raw!r}"
+            )
+
+        capability_name = capability_raw.strip().upper()
+        if capability_name not in _VALID_CAPABILITY_NAMES:
+            raise CapabilityDecisionError(f"Unknown capability: {capability_raw!r}")
+
+        capability = Capability[capability_name]
+        tool_name = payload.get("tool_name")
+
+        if capability is Capability.TOOL:
+            if not isinstance(tool_name, str) or not tool_name.strip():
+                raise CapabilityDecisionError(
+                    "TOOL decision must include a non-empty 'tool_name'"
+                )
+        elif tool_name is not None:
+            raise CapabilityDecisionError(
+                "'tool_name' must be null unless capability is TOOL, got: "
+                f"{tool_name!r}"
+            )
+
+        return CapabilityDecision(capability=capability, tool_name=tool_name)
+
+
+class HybridCapabilityRouter(CapabilityRouter):
+    """Deterministic-first, AI-fallback-only capability routing (M6.15).
+
+    Tries `deterministic_router` (defaulting to a bare
+    DeterministicCapabilityRouter()) first. Every DIRECT/SEARCH decision,
+    and every TOOL decision with a concrete `tool_name`, is returned
+    exactly as-is - zero AI calls, and no behavior change from M6.14 for
+    any of those messages. `decision_provider` (defaulting to
+    GeminiCapabilityDecisionProvider()) is consulted ONLY when the
+    deterministic router itself reports genuine ambiguity, and at most
+    once per message - never for the deterministic fast path, never twice
+    for one message, never as a second opinion on a confident decision.
+
+    Ambiguity boundary: a `CapabilityDecision(TOOL, tool_name=None)` - an
+    explicit tool-invocation phrasing ("use tool") with nothing actually
+    named - is deliberately the ONLY signal treated as ambiguous. This
+    reuses M6.14's own existing typed "TOOL, but nothing to dispatch to"
+    representation rather than inventing a new ambiguity heuristic or a
+    confidence score: every other message the deterministic router
+    resolves (DIRECT by default, SEARCH via SearchRouter's patterns, TOOL
+    with a named tool) is treated as fully confident, matching M6.9-M6.14
+    behavior exactly - see the README's Hybrid Capability Routing section
+    for the reasoning.
+
+    Whatever CapabilityDecision the decision_provider returns still goes
+    through JarvisCore's normal dispatch (app/core.py) - for TOOL, that
+    means `JarvisCore._handle_tool` -> `ToolRegistry.execute(...)`, the
+    exact same path a deterministic TOOL decision already uses. Gemini
+    never touches ToolRegistry and never executes a tool itself.
+    """
+
+    def __init__(
+        self,
+        deterministic_router: CapabilityRouter | None = None,
+        decision_provider: CapabilityDecisionProvider | None = None,
+    ):
+        self.deterministic_router = (
+            deterministic_router or DeterministicCapabilityRouter()
+        )
+        self.decision_provider = decision_provider or GeminiCapabilityDecisionProvider()
+
+    def route(self, message: str) -> CapabilityDecision:
+        decision = self.deterministic_router.route(message)
+        if decision.capability is Capability.TOOL and decision.tool_name is None:
+            return self.decision_provider.decide(message)
+        return decision

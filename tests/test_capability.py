@@ -13,9 +13,14 @@ import pytest
 from app.capability import (
     Capability,
     CapabilityDecision,
+    CapabilityDecisionError,
+    CapabilityDecisionProvider,
     CapabilityRouter,
     DeterministicCapabilityRouter,
+    GeminiCapabilityDecisionProvider,
+    HybridCapabilityRouter,
 )
+from app.providers.base import AIProvider, ProviderError
 from app.search.router import SearchDecision, SearchRouter
 
 
@@ -297,3 +302,415 @@ def test_freshness_request_still_routes_search_after_tool_addition():
     decision = router.route("what's the latest news on AI?")
 
     assert decision == CapabilityDecision(capability=Capability.SEARCH)
+
+
+# --- M6.15: hybrid capability routing ==========================================
+
+
+class FakeAIProvider(AIProvider):
+    """Fake AIProvider for testing GeminiCapabilityDecisionProvider without
+    a real Gemini call. Records the prompt it was given."""
+
+    def __init__(self, reply: str = "", error: Exception | None = None):
+        self.reply = reply
+        self.error = error
+        self.last_message: str | None = None
+
+    def generate_reply(self, message: str) -> str:
+        self.last_message = message
+        if self.error:
+            raise self.error
+        return self.reply
+
+
+class FakeCapabilityDecisionProvider(CapabilityDecisionProvider):
+    """Records whether/how it was called and returns a fixed
+    CapabilityDecision, or raises - decoupled from
+    GeminiCapabilityDecisionProvider's own prompt/JSON logic, which is
+    covered separately below."""
+
+    def __init__(
+        self,
+        decision: CapabilityDecision | None = None,
+        error: Exception | None = None,
+    ):
+        self.decision = decision
+        self.error = error
+        self.last_message: str | None = None
+        self.call_count = 0
+
+    def decide(self, message: str) -> CapabilityDecision:
+        self.call_count += 1
+        self.last_message = message
+        if self.error:
+            raise self.error
+        return self.decision
+
+
+class FakeDeterministicRouter(CapabilityRouter):
+    """Always returns a fixed CapabilityDecision, ignoring the message -
+    used to give HybridCapabilityRouter precise, controlled "deterministic
+    stage" results without depending on real regex matching."""
+
+    def __init__(self, decision: CapabilityDecision):
+        self.decision = decision
+
+    def route(self, message: str) -> CapabilityDecision:
+        return self.decision
+
+
+# --- HybridCapabilityRouter: deterministic fast path (no Gemini call) --------
+
+
+def test_hybrid_router_obvious_direct_does_not_call_the_decision_provider():
+    decision_provider = FakeCapabilityDecisionProvider()
+    router = HybridCapabilityRouter(decision_provider=decision_provider)
+
+    decision = router.route("what is quantum entanglement?")
+
+    assert decision == CapabilityDecision(capability=Capability.DIRECT)
+    assert decision_provider.call_count == 0
+
+
+def test_hybrid_router_obvious_search_does_not_call_the_decision_provider():
+    decision_provider = FakeCapabilityDecisionProvider()
+    router = HybridCapabilityRouter(decision_provider=decision_provider)
+
+    decision = router.route("what's the latest news on AI?")
+
+    assert decision == CapabilityDecision(capability=Capability.SEARCH)
+    assert decision_provider.call_count == 0
+
+
+def test_hybrid_router_explicit_tool_invocation_does_not_call_the_decision_provider():
+    decision_provider = FakeCapabilityDecisionProvider()
+    router = HybridCapabilityRouter(decision_provider=decision_provider)
+
+    decision = router.route("use tool echo")
+
+    assert decision == CapabilityDecision(capability=Capability.TOOL, tool_name="echo")
+    assert decision_provider.call_count == 0
+
+
+def test_hybrid_router_false_positive_protection_still_intact():
+    """Existing M6.9/M6.14 false-positive protections still hold through
+    the hybrid router without ever reaching Gemini."""
+    decision_provider = FakeCapabilityDecisionProvider()
+    router = HybridCapabilityRouter(decision_provider=decision_provider)
+
+    decision = router.route("how does depth-first search work?")
+
+    assert decision.capability is Capability.DIRECT
+    assert decision_provider.call_count == 0
+
+
+# --- HybridCapabilityRouter: ambiguous path (Gemini fallback) -----------------
+
+
+def test_hybrid_router_ambiguous_tool_without_name_invokes_the_decision_provider():
+    decision_provider = FakeCapabilityDecisionProvider(
+        decision=CapabilityDecision(capability=Capability.DIRECT)
+    )
+    router = HybridCapabilityRouter(decision_provider=decision_provider)
+
+    router.route("use tool")
+
+    assert decision_provider.call_count == 1
+
+
+def test_hybrid_router_passes_the_raw_message_to_the_decision_provider():
+    decision_provider = FakeCapabilityDecisionProvider(
+        decision=CapabilityDecision(capability=Capability.DIRECT)
+    )
+    router = HybridCapabilityRouter(decision_provider=decision_provider)
+
+    router.route("use tool")
+
+    assert decision_provider.last_message == "use tool"
+
+
+def test_hybrid_router_returns_the_providers_direct_decision():
+    decision_provider = FakeCapabilityDecisionProvider(
+        decision=CapabilityDecision(capability=Capability.DIRECT)
+    )
+    router = HybridCapabilityRouter(
+        deterministic_router=FakeDeterministicRouter(
+            CapabilityDecision(capability=Capability.TOOL, tool_name=None)
+        ),
+        decision_provider=decision_provider,
+    )
+
+    decision = router.route("use tool")
+
+    assert decision == CapabilityDecision(capability=Capability.DIRECT)
+
+
+def test_hybrid_router_returns_the_providers_search_decision():
+    decision_provider = FakeCapabilityDecisionProvider(
+        decision=CapabilityDecision(capability=Capability.SEARCH)
+    )
+    router = HybridCapabilityRouter(
+        deterministic_router=FakeDeterministicRouter(
+            CapabilityDecision(capability=Capability.TOOL, tool_name=None)
+        ),
+        decision_provider=decision_provider,
+    )
+
+    decision = router.route("use tool")
+
+    assert decision == CapabilityDecision(capability=Capability.SEARCH)
+
+
+def test_hybrid_router_returns_the_providers_tool_decision_with_tool_name():
+    decision_provider = FakeCapabilityDecisionProvider(
+        decision=CapabilityDecision(capability=Capability.TOOL, tool_name="echo")
+    )
+    router = HybridCapabilityRouter(
+        deterministic_router=FakeDeterministicRouter(
+            CapabilityDecision(capability=Capability.TOOL, tool_name=None)
+        ),
+        decision_provider=decision_provider,
+    )
+
+    decision = router.route("use tool")
+
+    assert decision == CapabilityDecision(capability=Capability.TOOL, tool_name="echo")
+
+
+def test_hybrid_router_never_calls_the_decision_provider_more_than_once():
+    decision_provider = FakeCapabilityDecisionProvider(
+        decision=CapabilityDecision(capability=Capability.DIRECT)
+    )
+    router = HybridCapabilityRouter(decision_provider=decision_provider)
+
+    router.route("use tool")
+
+    assert decision_provider.call_count == 1
+
+
+def test_hybrid_router_default_deterministic_router_is_a_bare_one():
+    router = HybridCapabilityRouter()
+
+    assert isinstance(router.deterministic_router, DeterministicCapabilityRouter)
+
+
+def test_hybrid_router_default_decision_provider_is_gemini_backed():
+    router = HybridCapabilityRouter()
+
+    assert isinstance(router.decision_provider, GeminiCapabilityDecisionProvider)
+
+
+def test_hybrid_router_is_a_capability_router():
+    assert isinstance(HybridCapabilityRouter(), CapabilityRouter)
+
+
+# --- HybridCapabilityRouter: provider failure ---------------------------------
+
+
+def test_hybrid_router_propagates_capability_decision_error_from_the_provider():
+    decision_provider = FakeCapabilityDecisionProvider(
+        error=CapabilityDecisionError("Gemini is down")
+    )
+    router = HybridCapabilityRouter(decision_provider=decision_provider)
+
+    with pytest.raises(CapabilityDecisionError, match="Gemini is down"):
+        router.route("use tool")
+
+
+# --- GeminiCapabilityDecisionProvider: prompt/request shape -------------------
+
+
+def test_decide_sends_the_message_and_the_three_capability_names_in_the_prompt():
+    provider = FakeAIProvider(reply='{"capability": "DIRECT", "tool_name": null}')
+    decision_provider = GeminiCapabilityDecisionProvider(provider=provider)
+
+    decision_provider.decide("check my calendar for tomorrow")
+
+    prompt = provider.last_message
+    assert "check my calendar for tomorrow" in prompt
+    assert "DIRECT" in prompt
+    assert "SEARCH" in prompt
+    assert "TOOL" in prompt
+
+
+def test_decide_does_not_mention_any_specific_registered_tool_name():
+    """No tool descriptions/registry contents are ever sent to Gemini -
+    only the fixed capability names."""
+    provider = FakeAIProvider(reply='{"capability": "DIRECT", "tool_name": null}')
+    decision_provider = GeminiCapabilityDecisionProvider(provider=provider)
+
+    decision_provider.decide("do something")
+
+    assert "echo" not in provider.last_message
+    assert "web_search" not in provider.last_message
+
+
+# --- GeminiCapabilityDecisionProvider: valid structured output ----------------
+
+
+def test_valid_direct_response_becomes_direct_decision():
+    provider = FakeAIProvider(reply='{"capability": "DIRECT", "tool_name": null}')
+    decision_provider = GeminiCapabilityDecisionProvider(provider=provider)
+
+    decision = decision_provider.decide("some ambiguous message")
+
+    assert decision == CapabilityDecision(capability=Capability.DIRECT)
+
+
+def test_valid_search_response_becomes_search_decision():
+    provider = FakeAIProvider(reply='{"capability": "SEARCH", "tool_name": null}')
+    decision_provider = GeminiCapabilityDecisionProvider(provider=provider)
+
+    decision = decision_provider.decide("some ambiguous message")
+
+    assert decision == CapabilityDecision(capability=Capability.SEARCH)
+
+
+def test_valid_tool_response_becomes_tool_decision_with_tool_name():
+    provider = FakeAIProvider(reply='{"capability": "TOOL", "tool_name": "echo"}')
+    decision_provider = GeminiCapabilityDecisionProvider(provider=provider)
+
+    decision = decision_provider.decide("some ambiguous message")
+
+    assert decision == CapabilityDecision(capability=Capability.TOOL, tool_name="echo")
+
+
+def test_lowercase_capability_value_is_normalized():
+    provider = FakeAIProvider(reply='{"capability": "direct", "tool_name": null}')
+    decision_provider = GeminiCapabilityDecisionProvider(provider=provider)
+
+    decision = decision_provider.decide("some ambiguous message")
+
+    assert decision.capability is Capability.DIRECT
+
+
+def test_tool_name_is_preserved_verbatim_not_normalized():
+    provider = FakeAIProvider(reply='{"capability": "TOOL", "tool_name": "Echo"}')
+    decision_provider = GeminiCapabilityDecisionProvider(provider=provider)
+
+    decision = decision_provider.decide("some ambiguous message")
+
+    assert decision.tool_name == "Echo"
+
+
+def test_markdown_code_fence_is_tolerated_before_parsing():
+    provider = FakeAIProvider(
+        reply='```json\n{"capability": "DIRECT", "tool_name": null}\n```'
+    )
+    decision_provider = GeminiCapabilityDecisionProvider(provider=provider)
+
+    decision = decision_provider.decide("some ambiguous message")
+
+    assert decision == CapabilityDecision(capability=Capability.DIRECT)
+
+
+def test_tool_name_key_may_be_omitted_entirely_for_non_tool_capabilities():
+    provider = FakeAIProvider(reply='{"capability": "DIRECT"}')
+    decision_provider = GeminiCapabilityDecisionProvider(provider=provider)
+
+    decision = decision_provider.decide("some ambiguous message")
+
+    assert decision == CapabilityDecision(capability=Capability.DIRECT)
+
+
+# --- GeminiCapabilityDecisionProvider: strict validation, fails safely --------
+
+
+def test_invalid_json_raises_capability_decision_error():
+    provider = FakeAIProvider(reply="sure, I'd say this is a DIRECT question.")
+    decision_provider = GeminiCapabilityDecisionProvider(provider=provider)
+
+    with pytest.raises(CapabilityDecisionError):
+        decision_provider.decide("some ambiguous message")
+
+
+def test_non_object_json_raises_capability_decision_error():
+    provider = FakeAIProvider(reply='"DIRECT"')
+    decision_provider = GeminiCapabilityDecisionProvider(provider=provider)
+
+    with pytest.raises(CapabilityDecisionError):
+        decision_provider.decide("some ambiguous message")
+
+
+def test_missing_capability_key_raises_capability_decision_error():
+    provider = FakeAIProvider(reply='{"tool_name": null}')
+    decision_provider = GeminiCapabilityDecisionProvider(provider=provider)
+
+    with pytest.raises(CapabilityDecisionError):
+        decision_provider.decide("some ambiguous message")
+
+
+def test_invalid_capability_value_raises_capability_decision_error():
+    provider = FakeAIProvider(reply='{"capability": "AUTOMATION", "tool_name": null}')
+    decision_provider = GeminiCapabilityDecisionProvider(provider=provider)
+
+    with pytest.raises(CapabilityDecisionError):
+        decision_provider.decide("some ambiguous message")
+
+
+def test_tool_without_tool_name_raises_capability_decision_error():
+    provider = FakeAIProvider(reply='{"capability": "TOOL", "tool_name": null}')
+    decision_provider = GeminiCapabilityDecisionProvider(provider=provider)
+
+    with pytest.raises(CapabilityDecisionError):
+        decision_provider.decide("some ambiguous message")
+
+
+def test_tool_with_missing_tool_name_key_raises_capability_decision_error():
+    provider = FakeAIProvider(reply='{"capability": "TOOL"}')
+    decision_provider = GeminiCapabilityDecisionProvider(provider=provider)
+
+    with pytest.raises(CapabilityDecisionError):
+        decision_provider.decide("some ambiguous message")
+
+
+def test_tool_with_blank_tool_name_raises_capability_decision_error():
+    provider = FakeAIProvider(reply='{"capability": "TOOL", "tool_name": "   "}')
+    decision_provider = GeminiCapabilityDecisionProvider(provider=provider)
+
+    with pytest.raises(CapabilityDecisionError):
+        decision_provider.decide("some ambiguous message")
+
+
+def test_direct_with_a_non_null_tool_name_raises_capability_decision_error():
+    provider = FakeAIProvider(reply='{"capability": "DIRECT", "tool_name": "echo"}')
+    decision_provider = GeminiCapabilityDecisionProvider(provider=provider)
+
+    with pytest.raises(CapabilityDecisionError):
+        decision_provider.decide("some ambiguous message")
+
+
+def test_unexpected_extra_field_raises_capability_decision_error():
+    provider = FakeAIProvider(
+        reply='{"capability": "DIRECT", "tool_name": null, "confidence": 0.9}'
+    )
+    decision_provider = GeminiCapabilityDecisionProvider(provider=provider)
+
+    with pytest.raises(CapabilityDecisionError):
+        decision_provider.decide("some ambiguous message")
+
+
+# --- GeminiCapabilityDecisionProvider: provider failure -----------------------
+
+
+def test_underlying_provider_failure_raises_capability_decision_error():
+    provider = FakeAIProvider(error=ProviderError("Gemini is down"))
+    decision_provider = GeminiCapabilityDecisionProvider(provider=provider)
+
+    with pytest.raises(CapabilityDecisionError, match="Gemini is down"):
+        decision_provider.decide("some ambiguous message")
+
+
+# --- Dependency injection / defaults -------------------------------------------
+
+
+def test_default_provider_is_gemini_provider():
+    from app.providers.gemini import GeminiProvider
+
+    decision_provider = GeminiCapabilityDecisionProvider()
+
+    assert isinstance(decision_provider.provider, GeminiProvider)
+
+
+def test_gemini_capability_decision_provider_is_a_capability_decision_provider():
+    assert isinstance(GeminiCapabilityDecisionProvider(), CapabilityDecisionProvider)

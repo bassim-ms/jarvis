@@ -1,16 +1,18 @@
 # Jarvis
 
-Personal AI assistant project. This is **Milestone 6.14: TOOL Capability**
-— Jarvis's `CapabilityRouter` (`app/capability.py`, M6.13) now decides
-between three capabilities: `DIRECT`, `SEARCH`, and `TOOL`. `TOOL`
-deterministically dispatches an explicit, narrowly-phrased request ("use
-tool echo") into the existing `ToolRegistry` (M5) by name - there is no
-AI/NLP tool selection, no automatic tool-chaining, and no agent loop; see
-[Web Search](#web-search) for details. `DIRECT` and `SEARCH` are otherwise
-unchanged: the underlying deterministic routing rules (M6.9), search
-pipeline (M6.5-6.9), conversation-aware answers (M6.10), source citations
-over `/chat` (M6.11), and deterministic query enrichment (M6.12) are all
-untouched. No autonomous research, citations UI, dashboard, agents, voice,
+Personal AI assistant project. This is **Milestone 6.15: Hybrid Capability
+Decision Layer** — capability routing (`app/capability.py`) is now
+deterministic-first, AI-fallback-only: obvious `DIRECT`/`SEARCH`/`TOOL`
+messages are still decided with zero AI calls (M6.9-M6.14, unchanged), and
+only a message the deterministic layer itself flags as genuinely ambiguous
+falls back to a small, strictly-validated Gemini capability decision, built
+entirely on the existing free-tier `AIProvider`/`GeminiProvider` - no new
+client, no paid API, no billing. Gemini only ever returns a decision; it
+never executes a tool - see [Web Search](#web-search) for details.
+`DIRECT`/`SEARCH`/`TOOL` execution, the search pipeline (M6.5-6.9),
+conversation-aware answers (M6.10), source citations over `/chat` (M6.11),
+deterministic query enrichment (M6.12), and `ToolRegistry` (M5) are all
+unchanged. No autonomous research, citations UI, dashboard, agents, voice,
 or hardware control yet.
 
 ## Stack
@@ -304,9 +306,11 @@ message -> DeterministicCapabilityRouter (TOOL check, first)
   produced it - no `if tool_name == "echo": ...` branching anywhere.
 - **No concrete tool identified is a real, typed outcome, not a guess**:
   an explicit invocation with nothing named (`"use tool"`) produces
-  `CapabilityDecision(capability=TOOL, tool_name=None)`, and
-  `JarvisCore._handle_tool` returns a plain "couldn't tell which tool"
-  reply for it - it never falls back to some default tool. An invocation
+  `CapabilityDecision(capability=TOOL, tool_name=None)`. With the plain
+  `DeterministicCapabilityRouter`, `JarvisCore._handle_tool` returns a
+  plain "couldn't tell which tool" reply for it - it never falls back to
+  some default tool. (With `HybridCapabilityRouter`, M6.15 below, this
+  exact case is instead what triggers the Gemini fallback.) An invocation
   naming a tool that isn't registered needs no special handling at all:
   `ToolRegistry.execute()` already returns a typed "Unknown tool" error for
   that, exactly as it always has.
@@ -326,6 +330,71 @@ message -> DeterministicCapabilityRouter (TOOL check, first)
   registered by default (see Tool System below); TOOL currently has
   nothing safe and general-purpose to dispatch to in the running app
   beyond whatever a caller registers itself (as tests do with fakes).
+
+### Hybrid Capability Routing (M6.15)
+
+Capability routing is now deterministic-first, AI-fallback-only, not
+purely deterministic:
+
+```
+message -> HybridCapabilityRouter
+        -> deterministic_router.route(message)  [DeterministicCapabilityRouter, unchanged]
+        -> confident? -> that CapabilityDecision, zero AI calls
+        -> ambiguous? -> decision_provider.decide(message)  [GeminiCapabilityDecisionProvider]
+        -> strictly validated CapabilityDecision -> JarvisCore (unchanged dispatch)
+```
+
+- **The deterministic fast path is untouched and still handles almost
+  every message**: obvious `DIRECT` questions, explicit `SEARCH` triggers
+  (M6.9), and explicit TOOL invocations with a name (M6.14) are all
+  returned exactly as before, with **zero** Gemini calls - `HybridCapabilityRouter`
+  wraps `DeterministicCapabilityRouter` rather than replacing or
+  duplicating any of its logic.
+- **The only ambiguity signal is `CapabilityDecision(TOOL, tool_name=None)`** -
+  an explicit tool-invocation phrasing ("use tool") with nothing actually
+  named. This reuses M6.14's own existing typed representation of "TOOL,
+  but nothing to dispatch to" rather than inventing a new confidence
+  score or a fuzzy ambiguity heuristic; every other deterministic outcome
+  is treated as fully confident. Gemini is consulted **at most once per
+  message**, never for the deterministic fast path.
+- **`GeminiCapabilityDecisionProvider`** (`CapabilityDecisionProvider`'s
+  only implementation) reuses the existing `AIProvider`/`GeminiProvider`
+  infrastructure exactly like `GeminiSearchAnswerGenerator` (M6.8) does -
+  no second Gemini client, no new API key/config, no paid API/billing/
+  subscription of any kind. The prompt is small and fixed: the raw user
+  message plus the three capability names (`DIRECT`/`SEARCH`/`TOOL`) -
+  no tool descriptions, parameters, or registry contents are ever sent,
+  so Gemini can only ever pick a capability, never attempt real tool
+  selection.
+- **Strict, fail-safe validation before any `CapabilityDecision` is
+  constructed**: the response must parse as a JSON object (an optional
+  markdown code fence is tolerantly stripped first) containing only
+  `capability`/`tool_name`; `capability` must be exactly one of
+  `DIRECT`/`SEARCH`/`TOOL` (case-insensitive); `tool_name` must be a
+  non-empty string when `capability` is `TOOL` and must be `null`/absent
+  otherwise. Any violation - invalid JSON, a non-object, an unknown
+  capability, a missing capability, an unexpected extra field, `TOOL`
+  with no usable `tool_name`, or a non-null `tool_name` on `DIRECT`/
+  `SEARCH` - raises `CapabilityDecisionError` instead of guessing a
+  decision or defaulting to some capability.
+- **Gemini never executes anything.** A validated `TOOL` decision from
+  Gemini flows through the exact same `JarvisCore._handle_tool` ->
+  `ToolRegistry.execute(tool_name)` path a deterministic `TOOL` decision
+  already uses (M6.14) - same permission enforcement, same "Unknown tool"
+  handling for a name Gemini invented, same lack of any
+  `if tool_name == "..."` branch in Core.
+- **Provider failures follow the existing convention**: a
+  `CapabilityDecisionError` (a failed Gemini call, or output that fails
+  validation) is caught right where `capability_router.route(...)` is
+  called in `JarvisCore.handle_chat` and re-raised as `ProviderError` -
+  the same translation `_handle_search` already does for
+  `SearchAnswerError`, so `/chat`'s existing error handling (a clean 502)
+  needs no changes.
+- **`JarvisCore`'s default `capability_router` is unchanged**: it's still
+  the fully deterministic `DeterministicCapabilityRouter` (M6.13/M6.14),
+  not `HybridCapabilityRouter` - using the hybrid router (and therefore
+  ever calling Gemini for a capability decision) is an explicit,
+  constructor-injected opt-in, not the running app's default behavior.
 
 ### Search Routing (M6.9)
 
@@ -780,16 +849,22 @@ These were not decided now, to avoid overbuilding before they're needed:
   actually implements it.
 - General-purpose natural-language tool selection/execution — `TOOL`
   (M6.14) only recognizes an explicit, fixed invocation phrasing and
-  dispatches by exact registered tool name; there is still no mechanism
-  (AI or otherwise) that maps an arbitrary request to a tool, extracts its
-  parameters, or chains multiple tool calls together. `web_search` stays
-  excluded from generic TOOL dispatch and keeps its own SEARCH path.
-- AI tool-calling (an AI provider choosing which tool to invoke) — Gemini
-  still never decides when to call `web_search`; `SearchRouter` (M6.9) is a
-  fixed keyword matcher, not an AI classifier, and tools are still only
-  invoked directly through the Registry (or, for the SEARCH path, directly
-  via `WebSearchTool.search(...)`) - not through any AI-driven tool-calling
-  loop.
+  dispatches by exact registered tool name. M6.15's Gemini fallback can
+  suggest a `tool_name` only for the one narrow "explicit invocation with
+  nothing named" ambiguity case, from a message alone (no tool
+  descriptions/registry contents given to it) - there is still no
+  mechanism that maps an arbitrary free-form request to a tool, extracts
+  its parameters, or chains multiple tool calls together. `web_search`
+  stays excluded from generic TOOL dispatch and keeps its own SEARCH path.
+- AI tool-calling (an AI provider choosing *when* to invoke a tool and
+  autonomously executing it) — Gemini still never decides when to call
+  `web_search`, and `HybridCapabilityRouter`'s Gemini fallback (M6.15)
+  only ever returns a capability *decision* for `JarvisCore` to dispatch -
+  it never calls `ToolRegistry` itself, isn't wired as `JarvisCore`'s
+  default, and only runs at all for the one narrow ambiguous case above.
+  `SearchRouter` (M6.9) is still a fixed keyword matcher for its own
+  decision, and tools are still only ever invoked through the Registry -
+  not through any autonomous, multi-step, or AI-driven execution loop.
 - Smarter routing — mode selection (FAST/RESEARCH/CRITICAL) for a SEARCH
   message, and precision improvements beyond fixed keywords (e.g. "results"
   as a live-info trigger is intentionally broad and can over-match) -

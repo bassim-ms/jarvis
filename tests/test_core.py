@@ -9,8 +9,11 @@ import pytest
 from app.capability import (
     Capability,
     CapabilityDecision,
+    CapabilityDecisionError,
+    CapabilityDecisionProvider,
     CapabilityRouter,
     DeterministicCapabilityRouter,
+    HybridCapabilityRouter,
 )
 from app.core import ConversationNotFoundError, JarvisCore
 from app.memory.sqlite_store import SQLiteMemoryStore
@@ -843,3 +846,106 @@ def test_core_tool_dispatch_never_produces_sources_and_persists_reply_to_memory(
     assert sources == []
     messages = jarvis.memory.get_messages(conversation_id)
     assert [m.content for m in messages] == ["use tool echo", "echoed"]
+
+
+# --- M6.15: hybrid capability routing integration ------------------------------
+
+
+class FailingCapabilityRouter(CapabilityRouter):
+    """Raises CapabilityDecisionError directly - isolates Core's own
+    translation of that error into ProviderError, the same way
+    FakeAnswerGenerator(error=...) isolates _handle_search's translation
+    of SearchAnswerError."""
+
+    def route(self, message):
+        raise CapabilityDecisionError("capability decision provider is down")
+
+
+def test_core_translates_capability_decision_error_into_provider_error():
+    jarvis = make_tool_core(FailingCapabilityRouter())
+
+    with pytest.raises(ProviderError, match="capability decision provider is down"):
+        jarvis.handle_chat("use tool")
+
+
+class FakeCapabilityDecisionProviderForCore(CapabilityDecisionProvider):
+    """Returns a fixed CapabilityDecision - has no reference to, and no
+    way to reach, any ToolRegistry - proving structurally that the
+    decision provider itself cannot execute a tool."""
+
+    def __init__(self, decision: CapabilityDecision):
+        self.decision = decision
+        self.last_message = None
+
+    def decide(self, message):
+        self.last_message = message
+        return self.decision
+
+
+def test_hybrid_ambiguous_tool_decision_reaches_toolregistry_and_executes():
+    """End-to-end M6.15 TOOL safety: the AI decision provider only ever
+    returns a CapabilityDecision; JarvisCore is what calls
+    ToolRegistry.execute(...) - the exact same _handle_tool path a
+    deterministic TOOL decision already uses."""
+    registry = ToolRegistry()
+    registry.register(EchoTool())
+    decision_provider = FakeCapabilityDecisionProviderForCore(
+        CapabilityDecision(capability=Capability.TOOL, tool_name="echo")
+    )
+    capability_router = HybridCapabilityRouter(decision_provider=decision_provider)
+    jarvis = make_tool_core(capability_router, tools=registry)
+
+    reply, _, sources = jarvis.handle_chat("use tool")
+
+    assert reply == "echoed"
+    assert sources == []
+    assert decision_provider.last_message == "use tool"
+
+
+def test_hybrid_ambiguous_direct_decision_never_touches_toolregistry():
+    decision_provider = FakeCapabilityDecisionProviderForCore(
+        CapabilityDecision(capability=Capability.DIRECT)
+    )
+    capability_router = HybridCapabilityRouter(decision_provider=decision_provider)
+    jarvis, provider, _ = make_search_core(
+        reply="a direct answer", capability_router=capability_router
+    )
+
+    reply, _, sources = jarvis.handle_chat("use tool")
+
+    assert reply == "a direct answer"
+    assert sources == []
+
+
+def test_hybrid_unknown_tool_named_by_ai_decision_uses_existing_registry_error():
+    """Gemini naming an unregistered tool needs no special-casing in Core
+    - ToolRegistry's own existing "Unknown tool" error surfaces exactly as
+    it does for a deterministic TOOL decision (M6.14)."""
+    decision_provider = FakeCapabilityDecisionProviderForCore(
+        CapabilityDecision(capability=Capability.TOOL, tool_name="does_not_exist")
+    )
+    capability_router = HybridCapabilityRouter(decision_provider=decision_provider)
+    jarvis = make_tool_core(capability_router)
+
+    reply, _, sources = jarvis.handle_chat("use tool")
+
+    assert "does_not_exist" in reply
+    assert sources == []
+
+
+def test_hybrid_router_default_deterministic_fast_path_never_calls_ai_decision_provider():
+    """Reconfirms, at the full JarvisCore level, that obvious messages
+    never reach the AI decision provider even when Core is wired with a
+    HybridCapabilityRouter."""
+    decision_provider = FakeCapabilityDecisionProviderForCore(
+        CapabilityDecision(capability=Capability.TOOL, tool_name="should_not_be_used")
+    )
+    capability_router = HybridCapabilityRouter(decision_provider=decision_provider)
+    jarvis, provider, _ = make_search_core(
+        reply="direct reply", capability_router=capability_router
+    )
+
+    reply, _, _ = jarvis.handle_chat("what is quantum entanglement?")
+
+    assert reply == "direct reply"
+    assert decision_provider.last_message is None  # never called

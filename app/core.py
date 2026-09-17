@@ -26,11 +26,22 @@ alone, via `ToolRegistry.execute(...)` - Core never branches on which tool
 it is, only on the generic ToolResult it gets back, the same "Registry is
 the abstraction boundary" design as the SEARCH path already has with
 WebSearchTool.
+
+Since M6.15, `capability_router.route(message)` can itself fail - a
+HybridCapabilityRouter's Gemini fallback (app/capability.py) may raise
+CapabilityDecisionError for a genuinely ambiguous message. Core re-raises
+that as ProviderError right where it's called, the same translation
+_handle_search already does for SearchAnswerError, so /chat's existing
+error handling (a clean 502) needs no changes to cover it. Core's default
+capability_router is still the fully deterministic DeterministicCapability-
+Router (unchanged from M6.14) - this failure path only matters for a
+caller that explicitly injects a HybridCapabilityRouter.
 """
 
 from app.capability import (
     Capability,
     CapabilityDecision,
+    CapabilityDecisionError,
     CapabilityRouter,
     DeterministicCapabilityRouter,
 )
@@ -140,7 +151,11 @@ class JarvisCore:
         history = self.memory.get_messages(conversation_id)
         facts = self.memory.get_facts()
 
-        decision = self.capability_router.route(message)
+        try:
+            decision = self.capability_router.route(message)
+        except CapabilityDecisionError as exc:
+            raise ProviderError(f"Failed to decide a capability: {exc}") from exc
+
         if decision.capability is Capability.SEARCH:
             reply, sources = self._handle_search(message, history, facts)
         elif decision.capability is Capability.TOOL:
