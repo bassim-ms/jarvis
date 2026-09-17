@@ -26,6 +26,7 @@ from app.search.answer import (
 from app.search.base import SearchProvider, SearchProviderError, SearchResult
 from app.search.query_builder import DeterministicSearchQueryBuilder, SearchQueryBuilder
 from app.search.router import SearchRouter
+from app.tools.base import PermissionLevel, Tool, ToolResult
 from app.tools.registry import ToolRegistry
 from app.tools.web_search import WebSearchTool
 
@@ -631,13 +632,14 @@ class FakeCapabilityRouter(CapabilityRouter):
     proves Core dispatches purely on the router's decision, not on any
     routing logic of its own."""
 
-    def __init__(self, capability: Capability):
+    def __init__(self, capability: Capability, tool_name: str | None = None):
         self.capability = capability
+        self.tool_name = tool_name
         self.last_message = None
 
     def route(self, message):
         self.last_message = message
-        return CapabilityDecision(capability=self.capability)
+        return CapabilityDecision(capability=self.capability, tool_name=self.tool_name)
 
 
 def test_core_dispatches_direct_when_the_capability_router_says_direct():
@@ -703,3 +705,141 @@ def test_default_capability_router_still_uses_the_injected_search_router():
 
     assert router.last_message == "what is quantum entanglement?"
     assert provider.last_message is not None  # DIRECT path actually ran
+
+
+# --- M6.14: TOOL capability dispatch -------------------------------------------
+
+
+class EchoTool(Tool):
+    """Fake READ tool: automatic, no confirmation needed."""
+
+    name = "echo"
+    description = "Echoes back a fixed message."
+    permission = PermissionLevel.READ
+
+    def execute(self) -> ToolResult:
+        return ToolResult.success(message="echoed")
+
+
+class AddTool(Tool):
+    """A second, differently-named fake tool - proves Core's TOOL dispatch
+    is generic (no `if tool_name == "echo"` branch) by working identically
+    for an unrelated tool."""
+
+    name = "add"
+    description = "Pretends to add two numbers."
+    permission = PermissionLevel.READ
+
+    def execute(self) -> ToolResult:
+        return ToolResult.success(data=42)
+
+
+class ConfirmTool(Tool):
+    """Fake CONFIRM tool - proves Core surfaces the Registry's existing
+    permission enforcement rather than bypassing or reimplementing it."""
+
+    name = "confirm_me"
+    description = "Requires confirmation before running."
+    permission = PermissionLevel.CONFIRM
+
+    def execute(self) -> ToolResult:
+        return ToolResult.success(message="confirmed and ran")
+
+
+def make_tool_core(
+    capability_router,
+    tools: ToolRegistry | None = None,
+) -> JarvisCore:
+    registry = tools or ToolRegistry()
+    return JarvisCore(
+        provider=FakeProvider("direct reply"),
+        memory=SQLiteMemoryStore(":memory:"),
+        tools=registry,
+        capability_router=capability_router,
+    )
+
+
+def test_core_dispatches_tool_based_on_the_injected_capability_decision():
+    registry = ToolRegistry()
+    registry.register(EchoTool())
+    capability_router = FakeCapabilityRouter(Capability.TOOL, tool_name="echo")
+    jarvis = make_tool_core(capability_router, tools=registry)
+
+    reply, _, sources = jarvis.handle_chat("use tool echo")
+
+    assert reply == "echoed"
+    assert sources == []
+
+
+def test_core_tool_dispatch_is_generic_across_different_registered_tools():
+    """No `if tool_name == "echo"` branch in Core: two differently-named
+    tools both dispatch correctly through the exact same code path."""
+    registry = ToolRegistry()
+    registry.register(EchoTool())
+    registry.register(AddTool())
+
+    echo_router = FakeCapabilityRouter(Capability.TOOL, tool_name="echo")
+    add_router = FakeCapabilityRouter(Capability.TOOL, tool_name="add")
+
+    echo_reply, _, _ = make_tool_core(echo_router, tools=registry).handle_chat(
+        "use tool echo"
+    )
+    add_reply, _, _ = make_tool_core(add_router, tools=registry).handle_chat(
+        "use tool add"
+    )
+
+    assert echo_reply == "echoed"
+    assert add_reply == "42"
+
+
+def test_core_tool_dispatch_reports_unknown_tool_via_existing_registry_error():
+    """An unrecognized tool_name needs no special-casing in Core - the
+    Registry's own existing "Unknown tool" error surfaces as the reply."""
+    capability_router = FakeCapabilityRouter(Capability.TOOL, tool_name="does_not_exist")
+    jarvis = make_tool_core(capability_router)
+
+    reply, _, sources = jarvis.handle_chat("use tool does_not_exist")
+
+    assert "does_not_exist" in reply
+    assert sources == []
+
+
+def test_core_tool_dispatch_with_no_identified_tool_returns_explicit_message():
+    """CapabilityDecision(TOOL, tool_name=None) - the CapabilityRouter
+    recognized an explicit tool request but couldn't name one - is handled
+    as an explicit, typed non-execution outcome, not a crash or a guess."""
+    capability_router = FakeCapabilityRouter(Capability.TOOL)
+    jarvis = make_tool_core(capability_router)
+
+    reply, _, sources = jarvis.handle_chat("use tool")
+
+    assert reply
+    assert sources == []
+
+
+def test_core_tool_dispatch_respects_confirm_permission():
+    """Core doesn't bypass the Registry's permission enforcement: a
+    CONFIRM-level tool returns the confirmation-required outcome as the
+    reply, and is never actually run without confirmation."""
+    registry = ToolRegistry()
+    registry.register(ConfirmTool())
+    capability_router = FakeCapabilityRouter(Capability.TOOL, tool_name="confirm_me")
+    jarvis = make_tool_core(capability_router, tools=registry)
+
+    reply, _, _ = jarvis.handle_chat("use tool confirm_me")
+
+    assert "confirm" in reply.lower()
+    assert reply != "confirmed and ran"  # the tool itself never actually ran
+
+
+def test_core_tool_dispatch_never_produces_sources_and_persists_reply_to_memory():
+    registry = ToolRegistry()
+    registry.register(EchoTool())
+    capability_router = FakeCapabilityRouter(Capability.TOOL, tool_name="echo")
+    jarvis = make_tool_core(capability_router, tools=registry)
+
+    _, conversation_id, sources = jarvis.handle_chat("use tool echo")
+
+    assert sources == []
+    messages = jarvis.memory.get_messages(conversation_id)
+    assert [m.content for m in messages] == ["use tool echo", "echoed"]

@@ -19,10 +19,18 @@ its own constructor parameter purely so the underlying deterministic
 keyword matching stays independently injectable/testable (see
 DeterministicCapabilityRouter, which delegates to it) - Core itself no
 longer branches on SearchDecision directly.
+
+Since M6.14, TOOL is a third capability: _handle_tool dispatches to
+`self.tools` (the existing ToolRegistry, M5/M6.9) by `decision.tool_name`
+alone, via `ToolRegistry.execute(...)` - Core never branches on which tool
+it is, only on the generic ToolResult it gets back, the same "Registry is
+the abstraction boundary" design as the SEARCH path already has with
+WebSearchTool.
 """
 
 from app.capability import (
     Capability,
+    CapabilityDecision,
     CapabilityRouter,
     DeterministicCapabilityRouter,
 )
@@ -40,6 +48,7 @@ from app.search.answer import (
 from app.search.base import SearchProviderError
 from app.search.query_builder import DeterministicSearchQueryBuilder, SearchQueryBuilder
 from app.search.router import SearchRouter
+from app.tools.base import ToolResult, ToolResultStatus
 from app.tools.registry import ToolRegistry
 from app.tools.web_search import WebSearchTool
 
@@ -106,18 +115,20 @@ class JarvisCore:
         conversation's prior messages are loaded and combined with any
         stored user facts to give the provider context for this turn.
 
-        CapabilityRouter (deterministic, no AI call - M6.13) decides
-        DIRECT vs SEARCH before that, not Core itself: DIRECT keeps the
-        existing prompt -> provider.generate_reply path unchanged; SEARCH
-        runs the message through WebSearchTool -> SearchResponse ->
-        SearchAnswerGenerator instead, using the generated answer as the
-        reply. Either way, the final reply is persisted exactly the same
-        way. Both paths reuse the same `history`/`facts` already loaded
-        below - the SEARCH path never issues its own memory query.
+        CapabilityRouter (deterministic, no AI call - M6.13/M6.14) decides
+        DIRECT vs SEARCH vs TOOL before that, not Core itself: DIRECT keeps
+        the existing prompt -> provider.generate_reply path unchanged;
+        SEARCH runs the message through WebSearchTool -> SearchResponse ->
+        SearchAnswerGenerator, using the generated answer as the reply;
+        TOOL dispatches to the existing ToolRegistry by name (see
+        _handle_tool). Either way, the final reply is persisted exactly the
+        same way. Both DIRECT and SEARCH reuse the same `history`/`facts`
+        already loaded below - neither the SEARCH nor the TOOL path issues
+        its own memory query.
 
         The third return value is the SearchAnswer's validated sources
-        (M6.11) - always `[]` for DIRECT, since it never produces a
-        SearchAnswer at all.
+        (M6.11) - always `[]` for DIRECT and TOOL, since neither produces a
+        SearchAnswer.
         """
         if conversation_id is None:
             conversation_id = self.memory.create_conversation()
@@ -132,6 +143,8 @@ class JarvisCore:
         decision = self.capability_router.route(message)
         if decision.capability is Capability.SEARCH:
             reply, sources = self._handle_search(message, history, facts)
+        elif decision.capability is Capability.TOOL:
+            reply, sources = self._handle_tool(decision)
         else:
             prompt = self._build_prompt(message, history, facts)
             reply = self.provider.generate_reply(prompt)
@@ -192,6 +205,46 @@ class JarvisCore:
             raise ProviderError(f"Failed to generate a search answer: {exc}") from exc
 
         return search_answer.answer, search_answer.sources
+
+    def _handle_tool(self, decision: CapabilityDecision) -> tuple[str, list[SearchSource]]:
+        """TOOL path (M6.14): dispatch to the existing ToolRegistry
+        (app/tools/registry.py) by `decision.tool_name` alone - Core never
+        branches on which tool it is, never inspects a specific tool's
+        parameters, and never attempts to extract them from the message
+        (no NLP/AI tool selection exists yet; see app/capability.py).
+        `sources` is always `[]` - TOOL never produces search evidence.
+
+        `decision.tool_name` is `None` when the CapabilityRouter recognized
+        an explicit tool-invocation phrasing but couldn't identify which
+        tool (e.g. "use tool" with nothing named) - reported back as a
+        clear, typed non-execution outcome rather than guessing a tool.
+
+        An unregistered `tool_name` needs no special handling here either:
+        `ToolRegistry.execute()` already returns a typed "Unknown tool"
+        `ToolResult.error(...)` for it, same as for any other tool failure.
+        Permission enforcement (CONFIRM/DANGEROUS -> CONFIRMATION_REQUIRED/
+        DENIED) is likewise entirely the Registry's existing behavior - the
+        `/chat` API has no confirmation round-trip yet, so those outcomes
+        simply surface as the reply text, same as an error would.
+        """
+        if decision.tool_name is None:
+            return "I couldn't tell which tool to use for that request.", []
+
+        result = self.tools.execute(decision.tool_name)
+        return self._format_tool_result(result), []
+
+    @staticmethod
+    def _format_tool_result(result: ToolResult) -> str:
+        """Turn a generic ToolResult into reply text - Core inspects only
+        the typed `status`/`message`/`data`, never which tool produced
+        them."""
+        if result.status is ToolResultStatus.SUCCESS:
+            if result.message:
+                return result.message
+            if result.data is not None:
+                return str(result.data)
+            return "Done."
+        return result.message
 
     def save_memory(self, key: str, value: str) -> None:
         """Programmatic hook to save a user fact. Manual for now; automatic

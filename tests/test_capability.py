@@ -22,11 +22,11 @@ from app.search.router import SearchDecision, SearchRouter
 # --- Capability representation ------------------------------------------------
 
 
-def test_capability_only_has_direct_and_search():
-    """M6.13 implements exactly DIRECT and SEARCH - no future capability
-    (MEMORY/TOOL/EMAIL/CALENDAR/PRINTER/ROBOTIC_ARM/...) is added as an
-    unused enum member."""
-    assert {member.name for member in Capability} == {"DIRECT", "SEARCH"}
+def test_capability_only_has_direct_search_and_tool():
+    """M6.13/M6.14 implement exactly DIRECT, SEARCH, and TOOL - no other
+    future capability (MEMORY/EMAIL/CALENDAR/PRINTER/ROBOTIC_ARM/...) is
+    added as an unused enum member."""
+    assert {member.name for member in Capability} == {"DIRECT", "SEARCH", "TOOL"}
 
 
 def test_capability_decision_holds_the_selected_capability():
@@ -183,3 +183,117 @@ def test_deterministic_router_translates_direct_decision_too():
 
 def test_deterministic_capability_router_is_a_capability_router():
     assert isinstance(DeterministicCapabilityRouter(), CapabilityRouter)
+
+
+# --- M6.14: TOOL capability representation -------------------------------------
+
+
+def test_capability_decision_can_represent_tool_with_a_tool_name():
+    decision = CapabilityDecision(capability=Capability.TOOL, tool_name="echo")
+
+    assert decision.capability is Capability.TOOL
+    assert decision.tool_name == "echo"
+
+
+def test_capability_decision_tool_name_defaults_to_none():
+    decision = CapabilityDecision(capability=Capability.SEARCH)
+
+    assert decision.tool_name is None
+
+
+# --- M6.14: deterministic TOOL routing ------------------------------------------
+
+
+def test_explicit_use_tool_with_name_routes_tool():
+    router = DeterministicCapabilityRouter()
+
+    decision = router.route("use tool echo")
+
+    assert decision == CapabilityDecision(capability=Capability.TOOL, tool_name="echo")
+
+
+def test_run_tool_colon_syntax_routes_tool():
+    router = DeterministicCapabilityRouter()
+
+    decision = router.route("run tool: echo")
+
+    assert decision == CapabilityDecision(capability=Capability.TOOL, tool_name="echo")
+
+
+def test_call_and_invoke_tool_phrasings_both_route_tool():
+    router = DeterministicCapabilityRouter()
+
+    assert router.route("call tool echo").capability is Capability.TOOL
+    assert router.route("invoke tool echo").capability is Capability.TOOL
+
+
+def test_tool_invocation_is_case_insensitive_but_name_is_captured_verbatim():
+    router = DeterministicCapabilityRouter()
+
+    decision = router.route("USE TOOL Echo")
+
+    assert decision.capability is Capability.TOOL
+    assert decision.tool_name == "Echo"  # not lowercased/normalized
+
+
+def test_use_tool_with_no_name_routes_tool_with_no_tool_name():
+    """An explicit tool-invocation phrasing with nothing named is still
+    TOOL - the CapabilityRouter never guesses a tool - but tool_name is
+    None, the explicit typed "nothing to dispatch to" representation."""
+    router = DeterministicCapabilityRouter()
+
+    decision = router.route("use tool")
+
+    assert decision == CapabilityDecision(capability=Capability.TOOL, tool_name=None)
+
+
+def test_tool_trigger_takes_priority_over_a_search_triggering_word():
+    """"weather" alone is a SEARCH live-info trigger (M6.9), but an
+    explicit tool invocation naming it must still win - TOOL is the most
+    deliberate/unambiguous of the three signals."""
+    router = DeterministicCapabilityRouter()
+
+    decision = router.route("use tool weather")
+
+    assert decision == CapabilityDecision(capability=Capability.TOOL, tool_name="weather")
+
+
+# --- M6.14: TOOL false-positive protection --------------------------------------
+
+
+def test_merely_mentioning_a_tool_does_not_trigger_tool_capability():
+    """No explicit invocation phrasing at the start of the message - stays
+    DIRECT, same as a stable question. TOOL must not fire on every
+    incidental mention of the word "tool"."""
+    router = DeterministicCapabilityRouter()
+
+    decision = router.route("what tool should I use for tightening this bolt?")
+
+    assert decision.capability is Capability.DIRECT
+
+
+def test_tool_word_mid_message_does_not_trigger_tool_capability():
+    router = DeterministicCapabilityRouter()
+
+    decision = router.route("I want to use tool steel in this design, is that wise?")
+
+    assert decision.capability is Capability.DIRECT
+
+
+# --- M6.14: no regression for DIRECT/SEARCH -------------------------------------
+
+
+def test_stable_knowledge_question_still_routes_direct_after_tool_addition():
+    router = DeterministicCapabilityRouter()
+
+    decision = router.route("what is quantum entanglement?")
+
+    assert decision == CapabilityDecision(capability=Capability.DIRECT)
+
+
+def test_freshness_request_still_routes_search_after_tool_addition():
+    router = DeterministicCapabilityRouter()
+
+    decision = router.route("what's the latest news on AI?")
+
+    assert decision == CapabilityDecision(capability=Capability.SEARCH)
