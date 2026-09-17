@@ -1,16 +1,17 @@
 # Jarvis
 
-Personal AI assistant project. This is **Milestone 6.10: Conversation-Aware
-Search** — the SEARCH path's answer generation can now see recent
-conversation history/facts, so a follow-up like "what's the latest
-application deadline?" after "tell me about TUM" is understood correctly.
-The actual search query stays exactly the raw current message (still fully
-deterministic, no AI query rewriting), and `SearchRouter`'s DIRECT/SEARCH
-decision (Milestone 6.9) is unchanged - only the *answer* step gets more
-context, and only for reference resolution, never as a second source of
-facts. Sources aren't surfaced in the HTTP response yet - see
-[Web Search](#web-search) for what's still future work. No autonomous
-research, citations UI, dashboard, agents, voice, or hardware control yet.
+Personal AI assistant project. This is **Milestone 6.13: Capability
+Decision Layer** — Jarvis's high-level "handle this directly, or via web
+search?" decision now lives behind a small `CapabilityRouter` abstraction
+(`app/capability.py`) that `JarvisCore` asks and dispatches on, rather than
+inside `JarvisCore` itself. Only `DIRECT` and `SEARCH` are implemented;
+future capabilities (memory, tools, email, calendar, ...) can be added
+later without touching Core's dispatch logic - see [Web Search](#web-search)
+for details. The underlying deterministic routing rules (M6.9), search
+pipeline (M6.5-6.9), conversation-aware answers (M6.10), source citations
+over `/chat` (M6.11), and deterministic query enrichment (M6.12) are all
+unchanged. No autonomous research, citations UI, dashboard, agents, voice,
+or hardware control yet.
 
 ## Stack
 
@@ -107,7 +108,8 @@ jarvis/
     __init__.py       - marks app/ as a Python package
     main.py            - the FastAPI app, /health and /chat endpoints
     config.py          - all configuration, read from environment variables
-    core.py            - Jarvis Core: routes a chat request DIRECT (AIProvider) or SEARCH (WebSearchTool + SearchAnswerGenerator)
+    core.py            - Jarvis Core: dispatches a chat request DIRECT (AIProvider) or SEARCH (WebSearchTool + SearchAnswerGenerator)
+    capability.py       - Capability/CapabilityDecision/CapabilityRouter: the DIRECT/SEARCH decision layer Core dispatches on
     providers/
       base.py           - AIProvider interface, so Core doesn't depend on any vendor
       gemini.py         - Gemini implementation of AIProvider
@@ -137,7 +139,8 @@ jarvis/
   tests/
     test_health.py         - proves the server starts and /health works
     test_chat.py            - proves /chat works, with Jarvis Core mocked out
-    test_core.py            - unit tests for Jarvis Core's provider delegation and DIRECT/SEARCH routing
+    test_core.py            - unit tests for Jarvis Core's provider delegation and DIRECT/SEARCH dispatch
+    test_capability.py      - unit tests for Capability/CapabilityDecision/DeterministicCapabilityRouter
     test_gemini_provider.py - unit tests for the Gemini provider, with HTTP mocked out
     test_memory.py          - unit tests for the SQLite memory store
     test_tools.py           - unit tests for the Tool Registry and permission model
@@ -219,21 +222,60 @@ architecture in `app/tools/`:
 follows the same "interface + swappable backend" shape as `AIProvider` /
 `GeminiProvider`.
 
-**General/stable knowledge vs. web search:** Since Milestone 6.9,
-`JarvisCore` decides this automatically and deterministically for every
-`/chat` message - see Search Routing below. Questions about stable facts
-("what is quantum entanglement?", "how does a transistor work?") are
-answered by Gemini directly, with no tool call. Questions needing
-current/external information ("what happened with NASA today?", "latest
-robotics news") go through `web_search`. `web_search` itself still has no
-idea which category a query falls into; it just searches whatever query
-it's given - the decision lives entirely in `SearchRouter`, one layer up.
+**General/stable knowledge vs. web search:** Since Milestone 6.9, this is
+decided automatically and deterministically for every `/chat` message -
+since M6.13, by the Capability Decision Layer (below), not by `JarvisCore`
+itself. Questions about stable facts ("what is quantum entanglement?", "how
+does a transistor work?") are answered by Gemini directly, with no tool
+call. Questions needing current/external information ("what happened with
+NASA today?", "latest robotics news") go through `web_search`. `web_search`
+itself still has no idea which category a query falls into; it just
+searches whatever query it's given - the decision lives one layer up.
+
+### Capability Decision Layer (M6.13)
+
+`JarvisCore` no longer decides DIRECT vs SEARCH itself - it asks an
+injected **`CapabilityRouter`** (`app/capability.py`) for a
+`CapabilityDecision` and dispatches on that:
+
+```
+message -> JarvisCore.handle_chat
+        -> capability_router.route(message) -> CapabilityDecision(capability=...)
+        -> dispatch to DIRECT or SEARCH
+```
+
+- **`Capability`** is a small enum - only `DIRECT` and `SEARCH` exist
+  today. Future capabilities (MEMORY, TOOL, EMAIL, CALENDAR, PRINTER,
+  ROBOTIC_ARM, ...) are deliberately **not** added as unused members yet -
+  see Postponed decisions.
+- **`CapabilityDecision`** is a tiny dataclass wrapping the chosen
+  `Capability` - enough for Core to dispatch today, and a place to grow if
+  a future capability needs to carry extra dispatch data, without changing
+  `CapabilityRouter`'s return type.
+- **`CapabilityRouter`** is the ABC; **`DeterministicCapabilityRouter`** is
+  the only implementation, and it does not duplicate M6.9's keyword rules -
+  it **delegates to `SearchRouter`** (still `app/search/router.py`,
+  unchanged) for the actual DIRECT/SEARCH matching, then translates the
+  `SearchDecision` it gets back into a `Capability`. `SearchRouter` is no
+  longer the top-level thing `JarvisCore` talks to for this decision, but
+  it's still the single source of truth for the matching rules, and its
+  own tests (`tests/test_search_router.py`) are unchanged and still
+  authoritative.
+- `JarvisCore` constructor-injects `capability_router` (defaulting to
+  `DeterministicCapabilityRouter(search_router=self.router)`) - so
+  injecting a custom `router` (a `SearchRouter`), the same parameter that
+  existed before M6.13, still drives the decision unchanged; injecting
+  `capability_router` directly is a separate, independent override for
+  swapping the whole decision layer.
+- No Gemini/LLM call anywhere in this layer, same as `SearchRouter` itself.
 
 ### Search Routing (M6.9)
 
-`JarvisCore.handle_chat` picks one of two paths for every message, via
+The deterministic DIRECT/SEARCH matching rules themselves still live in
 **`SearchRouter`** (`app/search/router.py`) - **deterministic keyword/
-phrase matching only, never an extra Gemini call**:
+phrase matching only, never an extra Gemini call**. Since M6.13,
+`DeterministicCapabilityRouter` (above) is what actually calls it; the two
+paths it distinguishes are unchanged:
 
 - **DIRECT** - the original, unchanged path: `_build_prompt` (history +
   facts + message) -> `provider.generate_reply(...)`.
@@ -673,6 +715,11 @@ These were not decided now, to avoid overbuilding before they're needed:
 - Conversation memory / multi-turn context — not in this milestone; `/chat`
   is stateless, one message in, one reply out.
 - Dashboard framework — decided when we build the actual dashboard.
+- Future `Capability` values (MEMORY, TOOL, EMAIL, CALENDAR, PRINTER,
+  ROBOTIC_ARM, ...) — the Capability Decision Layer (M6.13) is built to
+  hold more than DIRECT/SEARCH, but no enum member or decision logic for
+  any of these exists yet; each is added only when a milestone actually
+  implements it.
 - AI tool-calling (an AI provider choosing which tool to invoke) — Gemini
   still never decides when to call `web_search`; `SearchRouter` (M6.9) is a
   fixed keyword matcher, not an AI classifier, and tools are still only

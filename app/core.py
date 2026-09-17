@@ -3,17 +3,29 @@ Jarvis Core - the orchestrator for handling a chat request.
 
 Core depends only on the AIProvider and MemoryStore interfaces, not on any
 specific AI vendor or storage backend, so providers can be added or swapped
-without touching this module. Since M6.9, it also depends on SearchRouter
-and SearchAnswerGenerator - both deterministic/interface-level - and on
-WebSearchTool by name specifically (see _handle_search), a deliberate,
-narrow exception to "Core doesn't know about tool types": M6.9's whole
-point is that Core now orchestrates a fixed SEARCH path, not that it
-becomes tool-agnostic tool-calling. Since M6.12, it also depends on
-SearchQueryBuilder (deterministic, see app/search/query_builder.py) to
-decide what text to actually search once SearchRouter has already chosen
-SEARCH - SearchRouter itself never sees anything but the raw message.
+without touching this module. Since M6.9, it also depends on
+SearchAnswerGenerator (deterministic/interface-level) and on WebSearchTool
+by name specifically (see _handle_search), a deliberate, narrow exception
+to "Core doesn't know about tool types": M6.9's whole point is that Core
+now orchestrates a fixed SEARCH path, not that it becomes tool-agnostic
+tool-calling. Since M6.12, it also depends on SearchQueryBuilder
+(deterministic, see app/search/query_builder.py) to decide what text to
+actually search once SEARCH has already been chosen.
+
+Since M6.13, the DIRECT-vs-SEARCH decision itself is no longer Core's own
+logic: Core asks an injected CapabilityRouter (app/capability.py) for a
+CapabilityDecision and dispatches on it. `router`/`SearchRouter` is kept as
+its own constructor parameter purely so the underlying deterministic
+keyword matching stays independently injectable/testable (see
+DeterministicCapabilityRouter, which delegates to it) - Core itself no
+longer branches on SearchDecision directly.
 """
 
+from app.capability import (
+    Capability,
+    CapabilityRouter,
+    DeterministicCapabilityRouter,
+)
 from app.config import settings
 from app.memory.base import MemoryStore, Message
 from app.memory.sqlite_store import SQLiteMemoryStore
@@ -27,7 +39,7 @@ from app.search.answer import (
 )
 from app.search.base import SearchProviderError
 from app.search.query_builder import DeterministicSearchQueryBuilder, SearchQueryBuilder
-from app.search.router import SearchDecision, SearchRouter
+from app.search.router import SearchRouter
 from app.tools.registry import ToolRegistry
 from app.tools.web_search import WebSearchTool
 
@@ -56,6 +68,7 @@ class JarvisCore:
         router: SearchRouter | None = None,
         answer_generator: SearchAnswerGenerator | None = None,
         query_builder: SearchQueryBuilder | None = None,
+        capability_router: CapabilityRouter | None = None,
     ):
         self.provider = provider or GeminiProvider()
         self.memory = memory or SQLiteMemoryStore(settings.memory_db_path)
@@ -71,6 +84,16 @@ class JarvisCore:
             self.provider
         )
         self.query_builder = query_builder or DeterministicSearchQueryBuilder()
+        # M6.13: defaults to wrapping self.router, so an injected/default
+        # `router` still drives the DIRECT/SEARCH decision unchanged (e.g.
+        # a test's RecordingRouter keeps recording exactly as before) -
+        # `capability_router` is a separate, optional override for
+        # injecting a whole different CapabilityRouter (e.g. once a second
+        # real capability exists and DIRECT/SEARCH is no longer the only
+        # choice).
+        self.capability_router = capability_router or DeterministicCapabilityRouter(
+            search_router=self.router
+        )
 
     def handle_chat(
         self, message: str, conversation_id: str | None = None
@@ -83,14 +106,14 @@ class JarvisCore:
         conversation's prior messages are loaded and combined with any
         stored user facts to give the provider context for this turn.
 
-        SearchRouter (deterministic, no AI call) decides DIRECT vs SEARCH
-        before that: DIRECT keeps the existing prompt -> provider.
-        generate_reply path unchanged; SEARCH runs the message through
-        WebSearchTool -> SearchResponse -> SearchAnswerGenerator instead,
-        using the generated answer as the reply. Either way, the final
-        reply is persisted exactly the same way. Both paths reuse the same
-        `history`/`facts` already loaded below - the SEARCH path never
-        issues its own memory query.
+        CapabilityRouter (deterministic, no AI call - M6.13) decides
+        DIRECT vs SEARCH before that, not Core itself: DIRECT keeps the
+        existing prompt -> provider.generate_reply path unchanged; SEARCH
+        runs the message through WebSearchTool -> SearchResponse ->
+        SearchAnswerGenerator instead, using the generated answer as the
+        reply. Either way, the final reply is persisted exactly the same
+        way. Both paths reuse the same `history`/`facts` already loaded
+        below - the SEARCH path never issues its own memory query.
 
         The third return value is the SearchAnswer's validated sources
         (M6.11) - always `[]` for DIRECT, since it never produces a
@@ -106,7 +129,8 @@ class JarvisCore:
         history = self.memory.get_messages(conversation_id)
         facts = self.memory.get_facts()
 
-        if self.router.route(message) is SearchDecision.SEARCH:
+        decision = self.capability_router.route(message)
+        if decision.capability is Capability.SEARCH:
             reply, sources = self._handle_search(message, history, facts)
         else:
             prompt = self._build_prompt(message, history, facts)
@@ -126,7 +150,7 @@ class JarvisCore:
         as the reply and returning SearchAnswer.sources (M6.11) alongside
         it for the caller to surface as it sees fit.
 
-        SearchRouter.route() has already decided SEARCH from `message`
+        The CapabilityRouter has already decided SEARCH from `message`
         alone, before this method is even called - it never sees the
         bounded context built here or the enriched query built below.
         WebSearchTool.search(), by contrast, now (M6.12) receives whatever

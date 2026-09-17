@@ -6,6 +6,12 @@ depending on Gemini or SQLite specifically.
 
 import pytest
 
+from app.capability import (
+    Capability,
+    CapabilityDecision,
+    CapabilityRouter,
+    DeterministicCapabilityRouter,
+)
 from app.core import ConversationNotFoundError, JarvisCore
 from app.memory.sqlite_store import SQLiteMemoryStore
 from app.providers.base import AIProvider, ProviderError
@@ -164,6 +170,7 @@ def make_search_core(
     register_web_search: bool = True,
     router: SearchRouter | None = None,
     query_builder: SearchQueryBuilder | None = None,
+    capability_router: CapabilityRouter | None = None,
 ) -> tuple[JarvisCore, FakeProvider, ToolRegistry]:
     provider = FakeProvider(reply)
     tools = ToolRegistry()
@@ -176,6 +183,7 @@ def make_search_core(
         router=router,
         answer_generator=answer_generator,
         query_builder=query_builder,
+        capability_router=capability_router,
     )
     return jarvis, provider, tools
 
@@ -193,6 +201,10 @@ def test_default_answer_generator_is_gemini_backed_and_reuses_the_provider():
 
 def test_default_query_builder_is_deterministic_search_query_builder():
     assert isinstance(JarvisCore().query_builder, DeterministicSearchQueryBuilder)
+
+
+def test_default_capability_router_is_deterministic_capability_router():
+    assert isinstance(JarvisCore().capability_router, DeterministicCapabilityRouter)
 
 
 def test_handle_chat_uses_direct_path_for_a_stable_question():
@@ -609,3 +621,85 @@ def test_search_response_propagation_to_the_answer_generator_is_unchanged():
     assert response.results == [
         SearchResult(title="T", url="https://x.com", snippet="s")
     ]
+
+
+# --- M6.13: Capability Decision Layer dispatch --------------------------------
+
+
+class FakeCapabilityRouter(CapabilityRouter):
+    """Always returns a fixed CapabilityDecision, ignoring the message -
+    proves Core dispatches purely on the router's decision, not on any
+    routing logic of its own."""
+
+    def __init__(self, capability: Capability):
+        self.capability = capability
+        self.last_message = None
+
+    def route(self, message):
+        self.last_message = message
+        return CapabilityDecision(capability=self.capability)
+
+
+def test_core_dispatches_direct_when_the_capability_router_says_direct():
+    """Even a message that would normally trigger SEARCH (via SearchRouter's
+    own keyword matching) goes DIRECT if that's what the injected
+    CapabilityRouter decides - proving Core no longer has its own
+    DIRECT/SEARCH logic, only dispatch on the decision it's handed."""
+    capability_router = FakeCapabilityRouter(Capability.DIRECT)
+    jarvis, provider, _ = make_search_core(
+        reply="direct reply", capability_router=capability_router
+    )
+
+    reply, _, sources = jarvis.handle_chat("what's the latest news on AI?")
+
+    assert reply == "direct reply"
+    assert provider.last_message is not None
+    assert sources == []
+    assert capability_router.last_message == "what's the latest news on AI?"
+
+
+def test_core_dispatches_search_when_the_capability_router_says_search():
+    """Even a message that would normally stay DIRECT goes through the
+    SEARCH pipeline if that's what the injected CapabilityRouter
+    decides."""
+    capability_router = FakeCapabilityRouter(Capability.SEARCH)
+    answer_generator = FakeAnswerGenerator(answer="grounded answer")
+    jarvis, provider, _ = make_search_core(
+        answer_generator=answer_generator, capability_router=capability_router
+    )
+
+    reply, _, _ = jarvis.handle_chat("what is quantum entanglement?")
+
+    assert reply == "grounded answer"
+    assert provider.last_message is None  # DIRECT path never ran
+    assert answer_generator.last_response is not None
+    assert capability_router.last_message == "what is quantum entanglement?"
+
+
+def test_capability_router_is_constructor_injectable():
+    capability_router = FakeCapabilityRouter(Capability.DIRECT)
+
+    jarvis = JarvisCore(
+        provider=FakeProvider("direct reply"),
+        memory=SQLiteMemoryStore(":memory:"),
+        capability_router=capability_router,
+    )
+
+    jarvis.handle_chat("hello")
+
+    assert capability_router.last_message == "hello"
+
+
+def test_default_capability_router_still_uses_the_injected_search_router():
+    """Backward-compatibility guarantee: injecting a `router=` (as every
+    pre-M6.13 test does) still drives the DIRECT/SEARCH decision, because
+    the default CapabilityRouter wraps whatever `router` Core was given -
+    Core doesn't need a `capability_router` override just to keep using a
+    custom SearchRouter."""
+    router = RecordingRouter()
+    jarvis, provider, _ = make_search_core(reply="direct reply", router=router)
+
+    jarvis.handle_chat("what is quantum entanglement?")
+
+    assert router.last_message == "what is quantum entanglement?"
+    assert provider.last_message is not None  # DIRECT path actually ran
