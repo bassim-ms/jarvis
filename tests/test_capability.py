@@ -263,6 +263,71 @@ def test_tool_trigger_takes_priority_over_a_search_triggering_word():
     assert decision == CapabilityDecision(capability=Capability.TOOL, tool_name="weather")
 
 
+# --- M6.16: natural-language "the X tool" phrasing ------------------------------
+
+
+def test_use_the_x_tool_phrasing_routes_tool():
+    router = DeterministicCapabilityRouter()
+
+    decision = router.route("use the echo tool")
+
+    assert decision == CapabilityDecision(capability=Capability.TOOL, tool_name="echo")
+
+
+def test_use_the_x_tool_with_trailing_text_routes_tool():
+    router = DeterministicCapabilityRouter()
+
+    decision = router.route("use the echo tool to say hello")
+
+    assert decision == CapabilityDecision(capability=Capability.TOOL, tool_name="echo")
+
+
+def test_mention_pattern_works_without_an_article():
+    router = DeterministicCapabilityRouter()
+
+    decision = router.route("use echo tool")
+
+    assert decision == CapabilityDecision(capability=Capability.TOOL, tool_name="echo")
+
+
+def test_mention_pattern_supports_run_call_invoke_too():
+    router = DeterministicCapabilityRouter()
+
+    assert router.route("run the weather tool").tool_name == "weather"
+    assert router.route("call the echo tool").tool_name == "echo"
+    assert router.route("invoke the echo tool").tool_name == "echo"
+
+
+def test_mention_pattern_still_requires_the_message_to_start_with_it():
+    """Same start-anchoring as the original invocation pattern - a tool
+    mention that isn't the message's own opening request stays DIRECT."""
+    router = DeterministicCapabilityRouter()
+
+    decision = router.route("I guess I should use the echo tool for this")
+
+    assert decision.capability is Capability.DIRECT
+
+
+def test_generic_use_a_tool_phrasing_without_a_name_does_not_match():
+    """"use a tool" alone has no second "tool" word after the captured
+    token, so it correctly falls through rather than misfiring."""
+    router = DeterministicCapabilityRouter()
+
+    decision = router.route("use a tool to check the weather")
+
+    assert decision.capability is not Capability.TOOL
+
+
+def test_original_invocation_pattern_still_takes_priority():
+    """"use tool echo" is unambiguous under the original M6.14 pattern -
+    the new M6.16 pattern must not interfere with or shadow it."""
+    router = DeterministicCapabilityRouter()
+
+    decision = router.route("use tool echo")
+
+    assert decision == CapabilityDecision(capability=Capability.TOOL, tool_name="echo")
+
+
 # --- M6.14: TOOL false-positive protection --------------------------------------
 
 

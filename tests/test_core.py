@@ -29,7 +29,8 @@ from app.search.answer import (
 from app.search.base import SearchProvider, SearchProviderError, SearchResult
 from app.search.query_builder import DeterministicSearchQueryBuilder, SearchQueryBuilder
 from app.search.router import SearchRouter
-from app.tools.base import PermissionLevel, Tool, ToolResult
+from app.tools.base import PermissionLevel, Tool, ToolParameter, ToolResult
+from app.tools.decision import ToolCall, ToolCallBuilder, ToolCallError, ToolCallProvider
 from app.tools.registry import ToolRegistry
 from app.tools.web_search import WebSearchTool
 
@@ -752,6 +753,7 @@ class ConfirmTool(Tool):
 def make_tool_core(
     capability_router,
     tools: ToolRegistry | None = None,
+    tool_call_builder: ToolCallBuilder | None = None,
 ) -> JarvisCore:
     registry = tools or ToolRegistry()
     return JarvisCore(
@@ -759,6 +761,7 @@ def make_tool_core(
         memory=SQLiteMemoryStore(":memory:"),
         tools=registry,
         capability_router=capability_router,
+        tool_call_builder=tool_call_builder,
     )
 
 
@@ -949,3 +952,269 @@ def test_hybrid_router_default_deterministic_fast_path_never_calls_ai_decision_p
 
     assert reply == "direct reply"
     assert decision_provider.last_message is None  # never called
+
+
+# --- M6.16: natural-language tool selection ------------------------------------
+
+
+class MessageEchoTool(Tool):
+    """Fake READ tool with one required string parameter - distinct from
+    the zero-parameter EchoTool above, used to exercise M6.16's parameter
+    construction (deterministic and AI-backed) without disturbing any
+    M6.14 test that relies on the zero-parameter one."""
+
+    name = "echo"
+    description = "Echoes back a message."
+    permission = PermissionLevel.READ
+
+    @property
+    def parameters(self) -> list[ToolParameter]:
+        return [ToolParameter(name="message", type="string")]
+
+    def execute(self, message: str = "") -> ToolResult:
+        return ToolResult.success(data=message)
+
+
+class AddNumbersTool(Tool):
+    """Fake READ tool with two required parameters - needs AI-backed
+    construction even when the tool name is already known."""
+
+    name = "add"
+    description = "Adds two numbers."
+    permission = PermissionLevel.READ
+
+    @property
+    def parameters(self) -> list[ToolParameter]:
+        return [
+            ToolParameter(name="a", type="number"),
+            ToolParameter(name="b", type="number"),
+        ]
+
+    def execute(self, a: float = 0, b: float = 0) -> ToolResult:
+        return ToolResult.success(data=a + b)
+
+
+class FakeToolCallProviderForCore(ToolCallProvider):
+    """Records whether/how it was called and returns a fixed ToolCall, or
+    raises - has no reference to any ToolRegistry, proving structurally
+    that it cannot execute a tool itself."""
+
+    def __init__(self, tool_call=None, error=None):
+        self.tool_call = tool_call
+        self.error = error
+        self.call_count = 0
+        self.last_message = None
+        self.last_candidate_tools = None
+
+    def decide(self, message, candidate_tools):
+        self.call_count += 1
+        self.last_message = message
+        self.last_candidate_tools = candidate_tools
+        if self.error:
+            raise self.error
+        return self.tool_call
+
+
+def test_core_dispatches_deterministic_tool_call_with_parameters():
+    """An explicitly named tool invocation with leftover text fills the
+    single required parameter deterministically - no AI call at all."""
+    registry = ToolRegistry()
+    registry.register(MessageEchoTool())
+    call_provider = FakeToolCallProviderForCore()
+    capability_router = FakeCapabilityRouter(Capability.TOOL, tool_name="echo")
+    jarvis = make_tool_core(
+        capability_router, tools=registry, tool_call_builder=ToolCallBuilder(call_provider)
+    )
+
+    reply, _, sources = jarvis.handle_chat("use tool echo hello world")
+
+    assert reply == "hello world"
+    assert sources == []
+    assert call_provider.call_count == 0
+
+
+def test_core_end_to_end_handles_the_name_before_tool_phrasing():
+    """M6.16 routing fix, exercised through the real, unmocked
+    CapabilityRouter and ToolCallBuilder: "use the echo tool to say
+    hello" now reaches TOOL (via app/capability.py's
+    _TOOL_MENTION_PATTERN, not just the original "use tool echo" syntax)
+    and is filled deterministically - no AI call needed or made."""
+    registry = ToolRegistry()
+    registry.register(MessageEchoTool())
+    call_provider = FakeToolCallProviderForCore()
+    jarvis = JarvisCore(
+        provider=FakeProvider("direct reply"),
+        memory=SQLiteMemoryStore(":memory:"),
+        tools=registry,
+        tool_call_builder=ToolCallBuilder(call_provider),
+    )
+
+    reply, _, sources = jarvis.handle_chat("use the echo tool to say hello")
+
+    assert reply == "to say hello"
+    assert sources == []
+    assert call_provider.call_count == 0
+
+
+def test_core_dispatches_natural_language_tool_call_via_ai():
+    """decision.tool_name is None (an explicit-but-nameless TOOL request,
+    or a future capability decision that leaves it unset) - the
+    AI-backed ToolCallProvider selects a real registered tool and builds
+    its parameters, and Core executes it through the ordinary
+    ToolRegistry path. The fake provider has zero access to the
+    registry, proving Gemini itself never executes anything."""
+    registry = ToolRegistry()
+    registry.register(MessageEchoTool())
+    registry.register(AddNumbersTool())
+    call_provider = FakeToolCallProviderForCore(
+        tool_call=ToolCall(tool_name="echo", parameters={"message": "hello"})
+    )
+    capability_router = FakeCapabilityRouter(Capability.TOOL)
+    jarvis = make_tool_core(
+        capability_router, tools=registry, tool_call_builder=ToolCallBuilder(call_provider)
+    )
+
+    reply, _, sources = jarvis.handle_chat("say hello using the echo tool")
+
+    assert reply == "hello"
+    assert sources == []
+    assert call_provider.call_count == 1
+    assert {t.name for t in call_provider.last_candidate_tools} == {"echo", "add"}
+
+
+def test_core_tool_call_incomplete_error_becomes_a_graceful_reply_not_a_502():
+    """Missing required parameters is a normal, typed "not enough
+    information" outcome - a plain reply, never a 502."""
+    registry = ToolRegistry()
+    registry.register(MessageEchoTool())
+    capability_router = FakeCapabilityRouter(Capability.TOOL, tool_name="echo")
+    jarvis = make_tool_core(capability_router, tools=registry)
+
+    reply, _, sources = jarvis.handle_chat("use tool echo")
+
+    assert "message" in reply.lower() or "echo" in reply.lower()
+    assert sources == []
+
+
+def test_core_tool_call_error_becomes_provider_error():
+    """A ToolCallProvider failure (or invalid output) is translated to
+    ProviderError, the same convention CapabilityDecisionError/
+    SearchAnswerError already use - never a silent guess, never exposed
+    as a raw internal error."""
+    registry = ToolRegistry()
+    registry.register(AddNumbersTool())
+    call_provider = FakeToolCallProviderForCore(error=ToolCallError("Gemini is down"))
+    capability_router = FakeCapabilityRouter(Capability.TOOL, tool_name="add")
+    jarvis = make_tool_core(
+        capability_router, tools=registry, tool_call_builder=ToolCallBuilder(call_provider)
+    )
+
+    with pytest.raises(ProviderError, match="Gemini is down"):
+        jarvis.handle_chat("use tool add 2 and 3")
+
+
+def test_core_tool_dispatch_still_respects_permission_with_ai_constructed_parameters():
+    """AI-constructed parameters don't bypass ToolRegistry's permission
+    enforcement: a CONFIRM-level tool still requires confirmation and is
+    never actually run without it."""
+
+    class ConfirmWithParamTool(Tool):
+        name = "confirm_add"
+        description = "Adds two numbers, but requires confirmation."
+        permission = PermissionLevel.CONFIRM
+
+        @property
+        def parameters(self):
+            return [
+                ToolParameter(name="a", type="number"),
+                ToolParameter(name="b", type="number"),
+            ]
+
+        def execute(self, a: float = 0, b: float = 0) -> ToolResult:
+            return ToolResult.success(message="ran for real")
+
+    registry = ToolRegistry()
+    registry.register(ConfirmWithParamTool())
+    call_provider = FakeToolCallProviderForCore(
+        tool_call=ToolCall(tool_name="confirm_add", parameters={"a": 2, "b": 3})
+    )
+    capability_router = FakeCapabilityRouter(Capability.TOOL, tool_name="confirm_add")
+    jarvis = make_tool_core(
+        capability_router, tools=registry, tool_call_builder=ToolCallBuilder(call_provider)
+    )
+
+    reply, _, _ = jarvis.handle_chat("use tool confirm_add 2 and 3")
+
+    assert "confirm" in reply.lower()
+    assert reply != "ran for real"  # the tool itself never actually ran
+
+
+def test_core_tool_call_dispatch_is_generic_across_ai_selected_tools():
+    """No `if tool_name == "echo"` branch in Core: two differently-named,
+    differently-schemad tools both dispatch correctly through the exact
+    same AI-backed code path."""
+    registry = ToolRegistry()
+    registry.register(MessageEchoTool())
+    registry.register(AddNumbersTool())
+
+    echo_provider = FakeToolCallProviderForCore(
+        tool_call=ToolCall(tool_name="echo", parameters={"message": "hi"})
+    )
+    add_provider = FakeToolCallProviderForCore(
+        tool_call=ToolCall(tool_name="add", parameters={"a": 1, "b": 2})
+    )
+
+    echo_reply, _, _ = make_tool_core(
+        FakeCapabilityRouter(Capability.TOOL),
+        tools=registry,
+        tool_call_builder=ToolCallBuilder(echo_provider),
+    ).handle_chat("say hi with echo")
+    add_reply, _, _ = make_tool_core(
+        FakeCapabilityRouter(Capability.TOOL),
+        tools=registry,
+        tool_call_builder=ToolCallBuilder(add_provider),
+    ).handle_chat("add 1 and 2")
+
+    assert echo_reply == "hi"
+    assert add_reply == "3"
+
+
+def test_core_tool_call_builder_is_constructor_injectable():
+    call_provider = FakeToolCallProviderForCore(
+        tool_call=ToolCall(tool_name="echo", parameters={"message": "hi"})
+    )
+    registry = ToolRegistry()
+    registry.register(MessageEchoTool())
+    jarvis = JarvisCore(
+        provider=FakeProvider("direct reply"),
+        memory=SQLiteMemoryStore(":memory:"),
+        tools=registry,
+        capability_router=FakeCapabilityRouter(Capability.TOOL),
+        tool_call_builder=ToolCallBuilder(call_provider),
+    )
+
+    jarvis.handle_chat("say hi with echo")
+
+    assert call_provider.call_count == 1
+
+
+def test_core_default_tool_call_builder_is_a_tool_call_builder():
+    assert isinstance(JarvisCore().tool_call_builder, ToolCallBuilder)
+
+
+def test_direct_behavior_is_unaffected_by_the_tool_decision_layer():
+    jarvis, provider, _ = make_search_core(reply="a stable answer")
+
+    reply, _, sources = jarvis.handle_chat("what is quantum entanglement?")
+
+    assert reply == "a stable answer"
+    assert sources == []
+
+
+def test_search_behavior_is_unaffected_by_the_tool_decision_layer():
+    answer_generator = FakeAnswerGenerator(answer="grounded answer")
+    jarvis, _, _ = make_search_core(answer_generator=answer_generator)
+
+    reply, _, sources = jarvis.handle_chat("what's the latest news on AI?")
+
+    assert reply == "grounded answer"

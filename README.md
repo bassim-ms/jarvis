@@ -1,19 +1,21 @@
 # Jarvis
 
-Personal AI assistant project. This is **Milestone 6.15: Hybrid Capability
-Decision Layer** — capability routing (`app/capability.py`) is now
-deterministic-first, AI-fallback-only: obvious `DIRECT`/`SEARCH`/`TOOL`
-messages are still decided with zero AI calls (M6.9-M6.14, unchanged), and
-only a message the deterministic layer itself flags as genuinely ambiguous
-falls back to a small, strictly-validated Gemini capability decision, built
-entirely on the existing free-tier `AIProvider`/`GeminiProvider` - no new
-client, no paid API, no billing. Gemini only ever returns a decision; it
-never executes a tool - see [Web Search](#web-search) for details.
-`DIRECT`/`SEARCH`/`TOOL` execution, the search pipeline (M6.5-6.9),
-conversation-aware answers (M6.10), source citations over `/chat` (M6.11),
-deterministic query enrichment (M6.12), and `ToolRegistry` (M5) are all
-unchanged. No autonomous research, citations UI, dashboard, agents, voice,
-or hardware control yet.
+Personal AI assistant project. This is **Milestone 6.16: Natural-Language
+Tool Selection** — once capability routing (M6.13-M6.15) has already
+decided a message needs `TOOL`, a new Tool Decision Layer
+(`app/tools/decision.py`) turns it into a concrete, validated `ToolCall`
+(tool name + parameters), deterministically when the message already
+contains everything needed, and via a small, strictly-validated Gemini
+call - built entirely on the existing free-tier `AIProvider`/
+`GeminiProvider`, no new client, no paid API - only when genuinely
+necessary. Gemini only ever proposes a `ToolCall`; it never executes
+anything - `ToolRegistry` (M5) remains the sole executor and the sole
+authority on tool existence and permissions; see [Web Search](#web-search)
+for details. Capability routing itself (M6.13-M6.15), the search pipeline
+(M6.5-6.9), conversation-aware answers (M6.10), source citations over
+`/chat` (M6.11), and deterministic query enrichment (M6.12) are all
+unchanged. No multi-tool chaining, agents, planning, or autonomous
+execution yet.
 
 ## Stack
 
@@ -121,6 +123,7 @@ jarvis/
     tools/
       base.py           - Tool interface, PermissionLevel, ToolResult, ToolRequirements
       registry.py       - ToolRegistry: register/lookup/list/execute, permission enforcement
+      decision.py         - ToolCall/ToolCallBuilder/GeminiToolCallProvider: natural-language tool selection
       web_search.py      - WebSearchTool: adapts a SearchProvider into the Tool interface
       defaults.py        - register_default_tools: wires the app's default tools (web_search) into a registry
     search/
@@ -146,6 +149,7 @@ jarvis/
     test_gemini_provider.py - unit tests for the Gemini provider, with HTTP mocked out
     test_memory.py          - unit tests for the SQLite memory store
     test_tools.py           - unit tests for the Tool Registry and permission model
+    test_tool_decision.py   - unit tests for ToolCall/ToolCallBuilder/GeminiToolCallProvider
     test_searxng_provider.py - unit tests for the SearXNG provider, with HTTP mocked out
     test_web_search_tool.py  - unit tests for WebSearchTool, through the Tool Registry
     test_default_tools.py    - proves web_search is in the default/application tool registry
@@ -205,10 +209,11 @@ architecture in `app/tools/`:
   even though `JarvisCore`'s own default stays empty. AI tool-calling
   (letting Gemini decide which tool to invoke) is not wired up yet - that's
   a later milestone.
-- Since M6.14, a chat message can also reach a registered tool
-  deterministically through the `TOOL` capability - see TOOL Capability
-  below - but that's still an explicit, narrowly-phrased request, never AI
-  tool selection.
+- Since M6.14, a chat message can also reach a registered tool through the
+  `TOOL` capability - see TOOL Capability below. Since M6.16, once `TOOL`
+  is decided, a separate Tool Decision Layer can construct its parameters
+  - deterministically when possible, or via a small, strictly-validated
+  Gemini call otherwise - see Natural-Language Tool Selection below.
 
 ### Adding a new tool
 
@@ -291,13 +296,17 @@ message -> DeterministicCapabilityRouter (TOOL check, first)
 ```
 
 - **Deliberately conservative, deterministic detection**: only an explicit,
-  command-like phrasing at the very start of the message counts -
-  `use`/`run`/`call`/`invoke` + `tool` + an optional name (`"use tool
-  echo"`, `"run tool: echo"`). A message that merely *mentions* a tool
-  ("what tool should I use for this job?") stays `DIRECT`. No Gemini/AI
-  call, no NLP, no fuzzy or semantic matching - the tool name, when given,
-  is captured exactly as typed, never guessed, normalized, or matched
-  against registered tools by the router itself.
+  command-like phrasing at the very start of the message counts, in either
+  word order - `use`/`run`/`call`/`invoke` + `tool` + an optional name
+  (`"use tool echo"`, `"run tool: echo"`), or (M6.16) the name given
+  *before* the literal word "tool" (`"use the echo tool"`, `"call echo
+  tool"`). A message that merely *mentions* a tool ("what tool should I
+  use for this job?") stays `DIRECT`, and so does a nameless generic
+  mention ("use a tool to check the weather" - "tool" itself, not a real
+  name, is what would follow "a"). No Gemini/AI call, no NLP, no fuzzy or
+  semantic matching - the tool name, when given, is captured exactly as
+  typed, never guessed, normalized, or matched against registered tools by
+  the router itself.
 - **`CapabilityRouter` decides only "TOOL, name X" - it never touches
   `ToolRegistry`.** `JarvisCore._handle_tool` is what calls
   `self.tools.execute(decision.tool_name)` - the same `ToolRegistry.execute`
@@ -395,6 +404,80 @@ message -> HybridCapabilityRouter
   not `HybridCapabilityRouter` - using the hybrid router (and therefore
   ever calling Gemini for a capability decision) is an explicit,
   constructor-injected opt-in, not the running app's default behavior.
+
+### Natural-Language Tool Selection (M6.16)
+
+Once capability routing has already decided `TOOL`, a separate **Tool
+Decision Layer** (`app/tools/decision.py`) turns it into a concrete,
+validated tool call - a deliberately different question from "which
+capability" (M6.13-M6.15), answered by a deliberately different
+abstraction:
+
+```
+message + CapabilityDecision.tool_name -> ToolCallBuilder
+        -> deterministic? -> ToolCall, zero AI calls
+        -> ambiguous? -> call_provider.decide(message, candidate_tools)  [GeminiToolCallProvider]
+        -> strictly validated ToolCall -> JarvisCore._handle_tool -> ToolRegistry.execute(name, params=...)
+```
+
+- **No parallel tool-schema system**: `Tool.parameters` (a `list[
+  ToolParameter]`, each with `name`/`type`/`description`/`required` -
+  `app/tools/base.py`, unchanged) already *is* the schema. M6.16 only adds
+  a small serializer that sends a candidate tool's `name`/`description`/
+  parameter list to Gemini - never its `permission`, its `requirements`
+  (dependencies/env vars/network), its Python implementation, unrelated
+  tools outside the candidate set, or any conversation history.
+- **`ToolCall(tool_name, parameters)`** (`app/tools/decision.py`) is the
+  small, separate result type - it does not replace or extend
+  `CapabilityDecision`; `CapabilityRouter` still only ever decides
+  DIRECT/SEARCH/TOOL(+ an optional known name), exactly as in M6.13-M6.15.
+- **Deterministic-first, same philosophy as `SearchQueryBuilder`**:
+  `ToolCallBuilder` (defaulting to a bare `GeminiToolCallProvider()` for
+  its AI fallback) never re-asks which tool when `decision.tool_name` is
+  already known from M6.14's explicit invocation syntax - it only
+  constructs *parameters*, and even that with **zero AI calls** when the
+  tool needs none, or needs exactly one required `"string"` parameter
+  that the message already spells out as trailing text (`"use tool echo
+  hello world"` -> `{tool_name: "echo", parameters: {message: "hello
+  world"}}`, deterministically). Gemini is consulted only when a tool has
+  multiple required parameters, a non-`"string"` required parameter, or
+  the tool itself isn't already known - and even then, only the
+  already-known tool (or the full registry, if the name truly isn't
+  known) is offered as candidates, never a second capability-classification
+  call.
+- **Strict, fail-safe validation before any `ToolCall` is constructed**:
+  the response must be a JSON object with only `tool_name`/`parameters`;
+  `tool_name` must exactly match one of the *offered* candidate tools -
+  Gemini can never select or invent a tool outside that list; `parameters`
+  must be a JSON object whose keys are all declared for that tool, with
+  every required parameter present and each value's type checked against
+  the tool's own declared `type`. Any violation raises `ToolCallError`
+  (`app/tools/decision.py`) - never a silently repaired guess.
+- **Missing required parameters is its own typed outcome, not a hard
+  failure**: `ToolCallIncompleteError` (a `ToolCallError` subtype) covers
+  both "a required parameter's value isn't in the message" and "no tools
+  are registered to choose from at all" - `JarvisCore` turns this into a
+  plain reply (the same graceful-outcome shape M6.14 already used for an
+  unnamed tool request), not a 502, since it's about what the user said,
+  not a system failure. M6.16 doesn't build a conversational clarification
+  workflow on top of this; it only preserves the typed boundary for a
+  later milestone to use. Any other `ToolCallError` (a failed AI call, or
+  output that fails validation) is translated to `ProviderError` right
+  where `tool_call_builder.build(...)` is called in
+  `JarvisCore._handle_tool` - the same 502-producing convention
+  `CapabilityDecisionError`/`SearchAnswerError` already use.
+- **Gemini never executes anything, and `ToolRegistry` is untouched.** A
+  validated `ToolCall` flows straight into the exact same
+  `ToolRegistry.execute(tool_name, params=...)` API every other caller
+  already uses - same "Unknown tool" handling for an unregistered name
+  (deterministic or AI-selected alike), same `CONFIRM`/`DANGEROUS`
+  permission enforcement, same lack of any `if tool_name == "..."` branch
+  in Core.
+- **No multi-tool chaining, no agent loop, no retries/reflection that
+  re-ask Gemini to reconsider** - `ToolCallBuilder` calls
+  `call_provider.decide(...)` at most once per message, and that single
+  call only ever proposes one `ToolCall` for `JarvisCore` to dispatch,
+  never a sequence of them.
 
 ### Search Routing (M6.9)
 
@@ -847,24 +930,39 @@ These were not decided now, to avoid overbuilding before they're needed:
   hold more than DIRECT/SEARCH/TOOL, but no enum member or decision logic
   for any of these exists yet; each is added only when a milestone
   actually implements it.
-- General-purpose natural-language tool selection/execution — `TOOL`
-  (M6.14) only recognizes an explicit, fixed invocation phrasing and
-  dispatches by exact registered tool name. M6.15's Gemini fallback can
-  suggest a `tool_name` only for the one narrow "explicit invocation with
-  nothing named" ambiguity case, from a message alone (no tool
-  descriptions/registry contents given to it) - there is still no
-  mechanism that maps an arbitrary free-form request to a tool, extracts
-  its parameters, or chains multiple tool calls together. `web_search`
-  stays excluded from generic TOOL dispatch and keeps its own SEARCH path.
-- AI tool-calling (an AI provider choosing *when* to invoke a tool and
-  autonomously executing it) — Gemini still never decides when to call
-  `web_search`, and `HybridCapabilityRouter`'s Gemini fallback (M6.15)
-  only ever returns a capability *decision* for `JarvisCore` to dispatch -
-  it never calls `ToolRegistry` itself, isn't wired as `JarvisCore`'s
-  default, and only runs at all for the one narrow ambiguous case above.
-  `SearchRouter` (M6.9) is still a fixed keyword matcher for its own
-  decision, and tools are still only ever invoked through the Registry -
-  not through any autonomous, multi-step, or AI-driven execution loop.
+- Multi-tool chaining, agents, planning, or any autonomous execution —
+  M6.16's Tool Decision Layer proposes exactly one `ToolCall` per message,
+  once, for `JarvisCore` to dispatch through `ToolRegistry`; there is no
+  loop that lets an AI decide to call several tools in sequence, reflect
+  on a result, or retry with a different tool. `web_search` stays excluded
+  from generic TOOL dispatch and keeps its own SEARCH path.
+- Conversational clarification for a missing tool parameter —
+  `ToolCallIncompleteError` (M6.16) preserves the typed boundary (a
+  missing required parameter becomes a plain "not enough information"
+  reply), but there's no follow-up flow yet that asks the user for the
+  missing value and retries the same tool call once they answer.
+- Further widening what counts as an explicit `TOOL` request at the
+  `CapabilityRouter` level — M6.16 added a second narrow phrasing (the
+  tool name before the literal word "tool", e.g. `"use the echo tool"`)
+  alongside M6.14's original one, but both are still fixed, anchored
+  patterns requiring one of `use`/`run`/`call`/`invoke` at the very start
+  of the message; a message that matches neither (e.g. `"echo this
+  message: hello"`, with no verb/`"tool"` phrasing at all) never reaches
+  the Tool Decision Layer. Recognizing arbitrary free-form tool requests
+  without any such anchor, or `HybridCapabilityRouter`'s ambiguity
+  boundary, is a separate, deliberate future decision.
+- Autonomous AI tool-calling (an AI provider deciding *when* to invoke a
+  tool and executing it itself) — Gemini still never decides when to call
+  `web_search`; `HybridCapabilityRouter`'s capability fallback (M6.15) and
+  `GeminiToolCallProvider`'s tool-call construction (M6.16) each only ever
+  return a typed decision (`CapabilityDecision`/`ToolCall`) for
+  `JarvisCore` to dispatch - neither calls `ToolRegistry` itself, neither
+  is wired as `JarvisCore`'s default, and each runs at most once per
+  message, only when the deterministic layer above it couldn't already
+  resolve things. `SearchRouter` (M6.9) is still a fixed keyword matcher
+  for its own decision, and tools are still only ever invoked through the
+  Registry - not through any autonomous, multi-step, or AI-driven
+  execution loop.
 - Smarter routing — mode selection (FAST/RESEARCH/CRITICAL) for a SEARCH
   message, and precision improvements beyond fixed keywords (e.g. "results"
   as a live-info trigger is intentionally broad and can over-match) -

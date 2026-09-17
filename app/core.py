@@ -36,6 +36,18 @@ error handling (a clean 502) needs no changes to cover it. Core's default
 capability_router is still the fully deterministic DeterministicCapability-
 Router (unchanged from M6.14) - this failure path only matters for a
 caller that explicitly injects a HybridCapabilityRouter.
+
+Since M6.16, _handle_tool no longer calls ToolRegistry.execute() with a
+bare tool_name and no arguments: it first asks a ToolCallBuilder
+(app/tools/decision.py) to construct a validated ToolCall (tool_name +
+parameters) - deterministically when the message already contains
+enough information, via a Gemini-backed ToolCallProvider only when
+genuinely necessary - then passes that straight into the same
+ToolRegistry.execute(name, params=...) call. A ToolCallIncompleteError
+(missing required parameters, or nothing to select from) becomes a
+plain reply, the same way an unknown tool name already did; any other
+ToolCallError is translated to ProviderError, the same convention
+CapabilityDecisionError/SearchAnswerError already use.
 """
 
 from app.capability import (
@@ -60,6 +72,7 @@ from app.search.base import SearchProviderError
 from app.search.query_builder import DeterministicSearchQueryBuilder, SearchQueryBuilder
 from app.search.router import SearchRouter
 from app.tools.base import ToolResult, ToolResultStatus
+from app.tools.decision import ToolCallBuilder, ToolCallError, ToolCallIncompleteError
 from app.tools.registry import ToolRegistry
 from app.tools.web_search import WebSearchTool
 
@@ -89,6 +102,7 @@ class JarvisCore:
         answer_generator: SearchAnswerGenerator | None = None,
         query_builder: SearchQueryBuilder | None = None,
         capability_router: CapabilityRouter | None = None,
+        tool_call_builder: ToolCallBuilder | None = None,
     ):
         self.provider = provider or GeminiProvider()
         self.memory = memory or SQLiteMemoryStore(settings.memory_db_path)
@@ -114,6 +128,7 @@ class JarvisCore:
         self.capability_router = capability_router or DeterministicCapabilityRouter(
             search_router=self.router
         )
+        self.tool_call_builder = tool_call_builder or ToolCallBuilder()
 
     def handle_chat(
         self, message: str, conversation_id: str | None = None
@@ -159,7 +174,7 @@ class JarvisCore:
         if decision.capability is Capability.SEARCH:
             reply, sources = self._handle_search(message, history, facts)
         elif decision.capability is Capability.TOOL:
-            reply, sources = self._handle_tool(decision)
+            reply, sources = self._handle_tool(message, decision)
         else:
             prompt = self._build_prompt(message, history, facts)
             reply = self.provider.generate_reply(prompt)
@@ -221,31 +236,52 @@ class JarvisCore:
 
         return search_answer.answer, search_answer.sources
 
-    def _handle_tool(self, decision: CapabilityDecision) -> tuple[str, list[SearchSource]]:
-        """TOOL path (M6.14): dispatch to the existing ToolRegistry
-        (app/tools/registry.py) by `decision.tool_name` alone - Core never
-        branches on which tool it is, never inspects a specific tool's
-        parameters, and never attempts to extract them from the message
-        (no NLP/AI tool selection exists yet; see app/capability.py).
-        `sources` is always `[]` - TOOL never produces search evidence.
+    def _handle_tool(
+        self, message: str, decision: CapabilityDecision
+    ) -> tuple[str, list[SearchSource]]:
+        """TOOL path: ToolCallBuilder (M6.16) constructs a validated
+        ToolCall - deterministically when the message already has
+        everything needed, via a Gemini-backed ToolCallProvider only when
+        genuinely necessary - then dispatches to the existing
+        ToolRegistry (app/tools/registry.py) by name + parameters. Core
+        never branches on which tool it is, never inspects a specific
+        tool's own parameter semantics, and never extracts parameters
+        from the message itself - that's ToolCallBuilder's job. `sources`
+        is always `[]` - TOOL never produces search evidence.
 
-        `decision.tool_name` is `None` when the CapabilityRouter recognized
-        an explicit tool-invocation phrasing but couldn't identify which
-        tool (e.g. "use tool" with nothing named) - reported back as a
-        clear, typed non-execution outcome rather than guessing a tool.
+        A ToolCallIncompleteError (required parameters missing, or no
+        tools registered to choose from) is a normal, typed "not enough
+        information" outcome - reported back as the reply text, not a
+        502, since it's about what the user said rather than a system
+        failure; this replaces M6.14's fixed "couldn't tell which tool"
+        reply for `decision.tool_name is None` with a real attempt at
+        natural-language tool selection, falling back to the same kind of
+        plain reply only when that genuinely can't succeed (e.g. no tools
+        registered at all). Any other ToolCallError (a failed AI call, or
+        AI output that fails validation) is translated to ProviderError,
+        the same 502-producing convention CapabilityDecisionError/
+        SearchAnswerError already use.
 
-        An unregistered `tool_name` needs no special handling here either:
-        `ToolRegistry.execute()` already returns a typed "Unknown tool"
-        `ToolResult.error(...)` for it, same as for any other tool failure.
+        An unregistered `tool_name` still needs no special handling here:
+        ToolCallBuilder passes it through unchanged, and
+        `ToolRegistry.execute()` returns its existing typed "Unknown
+        tool" `ToolResult.error(...)` for it, same as before M6.16.
         Permission enforcement (CONFIRM/DANGEROUS -> CONFIRMATION_REQUIRED/
-        DENIED) is likewise entirely the Registry's existing behavior - the
-        `/chat` API has no confirmation round-trip yet, so those outcomes
-        simply surface as the reply text, same as an error would.
+        DENIED) is likewise entirely the Registry's existing behavior,
+        unaffected by how the parameters were constructed - the `/chat`
+        API has no confirmation round-trip yet, so those outcomes simply
+        surface as the reply text, same as an error would.
         """
-        if decision.tool_name is None:
-            return "I couldn't tell which tool to use for that request.", []
+        try:
+            tool_call = self.tool_call_builder.build(
+                message, self.tools, decision.tool_name
+            )
+        except ToolCallIncompleteError as exc:
+            return str(exc), []
+        except ToolCallError as exc:
+            raise ProviderError(f"Failed to construct a tool call: {exc}") from exc
 
-        result = self.tools.execute(decision.tool_name)
+        result = self.tools.execute(tool_call.tool_name, params=tool_call.parameters)
         return self._format_tool_result(result), []
 
     @staticmethod

@@ -19,8 +19,9 @@ DeterministicCapabilityRouter generalizes M6.9's SearchRouter
 SEARCH rather than duplicating its regex rules - SearchRouter (and its own
 tests, tests/test_search_router.py) stays the single source of truth for
 that matching; it's no longer the top-level interface JarvisCore talks to
-directly for the decision. TOOL detection (M6.14) is a separate, narrow,
-purely textual check - see DeterministicCapabilityRouter's docstring.
+directly for the decision. TOOL detection (M6.14, extended in M6.16 with a
+second narrow phrasing) is a separate, purely textual check - see
+DeterministicCapabilityRouter's docstring.
 
 M6.15 adds HybridCapabilityRouter: deterministic routing stays the fast
 path for every message it can already confidently resolve (which is still
@@ -117,22 +118,37 @@ _TOOL_INVOCATION_PATTERN = re.compile(
     r"^\s*(?:use|run|call|invoke)\s+tool\b\s*:?\s*(\S+)?", re.IGNORECASE
 )
 
+#: M6.16: the mirror-image phrasing - the tool name given BEFORE the
+#: literal word "tool" instead of after it ("use the echo tool[...]"),
+#: still anchored to the same explicit verb set and still requiring the
+#: literal word "tool" right after the name. Not a general NLP pattern -
+#: just the other natural word order for the same explicit intent. The
+#: negative lookahead stops the optional article from backtracking into
+#: the capture group itself (without it, "use a tool to..." would wrongly
+#: match with "a" captured as the tool name).
+_TOOL_MENTION_PATTERN = re.compile(
+    r"^\s*(?:use|run|call|invoke)\s+(?:(?:the|a|an)\s+)?"
+    r"(?!(?:the|a|an)\b)(\S+)\s+tool\b",
+    re.IGNORECASE,
+)
+
 
 class DeterministicCapabilityRouter(CapabilityRouter):
     """The only capability decision maker for now: TOOL, then DIRECT vs
     SEARCH, all without any Gemini/LLM call.
 
-    TOOL is checked first, via a narrow explicit-invocation phrasing
-    (`_TOOL_INVOCATION_PATTERN`) - the most deliberate, unambiguous signal
-    of the three, so it takes priority even over a message that also
-    happens to contain a SEARCH-triggering word (e.g. "use tool weather"
-    is TOOL, not SEARCH, even though "weather" alone would be SEARCH).
-    This check is pure text parsing - it never looks at what tools are
-    actually registered (that's ToolRegistry's job, at dispatch time in
-    JarvisCore._handle_tool - see app/core.py) and never executes
+    TOOL is checked first, via two narrow explicit-invocation phrasings -
+    `_TOOL_INVOCATION_PATTERN` ("use tool echo") and `_TOOL_MENTION_PATTERN`
+    ("use the echo tool") - the most deliberate, unambiguous signal of the
+    three, so either takes priority even over a message that also happens
+    to contain a SEARCH-triggering word (e.g. "use tool weather" is TOOL,
+    not SEARCH, even though "weather" alone would be SEARCH). Both checks
+    are pure text parsing - neither looks at what tools are actually
+    registered (that's ToolRegistry's job, at dispatch time in
+    JarvisCore._handle_tool - see app/core.py) and neither executes
     anything.
 
-    Everything that doesn't match the TOOL pattern is delegated to an
+    Everything that doesn't match either TOOL pattern is delegated to an
     injected SearchRouter (defaulting to a bare SearchRouter()) for the
     actual DIRECT/SEARCH keyword/pattern matching, exactly as in M6.13.
 
@@ -147,7 +163,9 @@ class DeterministicCapabilityRouter(CapabilityRouter):
         self.search_router = search_router or SearchRouter()
 
     def route(self, message: str) -> CapabilityDecision:
-        tool_match = _TOOL_INVOCATION_PATTERN.match(message)
+        tool_match = _TOOL_INVOCATION_PATTERN.match(
+            message
+        ) or _TOOL_MENTION_PATTERN.match(message)
         if tool_match:
             return CapabilityDecision(
                 capability=Capability.TOOL, tool_name=tool_match.group(1)
