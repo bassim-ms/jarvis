@@ -559,11 +559,14 @@ history/facts (already loaded by handle_chat)
   to, never as evidence, and never a source of facts/sources/URLs to
   answer from - the existing M6.8 grounding guarantees (answer only from
   search evidence, never invent citations) are unchanged and unweakened.
-- **The search query itself is untouched**: `SearchRouter.route(message)`
-  and `WebSearchTool.search(message)` still both receive exactly the raw
-  current message, nothing appended, no AI rewriting. Only
-  `JarvisCore._handle_search` additionally builds a context string and
-  passes it to the answer generator, *after* the search has already run.
+- **The search query itself was untouched in M6.10**: `SearchRouter.
+  route(message)` and `WebSearchTool.search(message)` both received
+  exactly the raw current message, nothing appended, no AI rewriting.
+  `JarvisCore._handle_search` only built a context string and passed it to
+  the answer generator, *after* the search had already run. M6.12 (below)
+  later gave `WebSearchTool.search()` a narrow, deterministic exception to
+  this for context-dependent follow-ups - `SearchRouter.route()` still
+  never sees anything but the raw message.
 - `JarvisCore._format_context(history, facts, max_messages=None)` is a new
   shared static helper factoring out the facts/history formatting that
   `_build_prompt` (DIRECT) already did, so DIRECT and SEARCH don't
@@ -578,9 +581,74 @@ history/facts (already loaded by handle_chat)
   still decides DIRECT vs SEARCH from the current message alone, before
   any context is built. M6.10 only affects what happens *after* SEARCH has
   already been chosen; it cannot cause more messages to route to SEARCH.
-- AI-driven search-query rewriting (using context to change *what* gets
-  searched, not just how the answer is worded) is intentionally deferred -
-  see Postponed decisions.
+- Using context to change *what* gets searched (not just how the answer is
+  worded) was intentionally deferred here - see Search Query Understanding
+  (M6.12) below for the deterministic version that was later built, and
+  Postponed decisions for what's still left (an AI-driven version).
+
+### Search Query Understanding (M6.12)
+
+A SEARCH follow-up like "is there anything more recent on that?" right
+after "what's the latest news about SpaceX?" is a valid SEARCH message
+(it matches `SearchRouter`'s freshness pattern), but searching it
+literally throws away the one thing that makes it answerable - the
+subject ("SpaceX") lives only in the previous turn. M6.12 lets
+`WebSearchTool.search()` see that, without touching *whether* something
+gets searched:
+
+```
+message (already routed to SEARCH by SearchRouter)
+    -> bounded conversation context (JarvisCore._format_context, same M6.10 bounds)
+    -> query_builder.build(message, context) -> the actual query
+    -> web_search.search(query)
+```
+
+- **`SearchQueryBuilder`** (`app/search/query_builder.py`) is a new
+  interface with one deterministic implementation,
+  `DeterministicSearchQueryBuilder` - same ABC-plus-one-impl shape as
+  `SearchRouter` and `SearchPlanner`. **This is deterministic contextual
+  enrichment, not AI-generated query rewriting**: no Gemini call, no
+  network call, no embeddings/semantic similarity, no ranking, no
+  autonomous research. `JarvisCore` constructor-injects it
+  (`query_builder`, defaulting to `DeterministicSearchQueryBuilder()`),
+  the same DI pattern already used for `router` and `answer_generator`.
+- The trigger set is a small, explicit, fixed list of context-dependent
+  phrasings ("on that/this/it", "about that/this/it/them", "the second
+  one", "what about", "how about", "and that/this/them") - deliberately
+  narrow, the same accepted-trade-off philosophy as `SearchRouter`'s own
+  keyword list. It is **not** a general coreference resolver: a follow-up
+  like "and Blue Origin?" won't be caught, on purpose - see Postponed
+  decisions.
+- Only when a message matches that trigger set **and** the bounded context
+  contains a prior user message does enrichment happen, by prepending that
+  prior user message to the current one. Every other message - including
+  every self-contained SEARCH query such as "what's the latest news about
+  NASA?" - is sent to `WebSearchTool.search()` **byte-for-byte unchanged**.
+- **`SearchRouter.route(message)` is completely unaffected**: it still
+  runs first, on the raw current message alone, before any context is
+  built or any query is enriched, and the enriched query is never fed back
+  into it. Only `WebSearchTool.search()` - called *after* routing has
+  already chosen SEARCH - ever receives anything other than the raw
+  message.
+- Reuses the exact same bounded context `JarvisCore._handle_search` was
+  already building for the M6.10 answer generator
+  (`_SEARCH_CONTEXT_MAX_MESSAGES` / `_SEARCH_CONTEXT_MAX_CHARS`) - computed
+  once and passed to both `query_builder.build()` and
+  `answer_generator.generate()`. No new or wider context system.
+- `SearchResponse.query` and each `SearchResult.query` (M6.7 provenance)
+  now record the *enriched* query actually sent to the search pipeline,
+  not the raw follow-up message - consistent with them always describing
+  what was actually searched. Neither dataclass's shape changed.
+- Zero added latency or cost: the builder is plain string/regex matching,
+  no network or model call, so it adds nothing to the per-request cost of
+  a SEARCH turn - matching Jarvis's zero-dollar/minimal-cost stance. A
+  misfire (over- or under-enriching) degrades to today's existing failure
+  mode (a possibly-weak search), never a crash, and never touches the
+  M6.8 grounding guarantee - answers still only ever cite real, validated
+  `SearchResult`s regardless of query quality.
+- No new persisted state: there is no "last search query" stored anywhere;
+  the prior user message is recovered each time from the same
+  already-loaded, already-bounded conversation history.
 
 Configuration:
 - `JARVIS_SEARXNG_URL` - base URL of a SearXNG instance (self-hosted or a
@@ -615,11 +683,13 @@ These were not decided now, to avoid overbuilding before they're needed:
   message, and precision improvements beyond fixed keywords (e.g. "results"
   as a live-info trigger is intentionally broad and can over-match) -
   `SearchRouter` is deliberately simple today, and M6.10 didn't change it.
-- AI-driven search-query rewriting/expansion using conversation context —
-  M6.10 only lets the *answer* step see recent context; `WebSearchTool.
-  search(message)` still receives exactly the raw current message. Using
-  context (or an LLM) to construct a better search query is a deliberate,
-  separate future milestone.
+- AI-driven (Gemini-generated) search-query rewriting/expansion — M6.12
+  added *deterministic* contextual query enrichment (fixed-pattern
+  matching, no model call - see Search Query Understanding above) for a
+  narrow, explicit set of context-dependent follow-ups. General
+  coreference resolution, or using an LLM to construct/expand a query, is
+  still a deliberate, separate future milestone - not attempted here to
+  avoid the extra latency/cost of another model call on every SEARCH turn.
 - Real Brave/Tavily providers and autonomous research/agents — left for
   later milestones now that `SearchProvider`, `SearchProviderManager`, and
   `CachedSearchProvider` give them a place to plug in.

@@ -18,6 +18,7 @@ from app.search.answer import (
     SearchSource,
 )
 from app.search.base import SearchProvider, SearchProviderError, SearchResult
+from app.search.query_builder import DeterministicSearchQueryBuilder, SearchQueryBuilder
 from app.search.router import SearchRouter
 from app.tools.registry import ToolRegistry
 from app.tools.web_search import WebSearchTool
@@ -162,6 +163,7 @@ def make_search_core(
     answer_generator: SearchAnswerGenerator | None = None,
     register_web_search: bool = True,
     router: SearchRouter | None = None,
+    query_builder: SearchQueryBuilder | None = None,
 ) -> tuple[JarvisCore, FakeProvider, ToolRegistry]:
     provider = FakeProvider(reply)
     tools = ToolRegistry()
@@ -173,6 +175,7 @@ def make_search_core(
         tools=tools,
         router=router,
         answer_generator=answer_generator,
+        query_builder=query_builder,
     )
     return jarvis, provider, tools
 
@@ -186,6 +189,10 @@ def test_default_answer_generator_is_gemini_backed_and_reuses_the_provider():
 
     assert isinstance(core.answer_generator, GeminiSearchAnswerGenerator)
     assert core.answer_generator.provider is core.provider
+
+
+def test_default_query_builder_is_deterministic_search_query_builder():
+    assert isinstance(JarvisCore().query_builder, DeterministicSearchQueryBuilder)
 
 
 def test_handle_chat_uses_direct_path_for_a_stable_question():
@@ -323,6 +330,166 @@ def test_direct_path_always_returns_empty_sources_even_with_facts_and_history():
     _, _, sources = jarvis.handle_chat("what is quantum entanglement?")
 
     assert sources == []
+
+
+# --- M6.12: deterministic conversational query enrichment --------------------
+
+
+class FakeSearchQueryBuilder(SearchQueryBuilder):
+    """Records the message/context it was given and returns either a fixed
+    value or the message unchanged, or raises - decoupled from
+    DeterministicSearchQueryBuilder's own pattern-matching logic, which is
+    covered by tests/test_search_query_builder.py."""
+
+    def __init__(
+        self, fixed_result: str | None = None, error: Exception | None = None
+    ):
+        self.fixed_result = fixed_result
+        self.error = error
+        self.last_message = None
+        self.last_context = None
+        self.call_count = 0
+
+    def build(self, message, recent_context):
+        self.call_count += 1
+        self.last_message = message
+        self.last_context = recent_context
+        if self.error:
+            raise self.error
+        return self.fixed_result if self.fixed_result is not None else message
+
+
+def test_search_path_enriches_a_context_dependent_follow_up_before_searching():
+    search_provider = FakeSearchProvider(results=[])
+    answer_generator = FakeAnswerGenerator()
+    jarvis, _, _ = make_search_core(
+        search_provider=search_provider, answer_generator=answer_generator
+    )
+
+    _, conversation_id, _ = jarvis.handle_chat("what's the latest news about SpaceX?")
+    jarvis.handle_chat(
+        "is there anything more recent on that?", conversation_id=conversation_id
+    )
+
+    assert "SpaceX" in search_provider.last_query
+    assert "is there anything more recent on that?" in search_provider.last_query
+
+
+def test_search_response_query_reflects_the_enriched_query_not_the_raw_message():
+    """Important architectural decision (M6.12): SearchResponse.query (and
+    therefore SearchResult.query provenance downstream) records whatever
+    was actually sent to the search pipeline - the enriched query, not the
+    raw follow-up message - without any schema change to either
+    dataclass."""
+    search_provider = FakeSearchProvider(results=[])
+    answer_generator = FakeAnswerGenerator()
+    jarvis, _, _ = make_search_core(
+        search_provider=search_provider, answer_generator=answer_generator
+    )
+
+    _, conversation_id, _ = jarvis.handle_chat("what's the latest news about SpaceX?")
+    jarvis.handle_chat(
+        "is there anything more recent on that?", conversation_id=conversation_id
+    )
+
+    response = answer_generator.last_response
+    assert response.query == search_provider.last_query
+    assert "SpaceX" in response.query
+
+
+def test_self_contained_follow_up_search_query_is_sent_unchanged():
+    search_provider = FakeSearchProvider(results=[])
+    jarvis, _, _ = make_search_core(search_provider=search_provider)
+
+    _, conversation_id, _ = jarvis.handle_chat("what's the latest news about SpaceX?")
+    jarvis.handle_chat(
+        "what's the latest news about NASA?", conversation_id=conversation_id
+    )
+
+    assert search_provider.last_query == "what's the latest news about NASA?"
+
+
+def test_first_turn_search_query_is_sent_unchanged_with_no_prior_context():
+    search_provider = FakeSearchProvider(results=[])
+    jarvis, _, _ = make_search_core(search_provider=search_provider)
+
+    jarvis.handle_chat("is there anything more recent on that?")
+
+    assert search_provider.last_query == "is there anything more recent on that?"
+
+
+def test_search_router_still_receives_only_the_raw_message_when_the_query_is_enriched():
+    router = RecordingRouter()
+    search_provider = FakeSearchProvider(results=[])
+    jarvis, _, _ = make_search_core(router=router, search_provider=search_provider)
+
+    _, conversation_id, _ = jarvis.handle_chat("what's the latest news about SpaceX?")
+    jarvis.handle_chat(
+        "is there anything more recent on that?", conversation_id=conversation_id
+    )
+
+    assert router.last_message == "is there anything more recent on that?"
+    assert "SpaceX" in search_provider.last_query  # the query WAS enriched
+    assert router.last_message != search_provider.last_query  # but not what routed
+
+
+def test_direct_path_never_invokes_the_query_builder():
+    query_builder = FakeSearchQueryBuilder(
+        error=AssertionError("query builder should not run on the DIRECT path")
+    )
+    jarvis, _, _ = make_search_core(reply="direct reply", query_builder=query_builder)
+
+    reply, _, _ = jarvis.handle_chat("what is quantum entanglement?")
+
+    assert reply == "direct reply"
+    assert query_builder.call_count == 0
+
+
+def test_query_builder_is_constructor_injectable_and_used_verbatim():
+    query_builder = FakeSearchQueryBuilder(fixed_result="a completely different query")
+    search_provider = FakeSearchProvider(results=[])
+    jarvis, _, _ = make_search_core(
+        query_builder=query_builder, search_provider=search_provider
+    )
+
+    jarvis.handle_chat("what's the latest news?")
+
+    assert search_provider.last_query == "a completely different query"
+
+
+def test_query_builder_receives_the_same_bounded_context_as_the_answer_generator():
+    query_builder = FakeSearchQueryBuilder()
+    answer_generator = FakeAnswerGenerator()
+    search_provider = FakeSearchProvider(results=[])
+    jarvis, _, _ = make_search_core(
+        query_builder=query_builder,
+        answer_generator=answer_generator,
+        search_provider=search_provider,
+    )
+
+    _, conversation_id, _ = jarvis.handle_chat("what's the latest news about SpaceX?")
+    jarvis.handle_chat(
+        "what's the latest news about NASA?", conversation_id=conversation_id
+    )
+
+    assert query_builder.last_context == answer_generator.last_context
+
+
+def test_query_builder_context_is_bounded_to_the_configured_message_window():
+    """M6.10's bounded-context limits are reused unchanged for query
+    building - no new/wider context system."""
+    query_builder = FakeSearchQueryBuilder()
+    jarvis, _, _ = make_search_core(reply="ok", query_builder=query_builder)
+
+    _, conversation_id, _ = jarvis.handle_chat("oldest message, should drop out")
+    for i in range(5):
+        jarvis.handle_chat(f"filler {i}", conversation_id=conversation_id)
+    jarvis.handle_chat("what's the latest news?", conversation_id=conversation_id)
+
+    context = query_builder.last_context
+    assert "oldest message, should drop out" not in context
+    assert "filler 0" not in context
+    assert "filler 4" in context  # within the last _SEARCH_CONTEXT_MAX_MESSAGES
 
 
 # --- M6.10: conversation context for the SEARCH answer step -----------------

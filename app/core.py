@@ -8,7 +8,10 @@ and SearchAnswerGenerator - both deterministic/interface-level - and on
 WebSearchTool by name specifically (see _handle_search), a deliberate,
 narrow exception to "Core doesn't know about tool types": M6.9's whole
 point is that Core now orchestrates a fixed SEARCH path, not that it
-becomes tool-agnostic tool-calling.
+becomes tool-agnostic tool-calling. Since M6.12, it also depends on
+SearchQueryBuilder (deterministic, see app/search/query_builder.py) to
+decide what text to actually search once SearchRouter has already chosen
+SEARCH - SearchRouter itself never sees anything but the raw message.
 """
 
 from app.config import settings
@@ -23,6 +26,7 @@ from app.search.answer import (
     SearchSource,
 )
 from app.search.base import SearchProviderError
+from app.search.query_builder import DeterministicSearchQueryBuilder, SearchQueryBuilder
 from app.search.router import SearchDecision, SearchRouter
 from app.tools.registry import ToolRegistry
 from app.tools.web_search import WebSearchTool
@@ -37,9 +41,10 @@ class JarvisCore:
     stored facts, delegates to an AI provider, then persists the exchange."""
 
     # Bounds for the conversation context passed to the SEARCH path's
-    # answer generator (M6.10) - small and fixed, so a search-answer prompt
-    # doesn't grow with conversation length the way DIRECT's prompt can.
-    # Not applied to DIRECT, which keeps its existing unbounded behavior.
+    # answer generator (M6.10) and query builder (M6.12) - small and
+    # fixed, so a search-answer prompt (or an enriched query) doesn't grow
+    # with conversation length the way DIRECT's prompt can. Not applied to
+    # DIRECT, which keeps its existing unbounded behavior.
     _SEARCH_CONTEXT_MAX_MESSAGES = 6
     _SEARCH_CONTEXT_MAX_CHARS = 800
 
@@ -50,6 +55,7 @@ class JarvisCore:
         tools: ToolRegistry | None = None,
         router: SearchRouter | None = None,
         answer_generator: SearchAnswerGenerator | None = None,
+        query_builder: SearchQueryBuilder | None = None,
     ):
         self.provider = provider or GeminiProvider()
         self.memory = memory or SQLiteMemoryStore(settings.memory_db_path)
@@ -64,6 +70,7 @@ class JarvisCore:
         self.answer_generator = answer_generator or GeminiSearchAnswerGenerator(
             self.provider
         )
+        self.query_builder = query_builder or DeterministicSearchQueryBuilder()
 
     def handle_chat(
         self, message: str, conversation_id: str | None = None
@@ -114,16 +121,23 @@ class JarvisCore:
     def _handle_search(
         self, message: str, history: list[Message], facts: dict[str, str]
     ) -> tuple[str, list[SearchSource]]:
-        """SEARCH path: WebSearchTool -> SearchResponse ->
-        SearchAnswerGenerator, using SearchAnswer.answer as the reply and
-        returning SearchAnswer.sources (M6.11) alongside it for the caller
-        to surface as it sees fit.
+        """SEARCH path: SearchQueryBuilder -> WebSearchTool ->
+        SearchResponse -> SearchAnswerGenerator, using SearchAnswer.answer
+        as the reply and returning SearchAnswer.sources (M6.11) alongside
+        it for the caller to surface as it sees fit.
 
-        The search query is `message` alone, exactly as before M6.10 -
-        conversation context is never passed to SearchRouter.route() or
-        WebSearchTool.search(), only to the answer generator afterwards
-        (M6.10), so it can resolve references like "it" or "the deadline"
-        in the question without changing what was actually searched.
+        SearchRouter.route() has already decided SEARCH from `message`
+        alone, before this method is even called - it never sees the
+        bounded context built here or the enriched query built below.
+        WebSearchTool.search(), by contrast, now (M6.12) receives whatever
+        `self.query_builder.build()` returns: `message` unchanged for a
+        self-contained SEARCH query (the common case), or `message` plus
+        the previous user turn for a narrow, explicit set of
+        context-dependent follow-ups ("what about that?", "the second
+        one", ...) - see app/search/query_builder.py. Either way, the
+        bounded context is computed once here and reused for both the
+        query builder and the answer generator (M6.10), never rebuilt or
+        widened for this new step.
 
         Failures from either step are raised as ProviderError, the same
         error type the DIRECT path already raises on an AI-provider
@@ -134,15 +148,17 @@ class JarvisCore:
         if not isinstance(web_search, WebSearchTool):
             raise ProviderError("web_search tool is not registered.")
 
-        try:
-            response = web_search.search(message)
-        except SearchProviderError as exc:
-            raise ProviderError(f"Search failed: {exc}") from exc
-
         context = self._format_context(
             history, facts, max_messages=self._SEARCH_CONTEXT_MAX_MESSAGES
         )
         context = context[-self._SEARCH_CONTEXT_MAX_CHARS :]
+
+        query = self.query_builder.build(message, context)
+
+        try:
+            response = web_search.search(query)
+        except SearchProviderError as exc:
+            raise ProviderError(f"Search failed: {exc}") from exc
 
         try:
             search_answer = self.answer_generator.generate(
