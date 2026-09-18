@@ -39,6 +39,12 @@ class Settings(BaseSettings):
     search_cache_ttl: int = 600
     search_cache_db_path: str = "jarvis_search_cache.db"
 
+    # Reminders (persistent tasks/reminders + background scheduler,
+    # see app/reminders/) - local SQLite file, and how often the
+    # background scheduler polls for due reminders, in seconds.
+    reminders_db_path: str = "jarvis_reminders.db"
+    reminder_poll_interval_seconds: float = 30.0
+
     model_config = SettingsConfigDict(env_file=".env", env_prefix="JARVIS_")
 
 

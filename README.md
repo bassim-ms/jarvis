@@ -1,21 +1,22 @@
 # Jarvis
 
-Personal AI assistant project. This is **Milestone 6.16: Natural-Language
-Tool Selection** — once capability routing (M6.13-M6.15) has already
-decided a message needs `TOOL`, a new Tool Decision Layer
-(`app/tools/decision.py`) turns it into a concrete, validated `ToolCall`
-(tool name + parameters), deterministically when the message already
-contains everything needed, and via a small, strictly-validated Gemini
-call - built entirely on the existing free-tier `AIProvider`/
-`GeminiProvider`, no new client, no paid API - only when genuinely
-necessary. Gemini only ever proposes a `ToolCall`; it never executes
-anything - `ToolRegistry` (M5) remains the sole executor and the sole
-authority on tool existence and permissions; see [Web Search](#web-search)
-for details. Capability routing itself (M6.13-M6.15), the search pipeline
-(M6.5-6.9), conversation-aware answers (M6.10), source citations over
-`/chat` (M6.11), and deterministic query enrichment (M6.12) are all
-unchanged. No multi-tool chaining, agents, planning, or autonomous
-execution yet.
+Personal AI assistant project. This is **Milestone 7: Persistent Tasks,
+Reminders & Background Scheduling** — a new `app/reminders/` module adds
+SQLite-persisted reminders (one-time or recurring on a fixed interval),
+a lightweight background `ReminderScheduler` that polls for due ones and
+survives a Jarvis restart with no special recovery code, and a free, fully
+local Windows toast notification mechanism (`powershell.exe`, no new pip
+dependency, no external service). `create_reminder`/`list_reminders`/
+`complete_reminder`/`cancel_reminder` are ordinary `Tool`s, reached through
+the exact same `TOOL` capability and Tool Decision Layer (M6.13-M6.16)
+every other tool already uses — no reminder-specific branching anywhere in
+`JarvisCore`. Scheduled state is deliberately narrow: a reminder can only
+ever become a notification, never an arbitrary tool invocation — see
+[Persistent Tasks, Reminders & Background Scheduling](#persistent-tasks-reminders--background-scheduling-m7)
+for details. Natural-language tool selection (M6.16), capability routing
+(M6.13-M6.15), and the search pipeline (M6.5-6.12) are all unchanged. No
+agents, planning, autonomous multi-tool execution, email, hardware, or
+paid APIs yet.
 
 ## Stack
 
@@ -58,6 +59,10 @@ Run these from inside the `jarvis` folder.
    to the base URL of a SearXNG instance you run or trust, and optionally
    `JARVIS_SEARCH_PROVIDER_ORDER`, `JARVIS_SEARCH_CACHE_TTL`, and
    `JARVIS_SEARCH_CACHE_DB_PATH` (see [Web Search](#web-search) below).
+   Reminders need no setup at all - they work with the defaults in
+   `.env.example` (see
+   [Persistent Tasks, Reminders & Background Scheduling](#persistent-tasks-reminders--background-scheduling-m7)
+   below).
 
 ## Run the server
 
@@ -95,7 +100,7 @@ pytest
 
 Expected output ends with something like:
 ```
-257 passed in 0.XXs
+473 passed in 0.XXs
 ```
 
 Tests never call the real Gemini or SearXNG APIs — `httpx.post` / `httpx.get`
@@ -125,7 +130,14 @@ jarvis/
       registry.py       - ToolRegistry: register/lookup/list/execute, permission enforcement
       decision.py         - ToolCall/ToolCallBuilder/GeminiToolCallProvider: natural-language tool selection
       web_search.py      - WebSearchTool: adapts a SearchProvider into the Tool interface
-      defaults.py        - register_default_tools: wires the app's default tools (web_search) into a registry
+      defaults.py        - register_default_tools: wires the app's default tools (web_search, reminders) into a registry
+    reminders/
+      base.py             - Reminder/ReminderStatus/Recurrence/ReminderStore interface, ReminderExecution
+      sqlite_store.py      - SQLiteReminderStore: SQLite implementation of ReminderStore
+      notifier.py          - Notifier interface, WindowsToastNotifier (powershell.exe toast), ConsoleNotifier
+      scheduler.py         - ReminderScheduler: background poller that triggers due reminders
+      tools.py             - CreateReminderTool/ListRemindersTool/CompleteReminderTool/CancelReminderTool
+      factory.py           - builds the default ReminderStore/Notifier/ReminderScheduler from config
     search/
       base.py           - SearchProvider interface and the SearchResult type
       searxng.py         - SearXNG implementation of SearchProvider
@@ -163,6 +175,11 @@ jarvis/
     test_search_response.py  - unit tests for SearchResponse and provenance through the whole chain
     test_search_answer.py    - unit tests for GeminiSearchAnswerGenerator and source validation
     test_search_router.py    - unit tests for SearchRouter's DIRECT/SEARCH decisions
+    test_reminders_store.py       - unit tests for SQLiteReminderStore (persistence, due queries, lifecycle)
+    test_reminders_notifier.py    - unit tests for WindowsToastNotifier/ConsoleNotifier, subprocess mocked out
+    test_reminders_scheduler.py   - unit tests for ReminderScheduler (ticking, recurrence, restart recovery)
+    test_reminders_tools.py       - unit tests for the reminder Tools, through the Tool Registry
+    test_reminders_integration.py - default-registry wiring + end-to-end Core TOOL dispatch onto reminders
   requirements.txt    - exact dependency versions
   .env.example         - template for your local .env (never commit .env itself)
   .gitignore
@@ -917,11 +934,109 @@ Configuration:
 
 See `.env.example` for all four.
 
+## Persistent Tasks, Reminders & Background Scheduling (M7)
+
+A new `app/reminders/` module adds Jarvis's first form of scheduled state:
+persistent reminders, a background poller that fires them, and a free
+local notification mechanism - all deliberately narrow, so "something can
+be scheduled" never becomes "something can be automated":
+
+```
+create_reminder(text, due_in_minutes, recurrence_unit?, recurrence_interval?)
+    -> ReminderStore.create -> Reminder(status=PENDING) persisted to SQLite
+
+ReminderScheduler (background thread, polls every JARVIS_REMINDER_POLL_INTERVAL_SECONDS)
+    -> ReminderStore.list_due(now) -> due Reminders
+    -> Notifier.notify(title, reminder.text)          # the ONLY action ever taken
+    -> ReminderStore.record_trigger(...)              # lifecycle/execution log
+```
+
+- **`Reminder`/`ReminderStatus`/`Recurrence`/`ReminderStore`**
+  (`app/reminders/base.py`) are the domain types, the same
+  "interface + swappable backend" shape as `MemoryStore`/`SearchCache`.
+  `ReminderStatus` is `PENDING` -> (`TRIGGERED` for a one-time reminder, or
+  back to `PENDING` with an advanced `due_at` for a recurring one) ->
+  `COMPLETED`/`CANCELLED` (terminal). `Recurrence` is deliberately just a
+  fixed interval (every N minutes/hours/days/weeks) - no cron expressions,
+  no calendar-aware scheduling - the same accepted-trade-off philosophy as
+  `SearchRouter`'s keyword list.
+- **The security boundary this milestone adds**: a `Reminder` only ever
+  carries free text plus a due time/recurrence - never a tool name or
+  parameters. `ReminderScheduler` (`app/reminders/scheduler.py`) only ever
+  calls `Notifier.notify(...)` for a due reminder - it never executes a
+  registered `Tool`, never runs arbitrary code, and has no way to schedule
+  anything other than a notification, no matter what's persisted.
+- **`SQLiteReminderStore`** (`app/reminders/sqlite_store.py`) follows the
+  exact pattern `SQLiteMemoryStore`/`SQLiteSearchCache` already established
+  - one held `sqlite3` connection guarded by a lock, a local file so
+  reminders (and whether they've already fired) survive a restart.
+  `record_trigger` is the one place lifecycle state changes: on a
+  *successful* notification it advances `due_at` and stays `PENDING`
+  (recurring) or becomes `TRIGGERED` (one-time, so it's never picked up
+  again); on a *failed* one it leaves the reminder `PENDING`/due so the
+  next poll retries it. Either way it appends a `ReminderExecution` row to
+  a separate `reminder_executions` table - the persisted lifecycle/
+  execution log this milestone requires, independent of the reminder's own
+  current state.
+- **`ReminderScheduler`** (`app/reminders/scheduler.py`) is a plain daemon
+  thread that calls `tick()` (`list_due(now)` -> notify each -> record the
+  outcome) on a fixed interval. **Restart recovery needs no special code**:
+  `list_due` is just `status = 'pending' AND due_at <= now` against
+  persistent SQLite, so a reminder that came due while Jarvis was offline
+  is simply found and triggered on the very first poll after startup,
+  exactly like any other due reminder.
+- **`Notifier`/`WindowsToastNotifier`/`ConsoleNotifier`**
+  (`app/reminders/notifier.py`) is the free, fully local notification
+  mechanism: `WindowsToastNotifier` shells out to `powershell.exe` (ships
+  with every supported Windows version) to raise a native Windows Runtime
+  toast via `Windows.UI.Notifications` - no new pip dependency, no
+  external service, no API key, matching this codebase's "no extra SDK
+  when a standard tool already does the job" stance (see
+  [Stack](#stack)). Arguments reach PowerShell as a plain argv list
+  (`-File <script> -AppId ... -Title ... -Message ...`), never
+  shell-interpolated text, so reminder text can never inject script code.
+  `ConsoleNotifier` is the non-Windows/dev fallback, used automatically by
+  `app/reminders/factory.py::create_default_notifier` when
+  `platform.system() != "Windows"`.
+- **`create_reminder`/`list_reminders`/`complete_reminder`/
+  `cancel_reminder`** (`app/reminders/tools.py`) are ordinary `Tool`s
+  registered in `app/tools/defaults.py` alongside `web_search` - reached
+  through the exact same `TOOL` capability and Tool Decision Layer
+  (M6.13-M6.16) every other tool already uses, with no reminder-specific
+  branching anywhere in `JarvisCore`. `complete_reminder`/`cancel_reminder`
+  each take one required string parameter (`reminder_id`), so
+  `ToolCallBuilder` fills it deterministically from trailing message text,
+  zero AI calls - `create_reminder` has multiple required parameters, so
+  it goes through `ToolCallBuilder`'s existing Gemini-assisted fallback,
+  same as any other multi-parameter tool. `create_reminder`/
+  `complete_reminder`/`cancel_reminder` are `SAFE_ACTION` (each only ever
+  adds a new reminder or changes that one reminder's own status);
+  `list_reminders` is `READ`.
+- **`app/main.py`** builds one shared `ReminderStore` at startup, passes
+  it into both `register_default_tools` (so the tools operate on it) and
+  `create_default_scheduler` (so the scheduler's polling sees the exact
+  same persisted rows, not a second independent SQLite connection to the
+  same file), and starts/stops the scheduler from a FastAPI `lifespan`
+  handler.
+
+Configuration:
+- `JARVIS_REMINDERS_DB_PATH` - local SQLite file reminders are stored in.
+  Defaults to `jarvis_reminders.db`.
+- `JARVIS_REMINDER_POLL_INTERVAL_SECONDS` - how often the background
+  scheduler polls for due reminders, in seconds. Defaults to `30`.
+
 ## Postponed decisions (on purpose)
 
 These were not decided now, to avoid overbuilding before they're needed:
 - Database (SQLite) — added when the first feature that needs persistence
-  (tasks, reminders, memory) is built.
+  (memory, the search cache, and now tasks/reminders as of M7) is built.
+  Each still gets its own local SQLite file rather than a shared one.
+- Automation/agents scheduling arbitrary tools — M7's `ReminderScheduler`
+  can only ever fire a `Notifier` for a persisted reminder's free text; it
+  has no way to persist or later invoke a tool name/parameters. Letting a
+  scheduled entry run an arbitrary registered `Tool` (with its own
+  permission re-confirmation story for a fully unattended run) is a
+  separate, deliberate future decision, not attempted here.
 - Conversation memory / multi-turn context — not in this milestone; `/chat`
   is stateless, one message in, one reply out.
 - Dashboard framework — decided when we build the actual dashboard.
