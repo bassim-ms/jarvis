@@ -8,8 +8,11 @@ through a MemoryStore. Since M7, it also starts a background
 ReminderScheduler that polls persisted reminders and fires local
 notifications for due ones. Since M8, it also starts a background
 AutomationEngine that polls persisted automations and runs their
-already-permission-checked tool actions when due. No dashboard, agents,
-voice, or hardware control yet - those come in later milestones.
+already-permission-checked tool actions when due. Since M9, it also
+wires up Google Calendar (OAuth-authorized separately via
+`python -m app.calendar.authorize`) and local Jarvis Tasks - neither
+needs a background process of its own. No dashboard, agents, voice, or
+hardware control yet - those come in later milestones.
 """
 
 from contextlib import asynccontextmanager
@@ -18,31 +21,37 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from app.automation.factory import create_default_automation_store
+from app.calendar.factory import create_default_calendar_provider
 from app.config import settings
 from app.core import ConversationNotFoundError, core
 from app.providers.base import ProviderError
 from app.reminders.factory import create_default_reminder_store, create_default_scheduler
+from app.tasks.factory import create_default_task_store
 from app.tools.defaults import register_default_tools
 
 # Application-level wiring: populate the running app's tool registry with
 # Jarvis's default tools. JarvisCore's own default (when no registry is
 # injected) stays empty - see app/tools/defaults.py.
 #
-# The reminder/automation stores are built once here and passed into both
-# register_default_tools (so their tools operate on them) and the
-# ReminderScheduler/AutomationEngine below (so their background polling
-# sees the exact same persisted rows), rather than each independently
-# opening its own SQLite connection to the same file. `core.memory` is
-# passed through too, so an automation's conditions
-# (app/automation/base.py's FactEqualsCondition) see the same stored
-# facts JarvisCore's own DIRECT/SEARCH prompts already use.
+# The reminder/automation/task stores (and the calendar provider) are
+# built once here and passed into both register_default_tools (so their
+# tools operate on them) and the ReminderScheduler/AutomationEngine below
+# (so their background polling sees the exact same persisted rows),
+# rather than each independently opening its own SQLite connection to the
+# same file. `core.memory` is passed through too, so an automation's
+# conditions (app/automation/base.py's FactEqualsCondition) see the same
+# stored facts JarvisCore's own DIRECT/SEARCH prompts already use.
 _reminder_store = create_default_reminder_store(settings.reminders_db_path)
 _automation_store = create_default_automation_store(settings.automations_db_path)
+_calendar_provider = create_default_calendar_provider()
+_task_store = create_default_task_store(settings.tasks_db_path)
 automation_engine = register_default_tools(
     core.tools,
     reminder_store=_reminder_store,
     automation_store=_automation_store,
     memory=core.memory,
+    calendar_provider=_calendar_provider,
+    task_store=_task_store,
 )
 
 reminder_scheduler = create_default_scheduler(

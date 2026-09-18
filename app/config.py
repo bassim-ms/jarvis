@@ -51,6 +51,20 @@ class Settings(BaseSettings):
     automations_db_path: str = "jarvis_automations.db"
     automation_poll_interval_seconds: float = 30.0
 
+    # Google Calendar (OAuth 2.0 desktop/localhost flow, see
+    # app/calendar/) - client_id/client_secret come from a Google Cloud
+    # "Desktop app" OAuth client; no default and no key is hard-coded
+    # anywhere. A single primary calendar only (see app/calendar/base.py).
+    google_client_id: str = ""
+    google_client_secret: str = ""
+    google_oauth_redirect_port: int = 8765
+    calendar_id: str = "primary"
+    calendar_token_db_path: str = "jarvis_calendar_token.db"
+
+    # Jarvis Tasks (local-only todo items, see app/tasks/) - independent
+    # of Reminders; no scheduling, no notifications, no external sync.
+    tasks_db_path: str = "jarvis_tasks.db"
+
     model_config = SettingsConfigDict(env_file=".env", env_prefix="JARVIS_")
 
 

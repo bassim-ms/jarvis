@@ -2,11 +2,12 @@
 Default tool registration for the running application.
 
 This is the one place that knows the concrete set of tools Jarvis ships
-with by default (`web_search`, the reminder tools since M7, and the
-automation tools since M8). It exists so the actual application
-(app/main.py) can get a fully-populated ToolRegistry, while JarvisCore
-itself (app/core.py) stays unaware of any specific tool - its own
-default, when no registry is injected, stays an empty ToolRegistry (see
+with by default (`web_search`, the reminder tools since M7, the
+automation tools since M8, and the calendar/task tools since M9). It
+exists so the actual application (app/main.py) can get a fully-populated
+ToolRegistry, while JarvisCore itself (app/core.py) stays unaware of any
+specific tool - its own default, when no registry is injected, stays an
+empty ToolRegistry (see
 test_tools.py::test_core_exposes_a_tool_registry_by_default).
 """
 
@@ -20,6 +21,14 @@ from app.automation.tools import (
     EnableAutomationTool,
     ListAutomationsTool,
     RunAutomationTool,
+)
+from app.calendar.base import CalendarProvider
+from app.calendar.factory import create_default_calendar_provider
+from app.calendar.tools import (
+    CreateEventTool,
+    DeleteEventTool,
+    ListEventsTool,
+    UpdateEventTool,
 )
 from app.config import settings
 from app.memory.base import MemoryStore
@@ -38,6 +47,9 @@ from app.search.factory import (
     create_default_search_provider,
 )
 from app.search.quality import ResultQualityProvider
+from app.tasks.base import TaskStore
+from app.tasks.factory import create_default_task_store
+from app.tasks.tools import CancelTaskTool, CompleteTaskTool, CreateTaskTool, ListTasksTool
 from app.tools.registry import ToolRegistry
 from app.tools.web_search import WebSearchTool
 
@@ -47,6 +59,8 @@ def register_default_tools(
     reminder_store: ReminderStore | None = None,
     automation_store: AutomationStore | None = None,
     memory: MemoryStore | None = None,
+    calendar_provider: CalendarProvider | None = None,
+    task_store: TaskStore | None = None,
 ) -> AutomationEngine:
     """Register every tool Jarvis ships with by default onto `registry`,
     and return the AutomationEngine built alongside the automation tools
@@ -85,6 +99,16 @@ def register_default_tools(
     ToolRegistry.execute looks up a tool by name only when actually
     called, not at construction time, so any tool registered later (by
     this function or afterward) is still visible to the engine.
+
+    `calendar_provider`/`task_store` follow the same
+    default-unless-given pattern as the reminder/automation stores.
+    Calendar tools carry their own permission split - `list_events` is
+    READ; `create_event`/`update_event` are CONFIRM; `delete_event` is
+    DANGEROUS (see app/calendar/tools.py) - enforced entirely by
+    ToolRegistry.execute, unchanged; AutomationEngine (M8) therefore can
+    never run the three calendar write tools unattended, with no changes
+    needed here or in app/automation/*. Task tools are all READ/
+    SAFE_ACTION, same as the reminder tools.
     """
     provider = ResultQualityProvider(
         CachedSearchProvider(
@@ -122,6 +146,18 @@ def register_default_tools(
     registry.register(DisableAutomationTool(store=automation_store))
     registry.register(CancelAutomationTool(store=automation_store))
     registry.register(RunAutomationTool(engine=engine))
+
+    calendar_provider = calendar_provider or create_default_calendar_provider()
+    registry.register(ListEventsTool(provider=calendar_provider))
+    registry.register(CreateEventTool(provider=calendar_provider))
+    registry.register(UpdateEventTool(provider=calendar_provider))
+    registry.register(DeleteEventTool(provider=calendar_provider))
+
+    task_store = task_store or create_default_task_store(settings.tasks_db_path)
+    registry.register(CreateTaskTool(store=task_store))
+    registry.register(ListTasksTool(store=task_store))
+    registry.register(CompleteTaskTool(store=task_store))
+    registry.register(CancelTaskTool(store=task_store))
 
     return engine
 

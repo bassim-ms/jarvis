@@ -1,28 +1,30 @@
 # Jarvis
 
-Personal AI assistant project. This is **Milestone 8: Persistent
-Automation Engine** — a new `app/automation/` module adds SQLite-persisted
-`Automation`s ("when TRIGGER (and CONDITIONS hold), run ACTION"), a
-background `AutomationEngine` that polls for due ones (with the same
-two-layer failure isolation and restart-recovery-by-persistence design as
-M7's `ReminderScheduler`), three trigger kinds (a fixed-interval schedule,
-manual invocation, or a linked reminder completing), two basic
-deterministic conditions, and an action that's always a plain `ToolCall`
-(M6.16) dispatched through the *existing* `ToolRegistry` - never
-`confirmed=True`, so an automation can only ever run a tool whose
-permission is already automatic (`READ`/`SAFE_ACTION`); `create_automation`
-rejects anything else, including the automation tools themselves (closing
-off self-replicating automations), at creation time. `create_automation`/
-`list_automations`/`enable_automation`/`disable_automation`/
-`cancel_automation`/`run_automation` are ordinary `Tool`s, reached through
-the exact same `TOOL` capability and Tool Decision Layer every other tool
-already uses — no automation-specific branching anywhere in `JarvisCore`.
-See [Persistent Automation Engine](#persistent-automation-engine-m8) for
-details. Persistent Tasks, Reminders & Background Scheduling (M7),
+Personal AI assistant project. This is **Milestone 9: Google Calendar +
+Local Jarvis Tasks** — two new, independent modules. `app/calendar/`
+adds a `CalendarProvider` abstraction (mirroring `AIProvider`/
+`SearchProvider`) with `GoogleCalendarProvider` as its only
+implementation: a Google OAuth 2.0 desktop/localhost flow (no hosted
+server, no Google SDK, plain httpx) authorizes access once, a local
+SQLite-backed `TokenStore` persists the refresh token, and every call
+auto-refreshes an expired access token first. `list_events` is `READ`;
+`create_event`/`update_event` are `CONFIRM`; `delete_event` is
+`DANGEROUS` — enforced entirely by the existing `ToolRegistry`, which
+means M8's `AutomationEngine` (READ/SAFE_ACTION tools only, unchanged)
+can never run a calendar write unattended, with zero changes to
+`app/automation/*`. `app/tasks/` adds local, SQLite-backed Jarvis Tasks
+(create/list/complete/cancel, optional due date + priority) —
+deliberately independent from M7 Reminders, with no scheduling or
+notifications of its own. See
+[Google Calendar](#google-calendar-m9) and
+[Jarvis Tasks](#jarvis-tasks-m9) for details. Persistent Automation
+Engine (M8), Persistent Tasks, Reminders & Background Scheduling (M7),
 natural-language tool selection (M6.16), capability routing
 (M6.13-M6.15), and the search pipeline (M6.5-6.12) are all unchanged. No
-agents, sub-agents, planning loops, browser, email, messaging, hardware,
-social media, or paid APIs yet.
+Google Tasks sync, multi-calendar/account support, attendee/invite
+management, RRULE authoring, calendar automation triggers, browser
+automation, email/messaging, agents/sub-agents, hardware, arbitrary
+code/shell execution, or paid APIs yet.
 
 ## Stack
 
@@ -65,11 +67,16 @@ Run these from inside the `jarvis` folder.
    to the base URL of a SearXNG instance you run or trust, and optionally
    `JARVIS_SEARCH_PROVIDER_ORDER`, `JARVIS_SEARCH_CACHE_TTL`, and
    `JARVIS_SEARCH_CACHE_DB_PATH` (see [Web Search](#web-search) below).
-   Reminders and automations need no setup at all - they work with the
-   defaults in `.env.example` (see
-   [Persistent Tasks, Reminders & Background Scheduling](#persistent-tasks-reminders--background-scheduling-m7)
-   and [Persistent Automation Engine](#persistent-automation-engine-m8)
-   below).
+   Reminders, automations, and Jarvis Tasks need no setup at all - they
+   work with the defaults in `.env.example` (see
+   [Persistent Tasks, Reminders & Background Scheduling](#persistent-tasks-reminders--background-scheduling-m7),
+   [Persistent Automation Engine](#persistent-automation-engine-m8), and
+   [Jarvis Tasks](#jarvis-tasks-m9) below). To use the calendar tools,
+   set `JARVIS_GOOGLE_CLIENT_ID`/`JARVIS_GOOGLE_CLIENT_SECRET` (from a
+   Google Cloud "Desktop app" OAuth client) and run
+   `python -m app.calendar.authorize` once (see
+   [Google Calendar](#google-calendar-m9) below) - without that, the
+   calendar tools just fail gracefully with a clear error.
 
 ## Run the server
 
@@ -107,7 +114,7 @@ pytest
 
 Expected output ends with something like:
 ```
-574 passed in 0.XXs
+659 passed in 0.XXs
 ```
 
 Tests never call the real Gemini or SearXNG APIs — `httpx.post` / `httpx.get`
@@ -151,6 +158,19 @@ jarvis/
       engine.py             - AutomationEngine: background poller that runs due automations' actions
       tools.py              - CreateAutomationTool/ListAutomationsTool/Enable-/Disable-/Cancel-/RunAutomationTool
       factory.py            - builds the default AutomationStore/AutomationEngine from config
+    calendar/
+      base.py             - CalendarEvent/CalendarProvider interface, OAuthToken/TokenStore interface
+      token_store.py        - SQLiteTokenStore: SQLite implementation of TokenStore
+      oauth.py               - GoogleOAuthClient/OAuthCallbackServer/CalendarAuthFlow: desktop/localhost OAuth 2.0
+      google_provider.py      - GoogleCalendarProvider: talks to the Calendar REST v3 API over httpx
+      tools.py                 - ListEventsTool/CreateEventTool/UpdateEventTool/DeleteEventTool
+      factory.py                - builds the default TokenStore/GoogleOAuthClient/CalendarProvider from config
+      authorize.py               - `python -m app.calendar.authorize`: one-time interactive OAuth setup
+    tasks/
+      base.py             - Task/TaskStatus/TaskPriority/TaskStore interface
+      sqlite_store.py      - SQLiteTaskStore: SQLite implementation of TaskStore
+      tools.py              - CreateTaskTool/ListTasksTool/CompleteTaskTool/CancelTaskTool
+      factory.py             - builds the default TaskStore from config
     search/
       base.py           - SearchProvider interface and the SearchResult type
       searxng.py         - SearXNG implementation of SearchProvider
@@ -198,6 +218,14 @@ jarvis/
     test_automation_engine.py      - unit tests for AutomationEngine (triggers, conditions, permissions, restart recovery, failure isolation)
     test_automation_tools.py       - unit tests for the automation Tools, through the Tool Registry
     test_automation_integration.py - default-registry wiring + end-to-end Core TOOL dispatch onto automations
+    test_calendar_oauth.py         - unit tests for GoogleOAuthClient/OAuthCallbackServer/CalendarAuthFlow
+    test_calendar_token_store.py   - unit tests for SQLiteTokenStore (persistence, restart behavior)
+    test_calendar_provider.py      - unit tests for GoogleCalendarProvider (CRUD, auto-refresh, error mapping)
+    test_calendar_tools.py         - unit tests for the calendar Tools, through the Tool Registry (permissions)
+    test_calendar_integration.py   - default-registry wiring, automation-guard regression, end-to-end Core TOOL dispatch
+    test_tasks_store.py            - unit tests for SQLiteTaskStore (persistence, lifecycle, restart behavior)
+    test_tasks_tools.py            - unit tests for the Task tools, through the Tool Registry
+    test_tasks_integration.py      - default-registry wiring + end-to-end Core TOOL dispatch onto tasks
   requirements.txt    - exact dependency versions
   .env.example         - template for your local .env (never commit .env itself)
   .gitignore
@@ -1188,12 +1216,135 @@ Configuration:
 - `JARVIS_AUTOMATION_POLL_INTERVAL_SECONDS` - how often the background
   engine polls for due automations, in seconds. Defaults to `30`.
 
+## Google Calendar (M9)
+
+`app/calendar/` follows the exact "interface + swappable backend" shape
+`AIProvider`/`SearchProvider` already established:
+
+```
+CreateEventTool/UpdateEventTool/DeleteEventTool/ListEventsTool (app/calendar/tools.py)
+    -> CalendarProvider (app/calendar/base.py) -> GoogleCalendarProvider (app/calendar/google_provider.py)
+    -> auto-refreshes the stored OAuth token if needed (app/calendar/oauth.py::needs_refresh)
+    -> Google Calendar REST v3, over httpx - no Google SDK
+```
+
+- **`CalendarEvent`/`CalendarProvider`/`OAuthToken`/`TokenStore`**
+  (`app/calendar/base.py`) are the only things calendar Tools and
+  JarvisCore ever see - no Google JSON shape, client type, or
+  vendor-specific error crosses this boundary. A future provider (CalDAV,
+  Outlook, ...) plugs in here without touching Tools, `ToolRegistry`, or
+  `JarvisCore`. Single primary calendar only (`calendar_id`, defaulting
+  to `"primary"`) - no multi-calendar/account support yet.
+- **OAuth 2.0 "Desktop app" flow** (`app/calendar/oauth.py`): a loopback
+  (`localhost`) redirect, no hosted server, no paid infra, built entirely
+  on httpx (already a dependency) - no Google SDK. Run
+  `python -m app.calendar.authorize` once: it opens your browser for
+  Google's consent screen, a minimal local `OAuthCallbackServer` (stdlib
+  `http.server`, bound only to the loopback interface) captures the
+  redirect's `code`, `GoogleOAuthClient` exchanges it for a token set,
+  and `TokenStore` persists it. Every `GoogleCalendarProvider` call
+  refreshes the access token first if it's expired/near-expiry
+  (`needs_refresh`, a 60-second skew) - transparent to every caller above
+  it; you never re-run the interactive flow unless you revoke access.
+- **The refresh token is treated as a sensitive credential everywhere it
+  flows**: never logged, never printed (not even by
+  `app/calendar/authorize.py`'s own success message), never included in
+  an `OAuthError`/`CalendarProviderError` message, never returned to
+  `JarvisCore` or a `ToolResult`. **`SQLiteTokenStore`**
+  (`app/calendar/token_store.py`) persists it locally, following the
+  exact `SQLiteReminderStore`/`SQLiteMemoryStore` pattern; the database
+  file matches the existing `*.db` `.gitignore` rule (the same trust
+  boundary this codebase already gives `.env`), and the store
+  additionally best-effort-restricts the file's own OS permissions to
+  owner-only on top of that (a documented no-op on platforms/filesystems
+  that don't support POSIX permission bits, e.g. most Windows setups -
+  the `.gitignore` rule is what actually matters there).
+- **Permission levels are the whole safety story, and they're the one
+  thing this milestone locked down explicitly**: `list_events` is
+  `READ`; `create_event`/`update_event` are `CONFIRM` (a created/changed
+  event can be visible to other people, unlike a local reminder/task);
+  `delete_event` is `DANGEROUS` (destructive, not easily undone from
+  Jarvis's side). None of that is enforced in `app/calendar/tools.py`
+  itself - `ToolRegistry.execute` (unchanged) already does it for every
+  tool. A direct consequence, requiring zero changes anywhere in
+  `app/automation/*`: `AutomationEngine` (M8) only ever runs
+  `READ`/`SAFE_ACTION` tools, so `create_event`/`update_event`/
+  `delete_event` can never be used as an automation's action -
+  `CreateAutomationTool`'s existing guard (M8) rejects them exactly like
+  it already rejects any other `CONFIRM`/`DANGEROUS` tool, with no new
+  code. No calendar-specific `TriggerType` was added either - a linked
+  reminder is still the only event-driven trigger.
+- A `CalendarProviderError` (not yet authorized, an unreachable API, a
+  failed token refresh, or an unexpected response shape) is always caught
+  at the Tool boundary and turned into a normal `ToolResult.error` -
+  never propagates, the same convention `SearchProviderError`/
+  `ProviderError` already use at their own boundaries.
+
+Configuration:
+- `JARVIS_GOOGLE_CLIENT_ID`/`JARVIS_GOOGLE_CLIENT_SECRET` - from a Google
+  Cloud "Desktop app" OAuth client. No default; the calendar tools fail
+  gracefully with a clear `ToolResult.error` until these are set and
+  `python -m app.calendar.authorize` has been run once.
+- `JARVIS_GOOGLE_OAUTH_REDIRECT_PORT` - the local port the one-time
+  authorization flow binds to. Defaults to `8765`.
+- `JARVIS_CALENDAR_ID` - which calendar to use. Defaults to `"primary"`.
+- `JARVIS_CALENDAR_TOKEN_DB_PATH` - local SQLite file the OAuth token is
+  stored in. Defaults to `jarvis_calendar_token.db`. Never commit it.
+
+## Jarvis Tasks (M9)
+
+`app/tasks/` is a small, local-only, SQLite-backed todo-item model -
+deliberately independent from M7 Reminders, following the same
+`create`/`list`/`complete`/`cancel` shape as the reminder tools:
+
+- **`Task`/`TaskStatus`/`TaskPriority`/`TaskStore`** (`app/tasks/base.py`):
+  `TaskStatus` is `TODO` -> `DONE`/`CANCELLED` (terminal); `TaskPriority`
+  is a fixed `LOW`/`MEDIUM`/`HIGH`, display/filtering only. `due_date` is
+  an optional, display-only ISO 8601 string - unlike `Reminder.due_at`,
+  nothing ever polls it or fires a notification from it; Tasks have no
+  background process of their own.
+- **Why separate from Reminder**: a Reminder's whole purpose (M7) is a
+  scheduled notification; a Task is just a todo item with no trigger. If
+  a user wants "remind me about this task," that's naturally two linked
+  objects (a Task plus a Reminder), not one model doing both jobs - kept
+  apart so Task never inherits scheduling/notification complexity it
+  doesn't need. `SQLiteTaskStore` and `SQLiteReminderStore` are
+  independent stores/tables - nothing in either can see or affect the
+  other.
+- **`create_task`/`list_tasks`/`complete_task`/`cancel_task`**
+  (`app/tasks/tools.py`) are ordinary `Tool`s, registered alongside every
+  other default tool - `create_task`/`complete_task`/`cancel_task` are
+  `SAFE_ACTION`; `list_tasks` is `READ`. `create_task` has only one
+  required parameter (`text`; `priority`/`due_date` are optional with
+  plain defaults) - unlike `create_reminder`/`create_automation`/
+  `create_event`, `ToolCallBuilder` can build it **deterministically**,
+  zero AI calls, the same single-required-string-param shape as
+  `complete_reminder`.
+
+Configuration:
+- `JARVIS_TASKS_DB_PATH` - local SQLite file tasks are stored in.
+  Defaults to `jarvis_tasks.db`.
+
 ## Postponed decisions (on purpose)
 
 These were not decided now, to avoid overbuilding before they're needed:
 - Database (SQLite) — added when the first feature that needs persistence
   (memory, the search cache, and now tasks/reminders as of M7) is built.
   Each still gets its own local SQLite file rather than a shared one.
+- Google Tasks sync, multi-calendar/multi-account support, attendee/
+  invite management, full RRULE authoring for recurring events, and
+  calendar write-conflict/double-booking detection — all explicitly
+  deferred from M9. Jarvis Tasks stays local-only rather than syncing to
+  a second Google API/OAuth surface; `GoogleCalendarProvider` targets a
+  single primary calendar and returns each occurrence of a recurring
+  Google event as its own `CalendarEvent` (read-only, via
+  `singleEvents=true`) rather than authoring/editing a recurrence rule
+  itself; attendee management borders on the "no email/messaging"
+  boundary M8 already excluded.
+- Calendar as an `AutomationEngine` trigger type (e.g. "when this event
+  starts") — no new `TriggerType` was added in M9; `Trigger`
+  (`app/automation/base.py`) can hold one cheaply later, but nothing was
+  built toward it now.
 - Cron-expression/calendar-aware scheduling, and conditions beyond
   `FactEqualsCondition`/`TimeWindowCondition` (e.g. comparing two facts,
   numeric thresholds, external-state lookups) — M8's `TIME` trigger is
