@@ -45,6 +45,12 @@ class Settings(BaseSettings):
     reminders_db_path: str = "jarvis_reminders.db"
     reminder_poll_interval_seconds: float = 30.0
 
+    # Automations (persistent automation engine, see app/automation/) -
+    # local SQLite file, and how often the background engine polls for
+    # due automations, in seconds.
+    automations_db_path: str = "jarvis_automations.db"
+    automation_poll_interval_seconds: float = 30.0
+
     model_config = SettingsConfigDict(env_file=".env", env_prefix="JARVIS_")
 
 

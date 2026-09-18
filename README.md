@@ -1,22 +1,28 @@
 # Jarvis
 
-Personal AI assistant project. This is **Milestone 7: Persistent Tasks,
-Reminders & Background Scheduling** — a new `app/reminders/` module adds
-SQLite-persisted reminders (one-time or recurring on a fixed interval),
-a lightweight background `ReminderScheduler` that polls for due ones and
-survives a Jarvis restart with no special recovery code, and a free, fully
-local Windows toast notification mechanism (`powershell.exe`, no new pip
-dependency, no external service). `create_reminder`/`list_reminders`/
-`complete_reminder`/`cancel_reminder` are ordinary `Tool`s, reached through
-the exact same `TOOL` capability and Tool Decision Layer (M6.13-M6.16)
-every other tool already uses — no reminder-specific branching anywhere in
-`JarvisCore`. Scheduled state is deliberately narrow: a reminder can only
-ever become a notification, never an arbitrary tool invocation — see
-[Persistent Tasks, Reminders & Background Scheduling](#persistent-tasks-reminders--background-scheduling-m7)
-for details. Natural-language tool selection (M6.16), capability routing
+Personal AI assistant project. This is **Milestone 8: Persistent
+Automation Engine** — a new `app/automation/` module adds SQLite-persisted
+`Automation`s ("when TRIGGER (and CONDITIONS hold), run ACTION"), a
+background `AutomationEngine` that polls for due ones (with the same
+two-layer failure isolation and restart-recovery-by-persistence design as
+M7's `ReminderScheduler`), three trigger kinds (a fixed-interval schedule,
+manual invocation, or a linked reminder completing), two basic
+deterministic conditions, and an action that's always a plain `ToolCall`
+(M6.16) dispatched through the *existing* `ToolRegistry` - never
+`confirmed=True`, so an automation can only ever run a tool whose
+permission is already automatic (`READ`/`SAFE_ACTION`); `create_automation`
+rejects anything else, including the automation tools themselves (closing
+off self-replicating automations), at creation time. `create_automation`/
+`list_automations`/`enable_automation`/`disable_automation`/
+`cancel_automation`/`run_automation` are ordinary `Tool`s, reached through
+the exact same `TOOL` capability and Tool Decision Layer every other tool
+already uses — no automation-specific branching anywhere in `JarvisCore`.
+See [Persistent Automation Engine](#persistent-automation-engine-m8) for
+details. Persistent Tasks, Reminders & Background Scheduling (M7),
+natural-language tool selection (M6.16), capability routing
 (M6.13-M6.15), and the search pipeline (M6.5-6.12) are all unchanged. No
-agents, planning, autonomous multi-tool execution, email, hardware, or
-paid APIs yet.
+agents, sub-agents, planning loops, browser, email, messaging, hardware,
+social media, or paid APIs yet.
 
 ## Stack
 
@@ -59,9 +65,10 @@ Run these from inside the `jarvis` folder.
    to the base URL of a SearXNG instance you run or trust, and optionally
    `JARVIS_SEARCH_PROVIDER_ORDER`, `JARVIS_SEARCH_CACHE_TTL`, and
    `JARVIS_SEARCH_CACHE_DB_PATH` (see [Web Search](#web-search) below).
-   Reminders need no setup at all - they work with the defaults in
-   `.env.example` (see
+   Reminders and automations need no setup at all - they work with the
+   defaults in `.env.example` (see
    [Persistent Tasks, Reminders & Background Scheduling](#persistent-tasks-reminders--background-scheduling-m7)
+   and [Persistent Automation Engine](#persistent-automation-engine-m8)
    below).
 
 ## Run the server
@@ -100,7 +107,7 @@ pytest
 
 Expected output ends with something like:
 ```
-473 passed in 0.XXs
+574 passed in 0.XXs
 ```
 
 Tests never call the real Gemini or SearXNG APIs — `httpx.post` / `httpx.get`
@@ -130,14 +137,20 @@ jarvis/
       registry.py       - ToolRegistry: register/lookup/list/execute, permission enforcement
       decision.py         - ToolCall/ToolCallBuilder/GeminiToolCallProvider: natural-language tool selection
       web_search.py      - WebSearchTool: adapts a SearchProvider into the Tool interface
-      defaults.py        - register_default_tools: wires the app's default tools (web_search, reminders) into a registry
+      defaults.py        - register_default_tools: wires the app's default tools (web_search, reminders, automations) into a registry
     reminders/
-      base.py             - Reminder/ReminderStatus/Recurrence/ReminderStore interface, ReminderExecution
+      base.py             - Reminder/ReminderStatus/Recurrence/ReminderStore interface, ReminderExecution, parse_recurrence/advance_by_recurrence (shared with automation)
       sqlite_store.py      - SQLiteReminderStore: SQLite implementation of ReminderStore
       notifier.py          - Notifier interface, WindowsToastNotifier (powershell.exe toast), ConsoleNotifier
       scheduler.py         - ReminderScheduler: background poller that triggers due reminders
       tools.py             - CreateReminderTool/ListRemindersTool/CompleteReminderTool/CancelReminderTool
       factory.py           - builds the default ReminderStore/Notifier/ReminderScheduler from config
+    automation/
+      base.py             - Automation/AutomationStatus/Trigger/Condition/AutomationStore interface, AutomationExecution
+      sqlite_store.py      - SQLiteAutomationStore: SQLite implementation of AutomationStore
+      engine.py             - AutomationEngine: background poller that runs due automations' actions
+      tools.py              - CreateAutomationTool/ListAutomationsTool/Enable-/Disable-/Cancel-/RunAutomationTool
+      factory.py            - builds the default AutomationStore/AutomationEngine from config
     search/
       base.py           - SearchProvider interface and the SearchResult type
       searxng.py         - SearXNG implementation of SearchProvider
@@ -180,6 +193,11 @@ jarvis/
     test_reminders_scheduler.py   - unit tests for ReminderScheduler (ticking, recurrence, restart recovery)
     test_reminders_tools.py       - unit tests for the reminder Tools, through the Tool Registry
     test_reminders_integration.py - default-registry wiring + end-to-end Core TOOL dispatch onto reminders
+    test_automation_store.py       - unit tests for SQLiteAutomationStore (persistence, trigger/condition/action round-trip)
+    test_automation_conditions.py  - unit tests for FactEqualsCondition/TimeWindowCondition/condition_from_dict
+    test_automation_engine.py      - unit tests for AutomationEngine (triggers, conditions, permissions, restart recovery, failure isolation)
+    test_automation_tools.py       - unit tests for the automation Tools, through the Tool Registry
+    test_automation_integration.py - default-registry wiring + end-to-end Core TOOL dispatch onto automations
   requirements.txt    - exact dependency versions
   .env.example         - template for your local .env (never commit .env itself)
   .gitignore
@@ -1025,18 +1043,173 @@ Configuration:
 - `JARVIS_REMINDER_POLL_INTERVAL_SECONDS` - how often the background
   scheduler polls for due reminders, in seconds. Defaults to `30`.
 
+## Persistent Automation Engine (M8)
+
+A new `app/automation/` module lets a user say "when X happens, do Y" once
+and have it persist and run unattended - built entirely on architecture
+M1-M7 already established, not a parallel system:
+
+```
+create_automation(name, trigger_type, action_tool_name, action_params, ...)
+    -> AutomationStore.create -> Automation(status=ENABLED) persisted to SQLite
+
+AutomationEngine (background thread, polls every JARVIS_AUTOMATION_POLL_INTERVAL_SECONDS)
+    -> AutomationStore.list(status=ENABLED) -> filter to what's actually due
+    -> conditions hold? -> ToolRegistry.execute(action.tool_name, params=..., confirmed=None)
+    -> AutomationStore.record_execution(...)  # lifecycle/execution log, trigger advances/retires
+```
+
+- **`Automation`/`AutomationStatus`/`Trigger`/`TriggerType`/`Condition`/
+  `AutomationStore`** (`app/automation/base.py`) are the domain types, the
+  same "interface + swappable backend" shape as `ReminderStore`/
+  `MemoryStore`/`SearchCache`. `AutomationStatus` is `ENABLED` ->
+  `DISABLED` (paused, re-enable-able; also what a one-shot trigger puts
+  itself into after it fires once, reusing `DISABLED` rather than
+  inventing a parallel status) -> `CANCELLED` (terminal).
+- **Three trigger kinds** (`TriggerType`): `TIME` (reuses
+  `Recurrence`/`RecurrenceUnit`/`parse_recurrence`/`advance_by_recurrence`
+  from `app/reminders/base.py` verbatim - the exact same fixed-interval
+  schedule a recurring Reminder already uses; no recurrence given means
+  "fire once, then self-disable"), `MANUAL` (never auto-due -
+  `AutomationEngine`'s background poll skips it entirely; only
+  `run_automation` ever runs it), and `REMINDER_COMPLETED` (`reminder_id`
+  names a `Reminder` - due once its status becomes `TRIGGERED` or
+  `COMPLETED`, never `CANCELLED` - "never mind" isn't "done"; inherently
+  one-shot, since a Reminder can only leave `PENDING` once, so the
+  automation self-disables the first time it's observed).
+- **Basic, deterministic conditions** (`Condition`, two implementations):
+  `FactEqualsCondition` (a stored `MemoryStore` fact, M2, equals a fixed
+  value) and `TimeWindowCondition` (the current UTC hour falls in a
+  range, wrapping past midnight if needed). No AI, no network. A
+  condition gates only whether the action runs *this* occurrence - it
+  never gates the trigger's own scheduling: a skipped occurrence (or a
+  failed action - see below) still advances a recurring `TIME` trigger
+  and still retires a one-shot one exactly as a successful run would
+  (`AutomationEngine._advance_trigger`), so a permanently-false condition
+  can't spam an occurrence every single poll interval forever, and a
+  temporarily-broken action tool can't wedge a recurring automation into
+  a tight retry loop - a deliberate difference from `ReminderScheduler`,
+  where a failed *notification* specifically does keep retrying, since
+  retrying a toast is cheap and safe in a way retrying an arbitrary tool
+  call isn't assumed to be.
+- **The security boundary this milestone adds**: an Automation's action
+  is a plain **`ToolCall`** (`app/tools/decision.py`, M6.16) - the same
+  type the Tool Decision Layer already uses, not a second "how to invoke
+  a tool" system. `AutomationEngine` only ever calls
+  `ToolRegistry.execute(tool_name, params=...)` - **never**
+  `confirmed=True` - so an automation can only ever run a tool whose
+  permission is already automatic (`READ`/`SAFE_ACTION`, `app/tools/
+  base.py`'s `AUTOMATIC_PERMISSIONS`). `CreateAutomationTool` rejects a
+  `CONFIRM`/`DANGEROUS` action tool, an unregistered one, **and any of
+  the automation tools themselves** (`create_automation`/
+  `list_automations`/`enable_automation`/`disable_automation`/
+  `cancel_automation`/`run_automation`) at creation time - that last
+  guard specifically closes off an automation whose action creates (or
+  enables/runs) *another* automation, which could otherwise self-
+  replicate without bound, exactly the kind of unattended, agent-like
+  growth this milestone's scope excludes. The engine is defensively safe
+  even if that validation were ever bypassed (e.g. a store written to
+  directly): it never overrides `ToolRegistry`'s own permission check, so
+  a `CONFIRM`/`DANGEROUS` action just fails (recorded, never silently
+  approved) rather than ever running.
+- **`SQLiteAutomationStore`** (`app/automation/sqlite_store.py`) follows
+  the exact pattern `SQLiteReminderStore`/`SQLiteMemoryStore` already
+  established - one held `sqlite3` connection guarded by a lock, a local
+  file so automations (and whether they're still enabled) survive a
+  restart. `record_execution` is the one place lifecycle state changes -
+  always appends an `AutomationExecution` row (`SUCCESS`/`FAILURE`/
+  `SKIPPED`), and separately either advances `next_run_at` (a recurring
+  `TIME` trigger) or flips the automation to `DISABLED` (a one-shot
+  trigger retiring) - the persisted lifecycle/execution log this
+  milestone requires, independent of the automation's own current state.
+- **`AutomationEngine`** (`app/automation/engine.py`) is a plain daemon
+  thread, the direct sibling of `ReminderScheduler` - same `start`/`stop`/
+  `tick()` shape, and the same **two-layer failure isolation**
+  `ReminderScheduler` was hardened with: each automation's execution is
+  isolated in its own `try`/`except` inside `tick()` (one misbehaving
+  automation can't stop the rest of that poll), and `tick()` itself is
+  wrapped again in `_run()` (a store-level failure, e.g. a transient
+  SQLite error, can't kill the background thread either) - "Failure
+  isolation so one automation cannot kill the engine" from this
+  milestone's scope is a property of both layers together, not either
+  alone. **Restart recovery needs no special code**, for the same reason
+  as reminders: a `TIME` trigger's due-ness is a plain persisted
+  comparison, and a `REMINDER_COMPLETED` trigger just re-reads the linked
+  Reminder's current (already-persistent) status - both are naturally
+  correct again the moment a fresh `AutomationEngine` starts polling.
+  `run_now(automation_id)` executes one automation immediately regardless
+  of trigger type or due-ness (raising `AutomationRunError` for an
+  unknown/`DISABLED`/`CANCELLED` id) - the only way a `MANUAL` automation
+  ever runs, and also usable to force an early run of a `TIME`/
+  `REMINDER_COMPLETED` one; it goes through the exact same conditions ->
+  permission-gated dispatch -> execution-history logging path as a
+  poller-triggered run.
+- **`create_automation`/`list_automations`/`enable_automation`/
+  `disable_automation`/`cancel_automation`/`run_automation`**
+  (`app/automation/tools.py`) are ordinary `Tool`s registered in
+  `app/tools/defaults.py` alongside `web_search`/the reminder tools -
+  reached through the exact same `TOOL` capability and Tool Decision
+  Layer every other tool already uses, with no automation-specific
+  branching anywhere in `JarvisCore`. The four ID-based tools
+  (`enable_automation`/`disable_automation`/`cancel_automation`/
+  `run_automation`) each take one required string parameter
+  (`automation_id`), so `ToolCallBuilder` fills it deterministically from
+  trailing message text, zero AI calls - `create_automation` has multiple
+  required parameters, so it goes through `ToolCallBuilder`'s existing
+  Gemini-assisted fallback, same as `create_reminder`. All six are
+  `SAFE_ACTION` except `list_automations` (`READ`).
+- **`app/main.py`** builds one shared `AutomationStore` at startup (plus
+  the existing `ReminderStore`), passes both - and `core.memory`, so
+  `FactEqualsCondition` sees the same stored facts `JarvisCore`'s own
+  DIRECT/SEARCH prompts use - into `register_default_tools` (which
+  constructs and returns the `AutomationEngine`, since `RunAutomationTool`
+  needs the engine itself, not just the store), and starts/stops the
+  engine from the same `lifespan` handler as the reminder scheduler.
+  `register_default_tools` passes the *same* `ToolRegistry` it's still
+  populating into `AutomationEngine`'s constructor - safe, because
+  `ToolRegistry.execute`/`get` look up a tool by name only when actually
+  called, not at construction time, so a tool registered later (by that
+  same function, including automation tools registered after the engine
+  object already exists) is still visible once the engine actually runs.
+- **Extensibility, not implementation**: nothing here builds toward
+  Jarvis writing code, creating/modifying files, testing/debugging, or
+  designing hardware workflows - none of that exists yet. But nothing
+  here blocks it either: once a future milestone registers a new kind of
+  `Tool` for one of those (with a deliberately-chosen permission level),
+  it becomes usable as an automation action like any other tool, with no
+  changes needed to `Automation`, `AutomationEngine`, or the automation
+  tools - the whole point of actions being a plain `ToolCall` dispatched
+  through the existing `ToolRegistry` rather than a bespoke automation-
+  only invocation mechanism.
+
+Configuration:
+- `JARVIS_AUTOMATIONS_DB_PATH` - local SQLite file automations are stored
+  in. Defaults to `jarvis_automations.db`.
+- `JARVIS_AUTOMATION_POLL_INTERVAL_SECONDS` - how often the background
+  engine polls for due automations, in seconds. Defaults to `30`.
+
 ## Postponed decisions (on purpose)
 
 These were not decided now, to avoid overbuilding before they're needed:
 - Database (SQLite) — added when the first feature that needs persistence
   (memory, the search cache, and now tasks/reminders as of M7) is built.
   Each still gets its own local SQLite file rather than a shared one.
-- Automation/agents scheduling arbitrary tools — M7's `ReminderScheduler`
-  can only ever fire a `Notifier` for a persisted reminder's free text; it
-  has no way to persist or later invoke a tool name/parameters. Letting a
-  scheduled entry run an arbitrary registered `Tool` (with its own
-  permission re-confirmation story for a fully unattended run) is a
-  separate, deliberate future decision, not attempted here.
+- Cron-expression/calendar-aware scheduling, and conditions beyond
+  `FactEqualsCondition`/`TimeWindowCondition` (e.g. comparing two facts,
+  numeric thresholds, external-state lookups) — M8's `TIME` trigger is
+  deliberately just a fixed interval (same trade-off as Reminder
+  recurrence), and its condition set is deliberately small; both are
+  extensible (`Condition` is an ABC) without touching `AutomationEngine`.
+- Automations invoking `CONFIRM`/`DANGEROUS` tools, even with a stored,
+  reusable approval — M8 restricts automation actions to already-
+  automatic-permission tools only ("safe actions only for now" in this
+  milestone's scope); a deliberate future design is needed for what an
+  unattended-but-still-confirmed action would even mean.
+- Jarvis writing/modifying code, running tests, or designing hardware
+  workflows — explicitly out of scope for M8; see this section's
+  "Extensibility, not implementation" note above for why the automation
+  action architecture doesn't need to change when that capability
+  eventually arrives as one or more new `Tool`s.
 - Conversation memory / multi-turn context — not in this milestone; `/chat`
   is stateless, one message in, one reply out.
 - Dashboard framework — decided when we build the actual dashboard.

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from enum import Enum
 
 
@@ -74,6 +75,70 @@ class Recurrence:
 
     unit: RecurrenceUnit
     interval: int = 1
+
+
+class RecurrenceError(ValueError):
+    """Raised by `parse_recurrence` for an unknown unit or a non-positive
+    interval - never silently coerced or dropped."""
+
+
+_VALID_RECURRENCE_UNIT_VALUES = {member.value for member in RecurrenceUnit}
+
+
+def parse_recurrence(unit: str | None, interval: float | int = 1) -> Recurrence | None:
+    """Validate and construct a Recurrence from raw tool parameters, or
+    return None if `unit` is None (one-time - the caller never supplied a
+    recurrence at all). Shared by CreateReminderTool
+    (app/reminders/tools.py) and CreateAutomationTool
+    (app/automation/tools.py) so both validate a recurring schedule
+    identically, rather than each re-implementing the same checks.
+
+    Raises RecurrenceError (never silently coerces) for an unrecognized
+    `unit`, or for an `interval` that truncates to <= 0 - a non-positive
+    interval would never advance a due time into the future (see
+    `advance_by_recurrence` below), so whatever it's attached to would
+    become due again on every single poll, forever.
+    """
+    if unit is None:
+        return None
+    if unit not in _VALID_RECURRENCE_UNIT_VALUES:
+        raise RecurrenceError(
+            f"Unknown recurrence_unit: '{unit}'. Must be one of: "
+            f"{sorted(_VALID_RECURRENCE_UNIT_VALUES)}"
+        )
+    parsed_interval = int(interval)
+    if parsed_interval <= 0:
+        raise RecurrenceError("recurrence_interval must be a positive integer.")
+    return Recurrence(unit=RecurrenceUnit(unit), interval=parsed_interval)
+
+
+_RECURRENCE_DELTA_KWARGS = {
+    RecurrenceUnit.MINUTES: "minutes",
+    RecurrenceUnit.HOURS: "hours",
+    RecurrenceUnit.DAYS: "days",
+    RecurrenceUnit.WEEKS: "weeks",
+}
+
+
+def advance_by_recurrence(timestamp: str, recurrence: Recurrence) -> str:
+    """Advance an ISO 8601 UTC `timestamp` by one recurrence interval,
+    relative to `timestamp` itself - not "now" - so a delay in
+    *processing* a recurring occurrence (Jarvis was offline, or a poll
+    was late) doesn't also shift every future occurrence later; it just
+    catches up one tick per poll until the timestamp is back in the
+    future. Shared by ReminderScheduler (app/reminders/scheduler.py) and
+    AutomationEngine (app/automation/engine.py) - both a recurring
+    Reminder's `due_at` and a recurring TIME-triggered Automation's
+    `next_run_at` advance exactly the same way.
+
+    Can raise OverflowError for an absurd interval (e.g. billions of
+    weeks) - callers isolate that themselves (see ReminderScheduler.tick/
+    AutomationEngine.tick's per-item failure isolation) rather than this
+    function silently clamping it.
+    """
+    kwarg = _RECURRENCE_DELTA_KWARGS[recurrence.unit]
+    delta = timedelta(**{kwarg: recurrence.interval})
+    return (datetime.fromisoformat(timestamp) + delta).isoformat()
 
 
 @dataclass

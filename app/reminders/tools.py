@@ -16,15 +16,14 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from app.reminders.base import (
-    Recurrence,
-    RecurrenceUnit,
+    RecurrenceError,
     Reminder,
     ReminderStatus,
     ReminderStore,
+    parse_recurrence,
 )
 from app.tools.base import PermissionLevel, Tool, ToolParameter, ToolResult
 
-_VALID_RECURRENCE_UNITS = {member.value for member in RecurrenceUnit}
 _VALID_STATUSES = {member.value for member in ReminderStatus}
 
 
@@ -104,20 +103,10 @@ class CreateReminderTool(Tool):
         if due_in_minutes < 0:
             return ToolResult.error("due_in_minutes must not be negative.")
 
-        recurrence = None
-        if recurrence_unit is not None:
-            if recurrence_unit not in _VALID_RECURRENCE_UNITS:
-                return ToolResult.error(
-                    f"Unknown recurrence_unit: '{recurrence_unit}'. Must be "
-                    f"one of: {sorted(_VALID_RECURRENCE_UNITS)}"
-                )
-            interval = int(recurrence_interval)
-            if interval <= 0:
-                # A non-positive interval would never advance due_at into
-                # the future (see ReminderScheduler._advance_due_at), so
-                # the reminder would re-fire on every single poll forever.
-                return ToolResult.error("recurrence_interval must be a positive integer.")
-            recurrence = Recurrence(unit=RecurrenceUnit(recurrence_unit), interval=interval)
+        try:
+            recurrence = parse_recurrence(recurrence_unit, recurrence_interval)
+        except RecurrenceError as exc:
+            return ToolResult.error(str(exc))
 
         due_at = (
             datetime.now(timezone.utc) + timedelta(minutes=due_in_minutes)

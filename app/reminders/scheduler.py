@@ -17,12 +17,17 @@ backing, so a Reminder that became due while Jarvis was offline is simply
 found and triggered on the first poll after startup, exactly like any
 other due reminder - restart recovery is a property of persistence, not a
 poller feature.
+
+`advance_by_recurrence` (app/reminders/base.py) is shared with
+AutomationEngine (app/automation/engine.py, M8) - a recurring Automation's
+`next_run_at` advances exactly the same way a recurring Reminder's
+`due_at` does, rather than a second copy of the same interval math.
 """
 
 import threading
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
-from app.reminders.base import Recurrence, RecurrenceUnit, Reminder, ReminderStore
+from app.reminders.base import Reminder, ReminderStore, advance_by_recurrence
 from app.reminders.notifier import Notifier, NotifierError
 
 #: How often ReminderScheduler polls by default when none is configured -
@@ -30,27 +35,9 @@ from app.reminders.notifier import Notifier, NotifierError
 #: coming due, without hammering ReminderStore's SQLite connection.
 DEFAULT_POLL_INTERVAL_SECONDS = 30.0
 
-_RECURRENCE_DELTA_KWARGS = {
-    RecurrenceUnit.MINUTES: "minutes",
-    RecurrenceUnit.HOURS: "hours",
-    RecurrenceUnit.DAYS: "days",
-    RecurrenceUnit.WEEKS: "weeks",
-}
-
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
-
-
-def _advance_due_at(due_at: str, recurrence: Recurrence) -> str:
-    """Advance `due_at` by one recurrence interval, relative to `due_at`
-    itself - not "now" - so a delay in *processing* a recurring reminder
-    (Jarvis was offline, or the poll was late) doesn't also shift every
-    future occurrence later; it just catches up one tick per poll until
-    `due_at` is back in the future."""
-    kwarg = _RECURRENCE_DELTA_KWARGS[recurrence.unit]
-    delta = timedelta(**{kwarg: recurrence.interval})
-    return (datetime.fromisoformat(due_at) + delta).isoformat()
 
 
 class ReminderScheduler:
@@ -136,7 +123,7 @@ class ReminderScheduler:
             success, detail = False, str(exc)
 
         next_due_at = (
-            _advance_due_at(reminder.due_at, reminder.recurrence)
+            advance_by_recurrence(reminder.due_at, reminder.recurrence)
             if success and reminder.recurrence is not None
             else None
         )
