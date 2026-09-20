@@ -1,30 +1,24 @@
 # Jarvis
 
-Personal AI assistant project. This is **Milestone 9: Google Calendar +
-Local Jarvis Tasks** — two new, independent modules. `app/calendar/`
-adds a `CalendarProvider` abstraction (mirroring `AIProvider`/
-`SearchProvider`) with `GoogleCalendarProvider` as its only
-implementation: a Google OAuth 2.0 desktop/localhost flow (no hosted
-server, no Google SDK, plain httpx) authorizes access once, a local
-SQLite-backed `TokenStore` persists the refresh token, and every call
-auto-refreshes an expired access token first. `list_events` is `READ`;
-`create_event`/`update_event` are `CONFIRM`; `delete_event` is
-`DANGEROUS` — enforced entirely by the existing `ToolRegistry`, which
-means M8's `AutomationEngine` (READ/SAFE_ACTION tools only, unchanged)
-can never run a calendar write unattended, with zero changes to
-`app/automation/*`. `app/tasks/` adds local, SQLite-backed Jarvis Tasks
-(create/list/complete/cancel, optional due date + priority) —
-deliberately independent from M7 Reminders, with no scheduling or
-notifications of its own. See
-[Google Calendar](#google-calendar-m9) and
-[Jarvis Tasks](#jarvis-tasks-m9) for details. Persistent Automation
-Engine (M8), Persistent Tasks, Reminders & Background Scheduling (M7),
-natural-language tool selection (M6.16), capability routing
-(M6.13-M6.15), and the search pipeline (M6.5-6.12) are all unchanged. No
-Google Tasks sync, multi-calendar/account support, attendee/invite
-management, RRULE authoring, calendar automation triggers, browser
-automation, email/messaging, agents/sub-agents, hardware, arbitrary
-code/shell execution, or paid APIs yet.
+Personal AI assistant project. This is **Milestone 11: Multi-Provider AI
+Foundation** — `app/providers/` now has five more `AIProvider`
+implementations alongside Gemini (Groq, OpenRouter, Cloudflare Workers
+AI, Mistral, xAI) and a small registry (`app/providers/factory.py`) to
+construct one by stable name. This milestone is **foundation only**:
+`JarvisCore` still builds its own default provider directly
+(`GeminiProvider()`, unchanged) and has no notion of provider selection,
+fallback, retries, quota tracking, or health-based rotation - that's the
+next milestone. See [Multi-Provider AI Foundation](#multi-provider-ai-foundation-m11)
+for the full provider table (base URL/required env/model config per
+provider) and what's still deliberately missing. `SearchRouter`,
+`CapabilityRouter`, `ToolCallBuilder`, Core's DIRECT/SEARCH/TOOL
+dispatch, Google Calendar + Local Jarvis Tasks (M9), Persistent
+Automation Engine (M8), Persistent Tasks, Reminders & Background
+Scheduling (M7), natural-language tool selection (M6.16), capability
+routing (M6.13-M6.15), and the search pipeline (M6.5-6.12) are all
+unchanged. No provider fallback/rotation, no quota tracking, no
+agents/sub-agents, no new capabilities, and no API key is required for
+any of the five new providers yet.
 
 ## Stack
 
@@ -134,8 +128,15 @@ jarvis/
     core.py            - Jarvis Core: dispatches a chat request DIRECT (AIProvider) or SEARCH (WebSearchTool + SearchAnswerGenerator)
     capability.py       - Capability/CapabilityDecision/CapabilityRouter: the DIRECT/SEARCH decision layer Core dispatches on
     providers/
-      base.py           - AIProvider interface, so Core doesn't depend on any vendor
-      gemini.py         - Gemini implementation of AIProvider
+      base.py           - AIProvider interface + ProviderError, so Core doesn't depend on any vendor; ProviderInfo (metadata type for describe_providers)
+      gemini.py         - Gemini implementation of AIProvider (Core's default, unchanged since M11)
+      _openai_compatible.py - OpenAICompatibleProvider: shared /chat/completions HTTP+JSON handling for Groq/OpenRouter/Mistral/xAI
+      groq.py            - Groq implementation of AIProvider (M11)
+      openrouter.py       - OpenRouter implementation of AIProvider (M11)
+      mistral.py           - Mistral implementation of AIProvider (M11)
+      xai.py                - xAI (Grok) implementation of AIProvider (M11)
+      cloudflare.py          - Cloudflare Workers AI implementation of AIProvider - own request/response shape (M11)
+      factory.py               - PROVIDER_FACTORIES registry + create_provider/describe_providers by stable name (M11)
     memory/
       base.py           - MemoryStore interface and the Message type
       sqlite_store.py   - SQLite implementation of MemoryStore
@@ -192,6 +193,13 @@ jarvis/
     test_core.py            - unit tests for Jarvis Core's provider delegation and DIRECT/SEARCH dispatch
     test_capability.py      - unit tests for Capability/CapabilityDecision/DeterministicCapabilityRouter
     test_gemini_provider.py - unit tests for the Gemini provider, with HTTP mocked out
+    test_openai_compatible_provider.py - unit tests for the shared Groq/OpenRouter/Mistral/xAI HTTP+JSON base class, via a dummy subclass
+    test_groq_provider.py    - wiring tests for Groq (URL/model/key), shared JSON logic covered above
+    test_openrouter_provider.py - wiring tests for OpenRouter (URL/model/key), shared JSON logic covered above
+    test_mistral_provider.py  - wiring tests for Mistral (URL/model/key), shared JSON logic covered above
+    test_xai_provider.py       - wiring tests for xAI (URL/model/key), shared JSON logic covered above
+    test_cloudflare_provider.py - unit tests for Cloudflare Workers AI (account id, success:false handling), with HTTP mocked out
+    test_provider_factory.py    - unit tests for the provider registry/factory: selection by name, unknown names, describe_providers metadata
     test_memory.py          - unit tests for the SQLite memory store
     test_tools.py           - unit tests for the Tool Registry and permission model
     test_tool_decision.py   - unit tests for ToolCall/ToolCallBuilder/GeminiToolCallProvider
@@ -1324,6 +1332,72 @@ deliberately independent from M7 Reminders, following the same
 Configuration:
 - `JARVIS_TASKS_DB_PATH` - local SQLite file tasks are stored in.
   Defaults to `jarvis_tasks.db`.
+
+## Multi-Provider AI Foundation (M11)
+
+M11 adds five more `AIProvider` implementations alongside Gemini - Groq,
+OpenRouter, Cloudflare Workers AI, Mistral, and xAI - plus a small
+registry to construct one by stable name. This is **foundation only**:
+`JarvisCore` still builds its own default provider directly
+(`GeminiProvider()`, unchanged) and has no notion of which provider is
+selected, no fallback, no retries, no quota tracking, and no health
+scoring or rotation - that's the next milestone. `SearchRouter`,
+`CapabilityRouter`, `ToolCallBuilder`, Core's DIRECT/SEARCH/TOOL
+dispatch, reminders, automations, calendar, and Jarvis Tasks are all
+completely unchanged.
+
+Every provider still implements the same `AIProvider.generate_reply(message: str) -> str`
+interface Gemini already used (`app/providers/base.py`) and raises the
+same kind of typed error (a `ProviderError` subclass) on failure - no
+provider-specific type or shape ever escapes its own adapter module.
+None of these need an API key to import, construct, or run the test
+suite; a missing key only surfaces as a clear `ProviderError` the moment
+that specific provider's `generate_reply` is actually called.
+
+Groq, OpenRouter, Mistral, and xAI all document an OpenAI-compatible
+`/chat/completions` endpoint (`{"model", "messages": [{"role",
+"content"}]}` in, `choices[0].message.content` out), so their HTTP/JSON
+handling is implemented once in `OpenAICompatibleProvider`
+(`app/providers/_openai_compatible.py`); each of their own modules
+supplies only its base URL, its own settings fields, and its own error
+type. Gemini (unchanged) and Cloudflare Workers AI both have their own
+distinct request/response shapes and are implemented directly against
+`AIProvider` instead.
+
+| Provider | Name (factory) | API base URL | Required env | Model config |
+|---|---|---|---|---|
+| Gemini | `gemini` | `generativelanguage.googleapis.com/v1beta/models/{model}:generateContent` | `JARVIS_GEMINI_API_KEY` | `JARVIS_GEMINI_MODEL` |
+| Groq | `groq` | `api.groq.com/openai/v1/chat/completions` | `JARVIS_GROQ_API_KEY` | `JARVIS_GROQ_MODEL` |
+| OpenRouter | `openrouter` | `openrouter.ai/api/v1/chat/completions` | `JARVIS_OPENROUTER_API_KEY` | `JARVIS_OPENROUTER_MODEL` |
+| Cloudflare Workers AI | `cloudflare` | `api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/{model}` | `JARVIS_CLOUDFLARE_API_KEY`, `JARVIS_CLOUDFLARE_ACCOUNT_ID` | `JARVIS_CLOUDFLARE_MODEL` |
+| Mistral | `mistral` | `api.mistral.ai/v1/chat/completions` | `JARVIS_MISTRAL_API_KEY` | `JARVIS_MISTRAL_MODEL` |
+| xAI (Grok) | `xai` | `api.x.ai/v1/chat/completions` | `JARVIS_XAI_API_KEY` | `JARVIS_XAI_MODEL` |
+
+Cloudflare is the only provider needing two env vars together, since its
+URL is per-account: it's only reported as "configured" when both the API
+token and the account id are set.
+
+- **`app/providers/factory.py`** is the one place a provider name is ever
+  checked against a string (same role `app/search/factory.py` already
+  plays for search providers): `create_provider(name)` builds one of the
+  six by name, raising `UnknownProviderError` for anything else, and
+  `describe_providers()` returns a `ProviderInfo` per provider (name,
+  base URL, required env var *names*, model env var name, and a live
+  `configured` bool computed from current settings) - metadata only,
+  never a key's value, so it's always safe to log or display.
+- Add a real key to `.env` for whichever provider(s) you want to actually
+  call (see `.env.example` for every placeholder + a safe example model
+  name); leaving all of them but Gemini blank changes nothing about how
+  Jarvis runs today, since Core still only ever constructs `GeminiProvider()`.
+- Tests (`tests/test_openai_compatible_provider.py`,
+  `test_groq_provider.py`, `test_openrouter_provider.py`,
+  `test_mistral_provider.py`, `test_xai_provider.py`,
+  `test_cloudflare_provider.py`, `test_provider_factory.py`) mock every
+  HTTP call - no test in this codebase ever makes a real call to any of
+  these APIs - and include a regression test per HTTP-backed provider
+  proving a non-2xx response's error message never contains the API key
+  (Gemini's existing key-redaction test from M1 is unchanged and still
+  passing).
 
 ## Postponed decisions (on purpose)
 

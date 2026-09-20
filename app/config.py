@@ -22,6 +22,30 @@ class Settings(BaseSettings):
     gemini_api_key: str = ""
     gemini_model: str = "gemini-3.8-flash"
 
+    # Additional AI providers (M11 foundation - see app/providers/factory.py
+    # for the registry these are selected through). Each is independently
+    # optional: leaving a provider's API key blank just means that
+    # provider raises a clear config error if it's ever actually invoked -
+    # it never affects importing, testing, or starting Jarvis, and Core
+    # still defaults to Gemini alone (no provider selection/fallback yet).
+    groq_api_key: str = ""
+    groq_model: str = "llama-3.3-70b-versatile"
+
+    openrouter_api_key: str = ""
+    openrouter_model: str = "openrouter/auto"
+
+    # Cloudflare Workers AI needs both a token and an account id, since its
+    # API URL is per-account (.../accounts/{account_id}/ai/run/{model}).
+    cloudflare_api_key: str = ""
+    cloudflare_account_id: str = ""
+    cloudflare_model: str = "@cf/meta/llama-3.1-8b-instruct"
+
+    mistral_api_key: str = ""
+    mistral_model: str = "mistral-small-latest"
+
+    xai_api_key: str = ""
+    xai_model: str = "grok-2-latest"
+
     # Memory (local SQLite persistence for conversations and user facts)
     memory_db_path: str = "jarvis_memory.db"
 

@@ -37,6 +37,14 @@ class GeminiProvider(AIProvider):
                 timeout=120,
             )
             response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            # exc's own message embeds exc.request.url, which includes the
+            # "key" query param above - use status/body instead so the API
+            # key never leaks into a GeminiError (and from there into
+            # /chat's 502 response body).
+            raise GeminiError(
+                f"Gemini returned {exc.response.status_code}: {exc.response.text}"
+            ) from exc
         except httpx.HTTPError as exc:
             raise GeminiError(f"Failed to reach Gemini: {exc}") from exc
 
