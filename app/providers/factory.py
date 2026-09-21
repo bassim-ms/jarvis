@@ -15,6 +15,7 @@ from app.providers.base import AIProvider, ProviderInfo
 from app.providers.cloudflare import CLOUDFLARE_URL, CloudflareProvider
 from app.providers.gemini import GEMINI_URL, GeminiProvider
 from app.providers.groq import GROQ_URL, GroqProvider
+from app.providers.manager import AIProviderEntry, AIProviderManager
 from app.providers.mistral import MISTRAL_URL, MistralProvider
 from app.providers.openrouter import OPENROUTER_URL, OpenRouterProvider
 from app.providers.xai import XAI_URL, XAIProvider
@@ -104,3 +105,26 @@ def describe_providers() -> list[ProviderInfo]:
             configured=bool(settings.xai_api_key),
         ),
     ]
+
+
+def build_ai_provider_entries() -> list[AIProviderEntry]:
+    """Instantiate the providers named in settings.ai_provider_order, in
+    order, each wrapped in an AIProviderEntry under its registry name -
+    mirrors app/search/factory.py:build_search_providers for AI providers."""
+    names = [
+        name.strip() for name in settings.ai_provider_order.split(",") if name.strip()
+    ]
+    return [AIProviderEntry(name=name, provider=create_provider(name)) for name in names]
+
+
+def create_default_ai_provider_manager() -> AIProviderManager:
+    """Build the application's default AIProviderManager: an ordered
+    fallback chain, with retry/cooldown from settings, over every provider
+    named in JARVIS_AI_PROVIDER_ORDER. Not used by JarvisCore yet (M12 only
+    establishes the manager) - a later milestone wires Core to this."""
+    return AIProviderManager(
+        build_ai_provider_entries(),
+        retry_count=settings.ai_provider_retry_count,
+        retry_delay_seconds=settings.ai_provider_retry_delay_seconds,
+        cooldown_seconds=settings.ai_provider_cooldown_seconds,
+    )

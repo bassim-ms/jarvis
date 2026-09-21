@@ -11,6 +11,7 @@ from app.providers import factory
 from app.providers.cloudflare import CloudflareProvider
 from app.providers.gemini import GeminiProvider
 from app.providers.groq import GroqProvider
+from app.providers.manager import AIProviderManager
 from app.providers.mistral import MistralProvider
 from app.providers.openrouter import OpenRouterProvider
 from app.providers.xai import XAIProvider
@@ -76,3 +77,47 @@ def test_describe_providers_reports_cloudflare_requires_two_env_vars():
         "JARVIS_CLOUDFLARE_API_KEY",
         "JARVIS_CLOUDFLARE_ACCOUNT_ID",
     }
+
+
+# --- build_ai_provider_entries / create_default_ai_provider_manager --------
+
+
+def test_build_ai_provider_entries_follows_configured_order(monkeypatch):
+    monkeypatch.setattr(factory.settings, "ai_provider_order", "cloudflare,gemini")
+
+    entries = factory.build_ai_provider_entries()
+
+    assert [entry.name for entry in entries] == ["cloudflare", "gemini"]
+    assert isinstance(entries[0].provider, CloudflareProvider)
+    assert isinstance(entries[1].provider, GeminiProvider)
+
+
+def test_build_ai_provider_entries_raises_on_unknown_name(monkeypatch):
+    monkeypatch.setattr(factory.settings, "ai_provider_order", "gemini,not-a-provider")
+
+    with pytest.raises(factory.UnknownProviderError, match="not-a-provider"):
+        factory.build_ai_provider_entries()
+
+
+def test_create_default_ai_provider_manager_returns_a_manager(monkeypatch):
+    monkeypatch.setattr(factory.settings, "ai_provider_order", "gemini,groq")
+
+    manager = factory.create_default_ai_provider_manager()
+
+    assert isinstance(manager, AIProviderManager)
+    assert [health.name for health in manager.get_health()] == ["gemini", "groq"]
+
+
+def test_create_default_ai_provider_manager_uses_configured_retry_and_cooldown(
+    monkeypatch,
+):
+    monkeypatch.setattr(factory.settings, "ai_provider_order", "gemini")
+    monkeypatch.setattr(factory.settings, "ai_provider_retry_count", 5)
+    monkeypatch.setattr(factory.settings, "ai_provider_retry_delay_seconds", 1.5)
+    monkeypatch.setattr(factory.settings, "ai_provider_cooldown_seconds", 120)
+
+    manager = factory.create_default_ai_provider_manager()
+
+    assert manager.retry_count == 5
+    assert manager.retry_delay_seconds == 1.5
+    assert manager.cooldown_seconds == 120

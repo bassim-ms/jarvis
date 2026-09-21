@@ -40,6 +40,23 @@ class Settings(BaseSettings):
     cloudflare_account_id: str = ""
     cloudflare_model: str = "@cf/meta/llama-3.1-8b-instruct"
 
+    # AI provider manager (M12 - see app/providers/manager.py and
+    # app/providers/factory.py:create_default_ai_provider_manager) - ordered
+    # fallback with retry/cooldown across the providers above. Local AI is
+    # planned as a future addition to this same order, not built yet.
+    # Ordered, comma-separated list of provider names to try, with automatic
+    # fallback to the next on failure; a name left out of this list is
+    # effectively disabled. Same convention as JARVIS_SEARCH_PROVIDER_ORDER.
+    ai_provider_order: str = "gemini,groq,openrouter,cloudflare"
+    # Extra attempts against the SAME provider for a transient (5xx) error
+    # before falling back to the next provider - 2 means up to 3 attempts
+    # total. Rate-limit/network/auth errors never retry the same provider.
+    ai_provider_retry_count: int = 2
+    ai_provider_retry_delay_seconds: float = 0.5
+    # How long a provider that returned a rate-limit (429) error is skipped
+    # for, in seconds, before the manager will try it again.
+    ai_provider_cooldown_seconds: float = 60.0
+
     mistral_api_key: str = ""
     mistral_model: str = "mistral-small-latest"
 
