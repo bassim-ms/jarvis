@@ -48,6 +48,21 @@ ToolRegistry.execute(name, params=...) call. A ToolCallIncompleteError
 plain reply, the same way an unknown tool name already did; any other
 ToolCallError is translated to ProviderError, the same convention
 CapabilityDecisionError/SearchAnswerError already use.
+
+Since M14, the DIRECT branch of handle_chat builds a RequestRequirements
+(app/providers/requirements.py) from the message, the already-decided
+Capability, and the assembled prompt's length, then calls the provider
+through call_with_requirements (app/providers/manager.py) instead of
+generate_reply directly - this is what lets M13's ProviderRouter actually
+pick an initial provider for real DIRECT requests. It's a no-op whenever
+`self.provider` isn't an AIProviderManager (a directly-injected
+AIProvider, every existing test fake, ...) - see call_with_requirements's
+own docstring. TOOL never reaches an AI provider through `self.provider`
+at all (tool-call construction, when needed, goes through its own
+deliberately Gemini-pinned ToolCallProvider - see app/tools/decision.py),
+so there's nothing to route there; SEARCH's routing lives in
+GeminiSearchAnswerGenerator instead (app/search/answer.py), since that's
+where the actual provider call happens.
 """
 
 from app.capability import (
@@ -61,7 +76,9 @@ from app.config import settings
 from app.memory.base import MemoryStore, Message
 from app.memory.sqlite_store import SQLiteMemoryStore
 from app.providers.base import AIProvider, ProviderError
-from app.providers.gemini import GeminiProvider
+from app.providers.factory import create_default_ai_provider_manager
+from app.providers.manager import call_with_requirements
+from app.providers.requirements import classify_request
 from app.search.answer import (
     GeminiSearchAnswerGenerator,
     SearchAnswerError,
@@ -104,7 +121,7 @@ class JarvisCore:
         capability_router: CapabilityRouter | None = None,
         tool_call_builder: ToolCallBuilder | None = None,
     ):
-        self.provider = provider or GeminiProvider()
+        self.provider = provider or create_default_ai_provider_manager()
         self.memory = memory or SQLiteMemoryStore(settings.memory_db_path)
         # Empty by default - no real tools exist yet (M5 is architecture
         # only). AI tool-calling isn't wired up here either; Core just has
@@ -177,7 +194,22 @@ class JarvisCore:
             reply, sources = self._handle_tool(message, decision)
         else:
             prompt = self._build_prompt(message, history, facts)
-            reply = self.provider.generate_reply(prompt)
+            # M14: `decision.capability` here is always DIRECT (SEARCH/TOOL
+            # are handled above) - passed through explicitly, rather than
+            # hardcoded, so classify_request always reflects the real
+            # capability decision Core already made (execution context)
+            # instead of re-deriving it. `context_char_count=len(prompt)`
+            # is the exact payload about to be sent - the most direct
+            # "how much context is this" signal available, no separate
+            # length heuristic invented. See app/providers/requirements.py
+            # for what this actually classifies (task type, long_context,
+            # ...) and app/providers/manager.py:call_with_requirements for
+            # why this is safe to call even when self.provider is a plain
+            # AIProvider that knows nothing about requirements.
+            requirements = classify_request(
+                message, capability=decision.capability, context_char_count=len(prompt)
+            )
+            reply = call_with_requirements(self.provider, prompt, requirements)
             sources = []
 
         self.memory.add_message(conversation_id, "user", message)

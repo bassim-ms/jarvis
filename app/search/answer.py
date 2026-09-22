@@ -16,6 +16,19 @@ follow-up question ("what's the latest deadline?" after "tell me about
 TUM") can be understood - never as a second source of facts to answer
 from, and never fed into the search query itself (that stays exactly the
 raw user message - see app/search/router.py and app/tools/web_search.py).
+
+Since M14, `generate()` builds a RequestRequirements
+(app/providers/requirements.py) unconditionally tagged search_synthesis
+(this class only ever performs search-answer synthesis - there's no
+ambiguity to classify), with `long_context` derived from the assembled
+prompt's actual length, and calls the provider through
+call_with_requirements (app/providers/manager.py) instead of
+generate_reply directly. That's a no-op whenever `self.provider` isn't an
+AIProviderManager (this class's own default GeminiProvider(), every
+existing test's FakeAIProvider, ...) - see call_with_requirements's own
+docstring - so this is purely additive for the one caller
+(JarvisCore._handle_search, via Core's shared self.provider) that already
+wraps an AIProviderManager.
 """
 
 from abc import ABC, abstractmethod
@@ -23,6 +36,12 @@ from dataclasses import dataclass
 
 from app.providers.base import AIProvider, ProviderError
 from app.providers.gemini import GeminiProvider
+from app.providers.manager import call_with_requirements
+from app.providers.requirements import (
+    LONG_CONTEXT_CHAR_THRESHOLD,
+    RequestRequirements,
+    TaskType,
+)
 from app.search.base import SearchResult
 from app.search.response import SearchResponse
 
@@ -86,9 +105,14 @@ class GeminiSearchAnswerGenerator(SearchAnswerGenerator):
         self, response: SearchResponse, conversation_context: str = ""
     ) -> SearchAnswer:
         prompt = self._build_prompt(response, conversation_context)
+        requirements = RequestRequirements(
+            task_type=TaskType.SEARCH_SYNTHESIS,
+            search_synthesis=True,
+            long_context=len(prompt) > LONG_CONTEXT_CHAR_THRESHOLD,
+        )
 
         try:
-            raw_answer = self.provider.generate_reply(prompt)
+            raw_answer = call_with_requirements(self.provider, prompt, requirements)
         except ProviderError as exc:
             raise SearchAnswerError(f"Failed to generate an answer: {exc}") from exc
 

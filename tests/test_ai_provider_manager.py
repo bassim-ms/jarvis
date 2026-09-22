@@ -14,6 +14,7 @@ from app.providers.manager import (
     AllProvidersFailedError,
     ErrorCategory,
     UnexpectedProviderError,
+    call_with_requirements,
     classify_error,
 )
 from app.providers.requirements import LatencyPreference, RequestRequirements
@@ -627,3 +628,38 @@ def test_last_routing_decision_contains_no_secrets():
     decision = manager.last_routing_decision
     assert "sk-super-secret" not in decision.reason
     assert all("sk-super-secret" not in c.reason for c in decision.excluded)
+
+
+# --- M14: call_with_requirements ----------------------------------------------
+#
+# The seam JarvisCore's DIRECT path and GeminiSearchAnswerGenerator's SEARCH
+# path (app/core.py, app/search/answer.py) actually call. Its whole job is to
+# be safe to call unconditionally, whether `provider` is an AIProviderManager
+# or any other plain AIProvider (including every AIProvider fake already in
+# this test suite, which knows nothing about `requirements`).
+
+
+def test_call_with_requirements_routes_through_a_real_manager():
+    groq = FakeProvider(reply="from groq")
+    gemini = FakeProvider(reply="from gemini")
+    manager = AIProviderManager([entry("gemini", gemini), entry("groq", groq)])
+    requirements = RequestRequirements(latency_preference=LatencyPreference.LOW)
+
+    reply = call_with_requirements(manager, "hi", requirements)
+
+    assert reply == "from groq"  # groq preferred: latency_preference=LOW
+    assert manager.last_routing_decision is not None
+    assert manager.last_routing_decision.requirements is requirements
+
+
+def test_call_with_requirements_is_a_no_op_for_a_plain_provider():
+    """A plain AIProvider (not an AIProviderManager) has no idea what
+    `requirements` even is - call_with_requirements must never pass it
+    along, so any existing AIProvider implementation/fake keeps working
+    exactly as before M14, with no TypeError."""
+    plain = FakeProvider(reply="plain reply")
+
+    reply = call_with_requirements(plain, "hi", RequestRequirements())
+
+    assert reply == "plain reply"
+    assert plain.calls == 1

@@ -9,6 +9,8 @@ import pytest
 
 from app.providers.base import AIProvider, ProviderError
 from app.providers.gemini import GeminiProvider
+from app.providers.manager import AIProviderEntry, AIProviderManager
+from app.providers.requirements import LONG_CONTEXT_CHAR_THRESHOLD, TaskType
 from app.search.answer import (
     GeminiSearchAnswerGenerator,
     SearchAnswer,
@@ -329,3 +331,91 @@ def test_search_answer_and_source_are_plain_comparable_dataclasses():
     assert answer == SearchAnswer(
         answer="a", sources=[SearchSource(title="t", url="https://x.com", query="q")]
     )
+
+
+# --- M14: RequestRequirements wiring -------------------------------------------
+#
+# generate() now builds a RequestRequirements and calls the provider through
+# call_with_requirements (app/providers/manager.py) instead of generate_reply
+# directly. Every test above this section uses a plain FakeAIProvider and
+# already proves that's unaffected (call_with_requirements is a no-op for a
+# non-AIProviderManager provider); these tests cover the new behavior itself,
+# using a real AIProviderManager to observe what was actually built.
+
+
+def test_generate_routes_through_a_real_manager_and_tags_search_synthesis():
+    manager = AIProviderManager(
+        [AIProviderEntry(name="only", provider=FakeAIProvider(reply="answer"))]
+    )
+    generator = GeminiSearchAnswerGenerator(provider=manager)
+
+    generator.generate(make_response(results=[RESULT_A]))
+
+    decision = manager.last_routing_decision
+    assert decision is not None
+    assert decision.requirements.task_type is TaskType.SEARCH_SYNTHESIS
+    assert decision.requirements.search_synthesis is True
+    # A soft preference, never a hard gate (see app/providers/router.py) -
+    # the single registered provider is still eligible, never excluded.
+    assert decision.excluded == []
+
+
+def test_generate_long_context_flag_reflects_the_assembled_prompt_length():
+    manager = AIProviderManager(
+        [AIProviderEntry(name="only", provider=FakeAIProvider(reply="answer"))]
+    )
+    generator = GeminiSearchAnswerGenerator(provider=manager)
+    # A single huge result snippet pushes the assembled evidence prompt
+    # well past LONG_CONTEXT_CHAR_THRESHOLD - real execution context (the
+    # actual payload size), not a keyword match.
+    huge_result = SearchResult(
+        title="Big",
+        url="https://big.example",
+        snippet="x" * (LONG_CONTEXT_CHAR_THRESHOLD + 1),
+        source="searxng",
+        query="python",
+    )
+
+    generator.generate(make_response(results=[huge_result]))
+
+    assert manager.last_routing_decision.requirements.long_context is True
+
+
+def test_generate_short_response_is_not_flagged_long_context():
+    manager = AIProviderManager(
+        [AIProviderEntry(name="only", provider=FakeAIProvider(reply="answer"))]
+    )
+    generator = GeminiSearchAnswerGenerator(provider=manager)
+
+    generator.generate(make_response(results=[RESULT_A]))
+
+    assert manager.last_routing_decision.requirements.long_context is False
+
+
+def test_generate_stays_backward_compatible_with_a_plain_provider():
+    # Every test above this section already exercises this implicitly
+    # (they all use FakeAIProvider, never a manager) - this pins the
+    # contract explicitly: a plain AIProvider must never receive a
+    # `requirements` keyword argument it doesn't understand.
+    provider = FakeAIProvider(reply="a plain answer")
+    generator = GeminiSearchAnswerGenerator(provider=provider)
+
+    answer = generator.generate(make_response(results=[RESULT_A]))
+
+    assert answer.answer == "a plain answer"
+
+
+def test_generate_never_leaks_the_query_or_evidence_into_the_routing_decision():
+    manager = AIProviderManager(
+        [AIProviderEntry(name="only", provider=FakeAIProvider(reply="answer"))]
+    )
+    generator = GeminiSearchAnswerGenerator(provider=manager)
+    secret_query = "sk-super-secret-query-do-not-leak"
+
+    generator.generate(make_response(results=[RESULT_A], query=secret_query))
+
+    decision = manager.last_routing_decision
+    assert not hasattr(decision.requirements, "message")
+    assert not hasattr(decision.requirements, "query")
+    assert secret_query not in decision.reason
+    assert all(secret_query not in c.reason for c in decision.excluded)

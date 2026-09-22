@@ -18,7 +18,8 @@ from app.capability import (
 from app.core import ConversationNotFoundError, JarvisCore
 from app.memory.sqlite_store import SQLiteMemoryStore
 from app.providers.base import AIProvider, ProviderError
-from app.providers.gemini import GeminiProvider
+from app.providers.manager import AIProviderEntry, AIProviderManager
+from app.providers.requirements import TaskType
 from app.search.answer import (
     GeminiSearchAnswerGenerator,
     SearchAnswer,
@@ -62,8 +63,19 @@ def test_handle_chat_delegates_to_provider():
     assert sources == []
 
 
-def test_default_provider_is_gemini():
-    assert isinstance(JarvisCore().provider, GeminiProvider)
+def test_default_provider_is_the_ai_provider_manager():
+    """Since the AI Provider Manager integration, Core's own default
+    (when no provider is injected) is the ordered Gemini->Groq->
+    OpenRouter->Cloudflare fallback manager (app/providers/manager.py),
+    built from JARVIS_AI_PROVIDER_ORDER - not a bare GeminiProvider."""
+    provider = JarvisCore().provider
+    assert isinstance(provider, AIProviderManager)
+    assert [health.name for health in provider.get_health()] == [
+        "gemini",
+        "groq",
+        "openrouter",
+        "cloudflare",
+    ]
 
 
 def test_handle_chat_creates_new_conversation_when_none_given():
@@ -1218,3 +1230,136 @@ def test_search_behavior_is_unaffected_by_the_tool_decision_layer():
     reply, _, sources = jarvis.handle_chat("what's the latest news on AI?")
 
     assert reply == "grounded answer"
+
+
+# --- M14: wiring RequestRequirements into the real DIRECT/SEARCH/TOOL paths --
+#
+# ProviderRouter/AIProviderManager themselves are already covered in
+# tests/test_provider_router.py and tests/test_ai_provider_manager.py; these
+# tests only cover the NEW seam - that JarvisCore's DIRECT path and the
+# SEARCH path (via GeminiSearchAnswerGenerator, tested more thoroughly in
+# tests/test_search_answer.py) actually build a RequestRequirements from real
+# execution context and route through it, without breaking anything for a
+# plain (non-manager) AIProvider.
+
+
+def test_direct_path_routes_through_the_manager_and_records_a_decision():
+    manager = AIProviderManager([AIProviderEntry("only", FakeProvider("direct reply"))])
+    jarvis = JarvisCore(provider=manager, memory=SQLiteMemoryStore(":memory:"))
+
+    reply, _, _ = jarvis.handle_chat("hello there")
+
+    assert reply == "direct reply"
+    assert manager.last_routing_decision is not None
+    assert manager.last_routing_decision.requirements.task_type is TaskType.GENERAL
+
+
+def test_direct_path_classifies_coding_task_type_from_the_message():
+    manager = AIProviderManager([AIProviderEntry("only", FakeProvider("ok"))])
+    jarvis = JarvisCore(provider=manager, memory=SQLiteMemoryStore(":memory:"))
+
+    jarvis.handle_chat("can you help me debug this function")
+
+    assert manager.last_routing_decision.requirements.task_type is TaskType.CODING
+
+
+def test_direct_path_long_context_flag_reflects_the_assembled_prompt_length():
+    manager = AIProviderManager([AIProviderEntry("only", FakeProvider("ok"))])
+    jarvis = JarvisCore(provider=manager, memory=SQLiteMemoryStore(":memory:"))
+    # Pushes the assembled prompt (facts + history + message) well past
+    # LONG_CONTEXT_CHAR_THRESHOLD - this is real execution context (the
+    # actual payload size), not a keyword match.
+    jarvis.save_memory("bio", "x" * 7000)
+
+    jarvis.handle_chat("hi")
+
+    assert manager.last_routing_decision.requirements.long_context is True
+
+
+def test_direct_path_short_message_is_not_flagged_long_context():
+    manager = AIProviderManager([AIProviderEntry("only", FakeProvider("ok"))])
+    jarvis = JarvisCore(provider=manager, memory=SQLiteMemoryStore(":memory:"))
+
+    jarvis.handle_chat("hi")
+
+    assert manager.last_routing_decision.requirements.long_context is False
+
+
+def test_direct_path_stays_backward_compatible_with_a_plain_provider():
+    # A plain (non-manager) AIProvider - every pre-M14 injection pattern,
+    # and every other test fake in this suite - must keep working exactly
+    # as before, with no TypeError from an unexpected `requirements`
+    # keyword argument reaching a provider that never asked for one.
+    jarvis, provider = make_core("hi there")
+
+    reply, _, _ = jarvis.handle_chat("hello")
+
+    assert reply == "hi there"
+    assert provider.last_message == "hello"
+
+
+def test_tool_path_never_builds_or_routes_requirements():
+    manager = AIProviderManager([AIProviderEntry("only", FakeProvider("unused"))])
+    call_provider = FakeToolCallProviderForCore(
+        tool_call=ToolCall(tool_name="echo", parameters={"message": "hi"})
+    )
+    registry = ToolRegistry()
+    registry.register(MessageEchoTool())
+    jarvis = JarvisCore(
+        provider=manager,
+        memory=SQLiteMemoryStore(":memory:"),
+        tools=registry,
+        capability_router=FakeCapabilityRouter(Capability.TOOL),
+        tool_call_builder=ToolCallBuilder(call_provider),
+    )
+
+    reply, _, _ = jarvis.handle_chat("say hi with echo")
+
+    assert reply == "hi"
+    assert call_provider.call_count == 1
+    # TOOL never reaches self.provider at all (see app/core.py's module
+    # docstring) - no routing decision is ever recorded on the manager.
+    assert manager.last_routing_decision is None
+
+
+def test_search_path_routes_through_the_manager_via_gemini_search_answer_generator():
+    manager = AIProviderManager(
+        [
+            AIProviderEntry(
+                "only",
+                FakeProvider("Grounded answer. See https://python.org for details."),
+            )
+        ]
+    )
+    tools = ToolRegistry()
+    tools.register(
+        WebSearchTool(
+            provider=FakeSearchProvider(
+                results=[
+                    SearchResult(
+                        title="Python.org",
+                        url="https://python.org",
+                        snippet="Official Python site",
+                        source="searxng",
+                        query="latest news on AI",
+                    )
+                ]
+            )
+        )
+    )
+    jarvis = JarvisCore(
+        provider=manager,
+        memory=SQLiteMemoryStore(":memory:"),
+        tools=tools,
+        answer_generator=GeminiSearchAnswerGenerator(provider=manager),
+    )
+
+    reply, _, sources = jarvis.handle_chat("what's the latest news on AI?")
+
+    assert "python.org" in reply
+    assert manager.last_routing_decision is not None
+    assert manager.last_routing_decision.requirements.search_synthesis is True
+    assert manager.last_routing_decision.requirements.task_type is TaskType.SEARCH_SYNTHESIS
+    # SEARCH_SYNTHESIS is a soft preference (see app/providers/router.py) -
+    # the single registered provider is still eligible, never excluded.
+    assert manager.last_routing_decision.excluded == []

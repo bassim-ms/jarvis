@@ -31,6 +31,12 @@ docstring) and that reordering is used as `order` instead. Every retry/
 cooldown/classification/fallback/health-tracking line below this point is
 completely unmodified by M13 - routing only ever changes which entry is
 tried in which position, never what happens once an entry is tried.
+
+Since M14, JarvisCore's DIRECT path and GeminiSearchAnswerGenerator's
+SEARCH path (app/core.py, app/search/answer.py) build a RequestRequirements
+per request and call this manager through call_with_requirements() below,
+rather than calling generate_reply() directly - see that function's own
+docstring for why.
 """
 
 import re
@@ -293,3 +299,25 @@ class AIProviderManager(AIProvider):
                 raise UnexpectedProviderError(
                     f"unexpected {type(exc).__name__} (not a ProviderError)"
                 ) from None
+
+
+def call_with_requirements(
+    provider: AIProvider, message: str, requirements: RequestRequirements
+) -> str:
+    """Call `provider.generate_reply`, passing `requirements` only if
+    `provider` actually understands it - today, only AIProviderManager
+    does (see its own generate_reply above). Every other AIProvider
+    implementation (GeminiProvider, GroqProvider, a test fake, a directly-
+    injected single provider, ...) is called exactly as it always has
+    been, with no new keyword argument at all - so any caller that
+    injects a plain AIProvider (JarvisCore's own constructor,
+    GeminiSearchAnswerGenerator's own default, every existing AIProvider
+    fake in this test suite) remains completely unaffected by M14's
+    routing integration.
+
+    This is the one seam JarvisCore's DIRECT path and
+    GeminiSearchAnswerGenerator's SEARCH path use instead of each
+    duplicating an isinstance check."""
+    if isinstance(provider, AIProviderManager):
+        return provider.generate_reply(message, requirements=requirements)
+    return provider.generate_reply(message)
