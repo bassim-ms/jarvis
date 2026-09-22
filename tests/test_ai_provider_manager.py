@@ -16,6 +16,7 @@ from app.providers.manager import (
     UnexpectedProviderError,
     classify_error,
 )
+from app.providers.requirements import LatencyPreference, RequestRequirements
 
 
 class FakeProvider(AIProvider):
@@ -533,3 +534,96 @@ def test_keyboard_interrupt_is_not_caught_by_the_manager():
 
     with pytest.raises(KeyboardInterrupt):
         manager.generate_reply("hi")
+
+
+# --- M13 hybrid routing integration -------------------------------------------
+#
+# ProviderRouter itself is tested in isolation in tests/test_provider_router.py
+# (eligibility, scoring, tie-breaking, the decision record). These tests only
+# cover the seam in AIProviderManager.generate_reply: that `requirements=None`
+# (the default, and every test above this section) is completely unaffected,
+# and that once routing picks an order, M12's own retry/cooldown/fallback loop
+# still runs exactly as it always has over that order.
+
+
+def test_generate_reply_without_requirements_is_unaffected_by_m13():
+    first = FakeProvider(reply="from first")
+    second = FakeProvider(reply="from second")
+    manager = AIProviderManager([entry("first", first), entry("second", second)])
+
+    reply = manager.generate_reply("hi")
+
+    assert reply == "from first"
+    assert manager.last_routing_decision is None
+
+
+def test_routing_selects_groq_then_m12_falls_back_after_groq_fails():
+    # Mirrors the M13 design's own example: router prefers groq (latency
+    # preference) even though it's not first in configured order, groq
+    # fails, and M12's existing fallback loop moves on to the next
+    # eligible provider in the router's order (openrouter beats gemini on
+    # the deterministic tie-break: both score 0, openrouter is earlier in
+    # configured order).
+    openrouter = FakeProvider(reply="from openrouter")
+    groq = FakeProvider(errors=[ProviderError("Groq returned 500: down")])
+    gemini = FakeProvider(reply="from gemini")
+    manager = AIProviderManager(
+        [entry("openrouter", openrouter), entry("groq", groq), entry("gemini", gemini)],
+        retry_count=0,
+        sleep=no_sleep,
+    )
+    requirements = RequestRequirements(latency_preference=LatencyPreference.LOW)
+
+    reply = manager.generate_reply("hi", requirements=requirements)
+
+    assert reply == "from openrouter"
+    assert groq.calls == 1
+    assert gemini.calls == 0  # never reached - openrouter answered right after groq failed
+    assert manager.last_routing_decision.selected == "groq"
+    assert manager.last_routing_decision.ordered_names == ["groq", "openrouter", "gemini"]
+
+
+def test_routing_with_unsatisfiable_hard_requirement_degrades_to_configured_order():
+    first = FakeProvider(reply="from first")
+    second = FakeProvider(reply="from second")
+    manager = AIProviderManager([entry("first", first), entry("second", second)])
+    # Neither fake provider is a registered capability name, so
+    # structured_output can never be satisfied - routing must still fall
+    # back to the manager's own configured order rather than blocking.
+    requirements = RequestRequirements(structured_output=True)
+
+    reply = manager.generate_reply("hi", requirements=requirements)
+
+    assert reply == "from first"
+    assert manager.last_routing_decision.eligible == []
+    assert manager.last_routing_decision.ordered_names == ["first", "second"]
+
+
+def test_last_routing_decision_does_not_leak_into_a_later_unrouted_call():
+    """A routed call's decision must never remain visible after a later
+    call that doesn't route - otherwise a caller inspecting
+    last_routing_decision after an ordinary (unrouted) request would see
+    stale information from a completely different, earlier request."""
+    first = FakeProvider(reply="from first")
+    manager = AIProviderManager([entry("first", first)])
+
+    manager.generate_reply("hi", requirements=RequestRequirements())
+    assert manager.last_routing_decision is not None
+
+    manager.generate_reply("hi")  # no requirements this time
+
+    assert manager.last_routing_decision is None
+
+
+def test_last_routing_decision_contains_no_secrets():
+    first = FakeProvider(errors=[ProviderError("Gemini returned 401: sk-super-secret")])
+    second = FakeProvider(reply="from second")
+    manager = AIProviderManager(
+        [entry("first", first), entry("second", second)], sleep=no_sleep
+    )
+
+    manager.generate_reply("hi", requirements=RequestRequirements())
+
+    decision = manager.last_routing_decision
+    assert "sk-super-secret" not in decision.reason
+    assert all("sk-super-secret" not in c.reason for c in decision.excluded)

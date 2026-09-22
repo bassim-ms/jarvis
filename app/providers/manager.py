@@ -19,6 +19,18 @@ already produce (e.g. "Gemini returned 503: ...", "JARVIS_GROQ_API_KEY is
 not set.") rather than adding a status_code field to ProviderError - keeps
 every existing adapter untouched. See classify_error() below for exactly
 which substrings map to which category.
+
+Since M13, generate_reply() also accepts an optional `requirements`
+keyword argument (RequestRequirements, see app/providers/requirements.py).
+When it's omitted - every call site before M13, and still the overwhelming
+majority today - behavior is byte-for-byte unchanged: `order` is simply
+`self.entries` in its configured order, exactly as before M13 existed.
+When it's given, ProviderRouter (app/providers/router.py) computes a
+reordering of the SAME entries (never fewer, never more - see its module
+docstring) and that reordering is used as `order` instead. Every retry/
+cooldown/classification/fallback/health-tracking line below this point is
+completely unmodified by M13 - routing only ever changes which entry is
+tried in which position, never what happens once an entry is tried.
 """
 
 import re
@@ -28,6 +40,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from app.providers.base import AIProvider, ProviderError
+from app.providers.requirements import RequestRequirements
+from app.providers.router import ProviderRouter, RoutingDecision
 
 _STATUS_RE = re.compile(r"returned (\d{3}):")
 
@@ -172,6 +186,11 @@ class AIProviderManager(AIProvider):
         self.cooldown_seconds = cooldown_seconds
         self._clock = clock
         self._sleep = sleep
+        # M13: set on every generate_reply() call made WITH `requirements`;
+        # left None otherwise. Purely observational (debugging/tests) -
+        # never read by any logic in this class. Never holds a key/token/
+        # header/URL or the request's own message text (see RoutingDecision).
+        self.last_routing_decision: RoutingDecision | None = None
 
     def get_health(self) -> list[ProviderHealth]:
         """Current health snapshot for every registered provider, in
@@ -188,10 +207,24 @@ class AIProviderManager(AIProvider):
                 return entry
         raise KeyError(f"No provider registered under '{name}'.")
 
-    def generate_reply(self, message: str) -> str:
+    def generate_reply(
+        self, message: str, *, requirements: RequestRequirements | None = None
+    ) -> str:
+        if requirements is None:
+            # No stale decision from a previous routed call should ever
+            # remain visible once a caller makes an unrouted request.
+            self.last_routing_decision = None
+            order = self.entries
+        else:
+            decision = ProviderRouter().route(
+                requirements, self.entries, now=self._clock()
+            )
+            self.last_routing_decision = decision
+            order = [self._entry(name) for name in decision.ordered_names]
+
         errors: list[str] = []
 
-        for entry in self.entries:
+        for entry in order:
             health = entry.health
 
             if not health.enabled:
@@ -207,11 +240,17 @@ class AIProviderManager(AIProvider):
             try:
                 reply = self._call_with_retries(entry, message)
             except ProviderError as exc:
+                # Manual-testing visibility only (M12 integration test prep):
+                # which provider was tried and why it fell back, on the
+                # server's own console - never a key/URL/prompt, since exc
+                # is the same secret-safe message already used above.
+                print(f"[ai-provider-manager] {entry.name} failed, falling back: {exc}")
                 errors.append(f"{entry.name}: {exc}")
                 continue
 
             health.consecutive_failures = 0
             health.healthy = True
+            print(f"[ai-provider-manager] answered by: {entry.name}")
             return reply
 
         raise AllProvidersFailedError(
