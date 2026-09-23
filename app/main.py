@@ -11,8 +11,14 @@ AutomationEngine that polls persisted automations and runs their
 already-permission-checked tool actions when due. Since M9, it also
 wires up Google Calendar (OAuth-authorized separately via
 `python -m app.calendar.authorize`) and local Rhasspy Tasks - neither
-needs a background process of its own. No dashboard, agents, voice, or
-hardware control yet - those come in later milestones.
+needs a background process of its own. Since M15, it also starts a
+background JobEngine that plans and executes goal-driven Jobs (see
+app/orchestration/) - a TASK-capability chat message just creates a
+PENDING Job and returns immediately; JobEngine does the actual planning/
+execution on its own thread, the same way AutomationEngine/
+ReminderScheduler already do their own background work. No dashboard,
+browser/computer control, or hardware control yet - those come in later
+milestones.
 """
 
 from contextlib import asynccontextmanager
@@ -24,6 +30,7 @@ from app.automation.factory import create_default_automation_store
 from app.calendar.factory import create_default_calendar_provider
 from app.config import settings
 from app.core import ConversationNotFoundError, core
+from app.orchestration.factory import create_default_job_engine, create_default_job_store
 from app.providers.base import ProviderError
 from app.reminders.factory import create_default_reminder_store, create_default_scheduler
 from app.tasks.factory import create_default_task_store
@@ -45,6 +52,7 @@ _reminder_store = create_default_reminder_store(settings.reminders_db_path)
 _automation_store = create_default_automation_store(settings.automations_db_path)
 _calendar_provider = create_default_calendar_provider()
 _task_store = create_default_task_store(settings.tasks_db_path)
+_job_store = create_default_job_store(settings.orchestration_db_path)
 automation_engine = register_default_tools(
     core.tools,
     reminder_store=_reminder_store,
@@ -52,10 +60,34 @@ automation_engine = register_default_tools(
     memory=core.memory,
     calendar_provider=_calendar_provider,
     task_store=_task_store,
+    job_store=_job_store,
 )
 
 reminder_scheduler = create_default_scheduler(
     _reminder_store, settings.reminder_poll_interval_seconds
+)
+
+# JobEngine (M15) isn't built by register_default_tools itself (see that
+# function's own docstring) - built here the same way ReminderScheduler
+# is, against the exact same `_job_store`/`core.tools` the create_job/
+# confirm_job/... tools above already operate on, so the background
+# planner/executor and a user's tool calls always see the same
+# persisted Jobs.
+# `context_provider=core.memory.get_facts` refreshes a Job's context
+# immediately before every planning/replanning call (see
+# JobEngine._refresh_context) - the same fact source CreateJobTool's own
+# `context_provider` already snapshots at creation time, so a Job never
+# relies solely on that one-time snapshot going stale.
+job_engine = create_default_job_engine(
+    _job_store,
+    core.tools,
+    max_steps=settings.orchestration_max_steps,
+    max_total_steps=settings.orchestration_max_total_steps,
+    max_retries_per_step=settings.orchestration_max_retries_per_step,
+    max_replans=settings.orchestration_max_replans,
+    retry_delay_seconds=settings.orchestration_retry_delay_seconds,
+    poll_interval_seconds=settings.orchestration_poll_interval_seconds,
+    context_provider=core.memory.get_facts,
 )
 
 
@@ -63,7 +95,9 @@ reminder_scheduler = create_default_scheduler(
 async def _lifespan(app: FastAPI):
     reminder_scheduler.start()
     automation_engine.start()
+    job_engine.start()
     yield
+    job_engine.stop()
     automation_engine.stop()
     reminder_scheduler.stop()
 
@@ -100,6 +134,11 @@ class ChatResponse(BaseModel):
     reply: str
     conversation_id: str
     sources: list[ChatSource] = []
+    #: The id of the Job `handle_chat_with_job_id` just created (M15), or
+    #: `None` for every capability except TASK - a real structured field
+    #: instead of a client having to parse the reply's prose for it (see
+    #: JarvisCore.handle_chat_with_job_id's own docstring).
+    job_id: str | None = None
 
 
 @app.post("/chat", response_model=ChatResponse)
@@ -110,7 +149,7 @@ def chat(request: ChatRequest) -> ChatResponse:
     conversation_id from a previous response to continue it with history.
     """
     try:
-        reply, conversation_id, sources = core.handle_chat(
+        reply, conversation_id, sources, job_id = core.handle_chat_with_job_id(
             request.message, request.conversation_id
         )
     except ConversationNotFoundError as exc:
@@ -123,4 +162,5 @@ def chat(request: ChatRequest) -> ChatResponse:
         sources=[
             ChatSource(title=s.title, url=s.url, query=s.query) for s in sources
         ],
+        job_id=job_id,
     )

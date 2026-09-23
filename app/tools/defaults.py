@@ -33,6 +33,17 @@ from app.calendar.tools import (
 from app.config import settings
 from app.memory.base import MemoryStore
 from app.memory.sqlite_store import SQLiteMemoryStore
+from app.orchestration.base import JobStore
+from app.orchestration.factory import create_default_job_store
+from app.orchestration.tools import (
+    CancelJobTool,
+    ConfirmJobTool,
+    CreateJobTool,
+    GetJobTool,
+    ListJobsTool,
+    PauseJobTool,
+    ResumeJobTool,
+)
 from app.reminders.base import ReminderStore
 from app.reminders.factory import create_default_reminder_store
 from app.reminders.tools import (
@@ -61,6 +72,7 @@ def register_default_tools(
     memory: MemoryStore | None = None,
     calendar_provider: CalendarProvider | None = None,
     task_store: TaskStore | None = None,
+    job_store: JobStore | None = None,
 ) -> AutomationEngine:
     """Register every tool Rhasspy ships with by default onto `registry`,
     and return the AutomationEngine built alongside the automation tools
@@ -109,6 +121,17 @@ def register_default_tools(
     never run the three calendar write tools unattended, with no changes
     needed here or in app/automation/*. Task tools are all READ/
     SAFE_ACTION, same as the reminder tools.
+
+    `job_store` (M15) follows the same default-unless-given pattern.
+    `CreateJobTool` is given `memory.get_facts` as its `context_provider`,
+    so a Job's planner sees the same stored user facts JarvisCore's own
+    DIRECT prompts and AutomationEngine's conditions already do - this
+    function does NOT build/register a JobEngine itself (unlike
+    AutomationEngine above): starting/stopping one is the caller's job,
+    via app/orchestration/factory.py:create_default_job_engine, exactly
+    like ReminderScheduler is built and started separately from this
+    function (see app/main.py) - keeping this function's own return type
+    (AutomationEngine) unchanged for full backward compatibility.
     """
     provider = ResultQualityProvider(
         CachedSearchProvider(
@@ -158,6 +181,15 @@ def register_default_tools(
     registry.register(ListTasksTool(store=task_store))
     registry.register(CompleteTaskTool(store=task_store))
     registry.register(CancelTaskTool(store=task_store))
+
+    job_store = job_store or create_default_job_store(settings.orchestration_db_path)
+    registry.register(CreateJobTool(store=job_store, context_provider=memory.get_facts))
+    registry.register(ListJobsTool(store=job_store))
+    registry.register(GetJobTool(store=job_store))
+    registry.register(ConfirmJobTool(store=job_store))
+    registry.register(PauseJobTool(store=job_store))
+    registry.register(ResumeJobTool(store=job_store))
+    registry.register(CancelJobTool(store=job_store))
 
     return engine
 

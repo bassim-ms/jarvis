@@ -9,10 +9,17 @@ ROBOTIC_ARM, ...) later - lives here, not in JarvisCore. JarvisCore
 CapabilityDecision and dispatches on it, never encoding routing rules
 itself.
 
-Only DIRECT, SEARCH, and TOOL are implemented - no other Capability member
-is added "for the future"; see the README's Postponed decisions for why.
-Adding a real future capability means adding an enum member plus whatever
-decision logic picks it, without touching JarvisCore's dispatch mechanics.
+DIRECT, SEARCH, TOOL, and (M15) TASK are implemented - no other
+Capability member is added "for the future"; see the README's Postponed
+decisions for why. Adding a real future capability means adding an enum
+member plus whatever decision logic picks it, without touching
+JarvisCore's dispatch mechanics - TASK (M15) is exactly that: a new
+member plus a new narrow, deterministic detector in
+DeterministicCapabilityRouter, dispatched by JarvisCore._handle_task
+(app/core.py) to the existing ToolRegistry's `create_job` tool
+(app/orchestration/tools.py) - JarvisCore itself never gains any
+orchestration-specific logic beyond that one dispatch line, the same
+"Core only orchestrates" discipline TOOL already established.
 
 DeterministicCapabilityRouter generalizes M6.9's SearchRouter
 (app/search/router.py) into this layer by delegating to it for DIRECT vs
@@ -49,15 +56,39 @@ from app.search.router import SearchDecision, SearchRouter
 class Capability(Enum):
     """A handler Rhasspy can dispatch a message to.
 
-    Only DIRECT, SEARCH, and TOOL exist today. MEMORY/EMAIL/CALENDAR/
-    PRINTER/ROBOTIC_ARM/etc. are deliberately not added as members until a
-    milestone actually implements the decision logic for them - an unused
-    enum value isn't "future-facing architecture," just dead code.
+    DIRECT, SEARCH, TOOL, and TASK were the M15 set; TASK_STATUS and
+    CONFIRMATION were added right after, to close two gaps the initial
+    TASK pass left open: a Job's outcome was only ever retrievable
+    through explicit tool-invocation syntax, and a Job's own confirmation
+    request had no path back from a natural reply like "yes"/"send it".
+    MEMORY/EMAIL/CALENDAR/PRINTER/ROBOTIC_ARM/etc. are still deliberately
+    not added as members until a milestone actually implements the
+    decision logic for them - an unused enum value isn't "future-facing
+    architecture," just dead code.
     """
 
     DIRECT = "direct"
     SEARCH = "search"
     TOOL = "tool"
+    #: M15: an open-ended, possibly multi-step goal, handled by starting
+    #: a persistent, AI-planned Job (app/orchestration/) rather than
+    #: answering/searching/calling one tool synchronously - see
+    #: JarvisCore._handle_task.
+    TASK = "task"
+    #: A natural-language question about a Job's progress/outcome -
+    #: "what's the status of my task?", "is that finished?", "what are
+    #: you doing?", "show me my running tasks" - resolved against the
+    #: existing list_jobs tool, scoped to the current conversation where
+    #: possible. See JarvisCore._handle_task_status.
+    TASK_STATUS = "task_status"
+    #: A short affirmative/negative reply ("yes", "send it", "go ahead",
+    #: "no", "cancel that") that MIGHT be answering a Job's pending
+    #: confirmation request. Deliberately resolved, not assumed, by
+    #: JarvisCore._handle_confirmation: if nothing is actually awaiting
+    #: confirmation right now, Core falls back to ordinary DIRECT
+    #: handling - this capability is a hint the message COULD be a
+    #: confirmation reply, never a guarantee that it is one.
+    CONFIRMATION = "confirmation"
 
 
 @dataclass
@@ -78,10 +109,23 @@ class CapabilityDecision:
     represent "TOOL, but nothing to dispatch to" rather than guessing a
     tool or silently falling back to DIRECT. It's also `None`, and simply
     unused, for DIRECT/SEARCH decisions.
+
+    `goal` (M15) is used only when `capability` is `TASK`: the goal text
+    JarvisCore._handle_task passes to `create_job` - the explicit-
+    invocation phrasing's captured text ("create a goal: <goal>"), or the
+    raw message itself when TASK was detected from its own wording alone
+    (e.g. "Prepare everything for tomorrow's meeting" - the whole message
+    IS the goal). `None` and unused for every other capability.
+
+    `approve` is used only when `capability` is `CONFIRMATION`: `True` for
+    an affirmative reply ("yes", "send it", "go ahead"), `False` for a
+    negative one ("no", "cancel that"). `None` and unused otherwise.
     """
 
     capability: Capability
     tool_name: str | None = None
+    goal: str | None = None
+    approve: bool | None = None
 
 
 class CapabilityRouter(ABC):
@@ -133,9 +177,93 @@ _TOOL_MENTION_PATTERN = re.compile(
 )
 
 
+#: M15: the explicit, unambiguous TASK invocation - "create/start/begin a
+#: goal/job/task: <goal text>" - the same "an explicit command-like phrase
+#: is the entire extent of understanding, no fuzzy matching" discipline
+#: _TOOL_INVOCATION_PATTERN already uses for TOOL. Takes priority even
+#: over the goal-verb heuristic below, since it's unambiguous.
+_TASK_INVOCATION_PATTERN = re.compile(
+    r"^\s*(?:create|start|begin)\s+(?:a\s+)?(?:goal|job|task)\s*:\s*(.+)$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+#: M15: a small, fixed, documented goal-verb list for the natural-language
+#: goal phrasing this milestone's own examples use ("Prepare everything I
+#: need for tomorrow's robotics meeting," "Organize my Downloads folder,"
+#: "Research robotics competitions and prepare a shortlist") - an
+#: accepted, deliberate trade-off, the same kind SearchRouter's own
+#: keyword list and requirements.py's _CODING_KEYWORDS/_REASONING_KEYWORDS
+#: already are: it catches the milestone's stated examples without
+#: attempting general goal/intent NLP, and never fires on a question (a
+#: "?" anywhere in the message defers to the existing DIRECT/SEARCH
+#: delegation instead - "prepare? what do you mean?" should never become
+#: a Job). Checked only at the START of the message, exactly like
+#: _TOOL_INVOCATION_PATTERN, so a message that merely mentions one of
+#: these words later ("let's discuss how to prepare for finals") is
+#: unaffected.
+_TASK_GOAL_VERB_PATTERN = re.compile(
+    r"^\s*(?:prepare|organize|research|plan|arrange|set\s+up|put\s+together)\b",
+    re.IGNORECASE,
+)
+
+#: A short affirmative/negative reply, anchored to the WHOLE message (not
+#: merely present somewhere in it) - the same "explicit, closed, narrow
+#: signal" discipline every other deterministic pattern in this file
+#: uses. Matching the whole message rather than a substring keeps this
+#: from ever misfiring on an ordinary sentence that happens to contain
+#: "yes"/"no" ("yes, and also tell me about Rome" stays DIRECT - only a
+#: message that IS essentially just the reply, plus optional trailing
+#: punctuation, counts). This alone does NOT mean a confirmation is
+#: actually pending - JarvisCore._handle_confirmation checks real Job
+#: state and falls back to ordinary DIRECT handling when nothing is
+#: awaiting confirmation, so an unrelated "yes"/"ok" in normal
+#: conversation behaves exactly as it always has whenever there's
+#: nothing to confirm.
+_CONFIRMATION_YES_PATTERN = re.compile(
+    r"^\s*(?:yes|yep|yeah|yup|sure|ok(?:ay)?|confirm(?:ed)?|approve[ds]?|"
+    r"go\s*ahead|send\s+it|do\s+it|proceed)[\.!]*\s*$",
+    re.IGNORECASE,
+)
+_CONFIRMATION_NO_PATTERN = re.compile(
+    r"^\s*(?:no|nope|nah|don'?t(?:\s+do\s+that)?|cancel(?:\s+that)?|"
+    r"decline[d]?|stop)[\.!]*\s*$",
+    re.IGNORECASE,
+)
+
+#: A natural-language question about a Job's status/progress - a small,
+#: fixed set of phrasings matching this project's own worked examples
+#: ("what's the status of my task?", "what are you doing?", "is that
+#: finished?", "show me my running tasks"), same discipline as every
+#: other pattern here. Deliberately does NOT match a bare "my tasks" -
+#: that phrase alone is genuinely ambiguous with app.tasks (Rhasspy
+#: Tasks, M9's unrelated simple todo list) and is left to existing
+#: DIRECT/SEARCH/TOOL handling; every pattern below instead requires a
+#: word implying an in-progress GOAL specifically ("status," "doing,"
+#: "finished/done," "running") that a plain todo item has no concept of.
+_TASK_STATUS_PATTERNS = (
+    re.compile(r"\bstatus\s+of\s+(?:my|the)\s+(?:task|job|goal)\b", re.IGNORECASE),
+    re.compile(r"\bwhat'?s?\s+(?:is\s+)?(?:the\s+)?status\b", re.IGNORECASE),
+    re.compile(r"\bwhat\s+are\s+you\s+(?:currently\s+)?doing\b", re.IGNORECASE),
+    re.compile(r"\bis\s+(?:that|it)\s+(?:finished|done|complete)\b", re.IGNORECASE),
+    re.compile(r"\bis\s+(?:my|the)\s+task\s+(?:finished|done|complete)\b", re.IGNORECASE),
+    re.compile(r"\bare\s+you\s+(?:done|finished)\b", re.IGNORECASE),
+    # "running"/"active"/"in-progress" is deliberately REQUIRED here (not
+    # optional) - "show me my tasks" alone, with no such qualifier, is
+    # left unmatched precisely because it's genuinely ambiguous with
+    # app.tasks' own (currently NL-inert, tool-invocation-only) simple
+    # todo list - see this constant's own module-level comment above.
+    re.compile(
+        r"\b(?:show|list)\s+me\s+my\s+(?:running|active|in[- ]progress)\s+tasks\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\bmy\s+(?:running|active|in[- ]progress)\s+tasks\b", re.IGNORECASE),
+)
+
+
 class DeterministicCapabilityRouter(CapabilityRouter):
-    """The only capability decision maker for now: TOOL, then DIRECT vs
-    SEARCH, all without any Gemini/LLM call.
+    """The only capability decision maker for now: TOOL, then CONFIRMATION,
+    then TASK_STATUS, then TASK, then DIRECT vs SEARCH, all without any
+    Gemini/LLM call.
 
     TOOL is checked first, via two narrow explicit-invocation phrasings -
     `_TOOL_INVOCATION_PATTERN` ("use tool echo") and `_TOOL_MENTION_PATTERN`
@@ -148,9 +276,36 @@ class DeterministicCapabilityRouter(CapabilityRouter):
     JarvisCore._handle_tool - see app/core.py) and neither executes
     anything.
 
-    Everything that doesn't match either TOOL pattern is delegated to an
-    injected SearchRouter (defaulting to a bare SearchRouter()) for the
-    actual DIRECT/SEARCH keyword/pattern matching, exactly as in M6.13.
+    CONFIRMATION is checked next: `_CONFIRMATION_YES_PATTERN`/
+    `_CONFIRMATION_NO_PATTERN` match a short affirmative/negative reply
+    anchored to the WHOLE message. This is only ever a HINT the message
+    might be answering a pending confirmation - JarvisCore._handle_
+    confirmation checks whether anything is actually awaiting
+    confirmation and falls back to ordinary DIRECT handling if not, so a
+    stray "yes"/"ok" with nothing pending behaves exactly as before.
+    Checked before TASK_STATUS/TASK since neither of those patterns can
+    match a bare "yes" anyway, but placed early for clarity of intent.
+
+    TASK_STATUS is checked next: `_TASK_STATUS_PATTERNS` match a small
+    fixed set of natural-language status questions ("what's the status of
+    my task?", "is that finished?", "what are you doing?", "show me my
+    running tasks") - resolved by JarvisCore._handle_task_status against
+    the real list_jobs data, never guessed here.
+
+    TASK is checked next (M15), via `_TASK_INVOCATION_PATTERN` (the same
+    kind of explicit "create a goal: ..." phrasing as TOOL's) or
+    `_TASK_GOAL_VERB_PATTERN` (a small fixed goal-verb list matching this
+    milestone's own examples - "prepare," "organize," "research," etc. -
+    at the very start of the message, skipped entirely if the message
+    contains "?" so a genuine question is never misrouted). Checked after
+    TOOL (so "use tool prepare_report" still means TOOL, not TASK) but
+    before SEARCH/DIRECT, since a goal-verb message would otherwise often
+    also match SearchRouter's own keyword patterns.
+
+    Everything that doesn't match a TOOL, CONFIRMATION, TASK_STATUS, or
+    TASK pattern is delegated to an injected SearchRouter (defaulting to
+    a bare SearchRouter()) for the actual DIRECT/SEARCH keyword/pattern
+    matching, exactly as in M6.13.
 
     Injecting a `search_router` here is how JarvisCore keeps its existing
     `router`/`SearchRouter` constructor parameter meaningful (see
@@ -170,6 +325,22 @@ class DeterministicCapabilityRouter(CapabilityRouter):
             return CapabilityDecision(
                 capability=Capability.TOOL, tool_name=tool_match.group(1)
             )
+
+        if _CONFIRMATION_YES_PATTERN.match(message):
+            return CapabilityDecision(capability=Capability.CONFIRMATION, approve=True)
+        if _CONFIRMATION_NO_PATTERN.match(message):
+            return CapabilityDecision(capability=Capability.CONFIRMATION, approve=False)
+
+        if any(pattern.search(message) for pattern in _TASK_STATUS_PATTERNS):
+            return CapabilityDecision(capability=Capability.TASK_STATUS)
+
+        task_invocation_match = _TASK_INVOCATION_PATTERN.match(message)
+        if task_invocation_match:
+            return CapabilityDecision(
+                capability=Capability.TASK, goal=task_invocation_match.group(1).strip()
+            )
+        if "?" not in message and _TASK_GOAL_VERB_PATTERN.match(message):
+            return CapabilityDecision(capability=Capability.TASK, goal=message.strip())
 
         decision = self.search_router.route(message)
         capability = (

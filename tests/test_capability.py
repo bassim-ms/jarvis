@@ -27,11 +27,19 @@ from app.search.router import SearchDecision, SearchRouter
 # --- Capability representation ------------------------------------------------
 
 
-def test_capability_only_has_direct_search_and_tool():
-    """M6.13/M6.14 implement exactly DIRECT, SEARCH, and TOOL - no other
-    future capability (MEMORY/EMAIL/CALENDAR/PRINTER/ROBOTIC_ARM/...) is
-    added as an unused enum member."""
-    assert {member.name for member in Capability} == {"DIRECT", "SEARCH", "TOOL"}
+def test_capability_only_has_the_implemented_set():
+    """M6.13/M6.14 implement DIRECT, SEARCH, and TOOL; M15 adds TASK,
+    TASK_STATUS, and CONFIRMATION - no other future capability (MEMORY/
+    EMAIL/CALENDAR/PRINTER/ROBOTIC_ARM/...) is added as an unused enum
+    member."""
+    assert {member.name for member in Capability} == {
+        "DIRECT",
+        "SEARCH",
+        "TOOL",
+        "TASK",
+        "TASK_STATUS",
+        "CONFIRMATION",
+    }
 
 
 def test_capability_decision_holds_the_selected_capability():
@@ -779,3 +787,184 @@ def test_default_provider_is_gemini_provider():
 
 def test_gemini_capability_decision_provider_is_a_capability_decision_provider():
     assert isinstance(GeminiCapabilityDecisionProvider(), CapabilityDecisionProvider)
+
+
+# --- TASK detection (M15) -------------------------------------------------
+
+
+def test_explicit_task_invocation_is_task_with_captured_goal():
+    router = DeterministicCapabilityRouter()
+
+    decision = router.route("create a goal: prepare everything for tomorrow's meeting")
+
+    assert decision.capability is Capability.TASK
+    assert decision.goal == "prepare everything for tomorrow's meeting"
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "create a task: organize my downloads",
+        "create task: organize my downloads",
+        "start a job: organize my downloads",
+        "start job: organize my downloads",
+        "begin a goal: organize my downloads",
+    ]
+)
+def test_explicit_task_invocation_accepts_goal_job_and_task_wording(phrase):
+    router = DeterministicCapabilityRouter()
+
+    decision = router.route(phrase)
+
+    assert decision.capability is Capability.TASK
+    assert decision.goal == "organize my downloads"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Prepare everything I need for tomorrow's robotics meeting.",
+        "Organize my Downloads folder.",
+        "Research robotics competitions and prepare a shortlist.",
+        "Plan a birthday party for next week.",
+        "Arrange a call with the team.",
+        "Set up a new project folder structure.",
+        "Put together a summary of this quarter's sales.",
+    ]
+)
+def test_goal_verb_messages_are_task_with_the_whole_message_as_goal(message):
+    router = DeterministicCapabilityRouter()
+
+    decision = router.route(message)
+
+    assert decision.capability is Capability.TASK
+    assert decision.goal == message
+
+
+def test_goal_verb_question_is_not_misrouted_to_task():
+    router = DeterministicCapabilityRouter()
+
+    decision = router.route("Prepare? What do you mean by that?")
+
+    assert decision.capability is not Capability.TASK
+
+
+def test_tool_invocation_takes_priority_over_goal_verb():
+    router = DeterministicCapabilityRouter()
+
+    decision = router.route("use tool prepare_report")
+
+    assert decision.capability is Capability.TOOL
+    assert decision.tool_name == "prepare_report"
+
+
+def test_goal_verb_mentioned_mid_message_is_not_task():
+    router = DeterministicCapabilityRouter()
+
+    decision = router.route("let's discuss how to prepare for finals")
+
+    assert decision.capability is not Capability.TASK
+
+
+def test_ordinary_direct_and_search_messages_are_unaffected_by_task_detection():
+    router = DeterministicCapabilityRouter()
+
+    assert router.route("what is quantum entanglement?").capability is Capability.DIRECT
+    assert router.route("what's the latest news on AI?").capability is Capability.SEARCH
+
+
+# --- TASK_STATUS / CONFIRMATION detection -----------------------------------
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "what's the status of my task?",
+        "what is the status of my job?",
+        "status of my task",
+        "what are you doing?",
+        "what are you currently doing",
+        "is that finished?",
+        "is it done?",
+        "is my task finished?",
+        "are you done?",
+        "are you finished?",
+        "show me my running tasks",
+        "list me my active tasks",
+        "my running tasks",
+        "my in-progress tasks",
+    ]
+)
+def test_status_query_phrasings_route_to_task_status(message):
+    router = DeterministicCapabilityRouter()
+
+    decision = router.route(message)
+
+    assert decision.capability is Capability.TASK_STATUS
+
+
+@pytest.mark.parametrize("message", ["my tasks", "show me my tasks", "list my tasks"])
+def test_bare_my_tasks_does_not_route_to_task_status(message):
+    """Deliberately excluded - ambiguous with app.tasks (Rhasspy Tasks,
+    M9's unrelated todo list); only phrasings implying an in-progress
+    GOAL (status/doing/finished/running/active/in-progress) trigger
+    TASK_STATUS, never a bare 'my tasks' with no such qualifier."""
+    router = DeterministicCapabilityRouter()
+
+    decision = router.route(message)
+
+    assert decision.capability is not Capability.TASK_STATUS
+
+
+@pytest.mark.parametrize(
+    "message,expected_approve",
+    [
+        ("yes", True),
+        ("Yes.", True),
+        ("yep", True),
+        ("yeah!", True),
+        ("sure", True),
+        ("ok", True),
+        ("okay", True),
+        ("confirm", True),
+        ("confirmed", True),
+        ("approve", True),
+        ("approved", True),
+        ("go ahead", True),
+        ("send it", True),
+        ("do it", True),
+        ("proceed", True),
+        ("no", False),
+        ("nope", False),
+        ("nah", False),
+        ("don't", False),
+        ("cancel that", False),
+        ("decline", False),
+        ("declined", False),
+        ("stop", False),
+    ]
+)
+def test_short_confirmation_replies_route_to_confirmation(message, expected_approve):
+    router = DeterministicCapabilityRouter()
+
+    decision = router.route(message)
+
+    assert decision.capability is Capability.CONFIRMATION
+    assert decision.approve is expected_approve
+
+
+def test_confirmation_pattern_matches_the_whole_message_not_a_substring():
+    """A longer sentence that merely contains 'yes' must NOT be treated
+    as a confirmation reply - only a message that IS essentially just the
+    short reply counts."""
+    router = DeterministicCapabilityRouter()
+
+    decision = router.route("yes, and also can you tell me about Rome")
+
+    assert decision.capability is not Capability.CONFIRMATION
+
+
+def test_tool_invocation_takes_priority_over_confirmation_and_status_patterns():
+    router = DeterministicCapabilityRouter()
+
+    assert router.route("use tool confirm_job").capability is Capability.TOOL

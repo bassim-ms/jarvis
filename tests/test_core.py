@@ -17,6 +17,7 @@ from app.capability import (
 )
 from app.core import ConversationNotFoundError, JarvisCore
 from app.memory.sqlite_store import SQLiteMemoryStore
+from app.orchestration.base import JobStatus
 from app.providers.base import AIProvider, ProviderError
 from app.providers.manager import AIProviderEntry, AIProviderManager
 from app.providers.requirements import TaskType
@@ -1363,3 +1364,373 @@ def test_search_path_routes_through_the_manager_via_gemini_search_answer_generat
     # SEARCH_SYNTHESIS is a soft preference (see app/providers/router.py) -
     # the single registered provider is still eligible, never excluded.
     assert manager.last_routing_decision.excluded == []
+
+
+# --- M15: TASK capability dispatch ------------------------------------------
+
+
+def test_handle_task_creates_a_job_via_the_create_job_tool():
+    from app.orchestration.sqlite_store import SQLiteJobStore
+    from app.orchestration.tools import CreateJobTool
+
+    provider = FakeProvider("should not be used")
+    job_store = SQLiteJobStore(":memory:")
+    tools = ToolRegistry()
+    tools.register(CreateJobTool(store=job_store))
+    jarvis = JarvisCore(provider=provider, memory=SQLiteMemoryStore(":memory:"), tools=tools)
+
+    reply, _, sources = jarvis.handle_chat("Prepare everything for tomorrow's robotics meeting.")
+
+    assert sources == []
+    jobs = job_store.list()
+    assert len(jobs) == 1
+    assert jobs[0].goal == "Prepare everything for tomorrow's robotics meeting."
+    assert "task" in reply.lower() or jobs[0].id in reply
+    # DIRECT's own provider is never consulted for a TASK request - job
+    # creation/planning is entirely separate from the chat provider call.
+    assert provider.last_message is None
+
+
+def test_handle_task_uses_explicit_invocation_goal_text():
+    from app.orchestration.sqlite_store import SQLiteJobStore
+    from app.orchestration.tools import CreateJobTool
+
+    job_store = SQLiteJobStore(":memory:")
+    tools = ToolRegistry()
+    tools.register(CreateJobTool(store=job_store))
+    jarvis, _ = make_core()
+    jarvis.tools = tools
+
+    jarvis.handle_chat("create a goal: organize my downloads folder")
+
+    assert job_store.list()[0].goal == "organize my downloads folder"
+
+
+def test_handle_task_with_no_create_job_tool_registered_returns_plain_reply():
+    jarvis, _ = make_core()  # default empty ToolRegistry, no create_job
+
+    reply, conversation_id, sources = jarvis.handle_chat("Organize my Downloads folder.")
+
+    assert sources == []
+    assert "create_job" in reply or "Unknown tool" in reply
+    # Still persisted as a normal conversation turn, same as any other reply.
+    history = jarvis.memory.get_messages(conversation_id)
+    assert history[-1].content == reply
+
+
+def test_handle_task_never_blocks_on_planning_or_execution():
+    """TASK only ever creates a PENDING job and returns - planning/
+    execution is JobEngine's job, never JarvisCore's."""
+    from app.orchestration.base import JobStatus
+    from app.orchestration.sqlite_store import SQLiteJobStore
+    from app.orchestration.tools import CreateJobTool
+
+    job_store = SQLiteJobStore(":memory:")
+    tools = ToolRegistry()
+    tools.register(CreateJobTool(store=job_store))
+    jarvis, _ = make_core()
+    jarvis.tools = tools
+
+    jarvis.handle_chat("plan a birthday party for next week")
+
+    assert job_store.list()[0].status == JobStatus.PENDING
+
+
+def test_simple_direct_question_is_unaffected_by_task_capability_existing():
+    jarvis, provider = make_core("Tokyo.")
+
+    reply, _, sources = jarvis.handle_chat("What is the capital of Japan?")
+
+    assert reply == "Tokyo."
+    assert sources == []
+
+
+# --- M15 fixes: handle_chat_with_job_id, TASK_STATUS, CONFIRMATION ---------
+
+
+def _orchestration_core(reply: str = "direct reply", provider: FakeProvider | None = None):
+    """A JarvisCore wired with real orchestration tools/store (in-memory),
+    for end-to-end coverage of TASK/TASK_STATUS/CONFIRMATION through
+    handle_chat - not just each tool in isolation."""
+    from app.orchestration.sqlite_store import SQLiteJobStore
+    from app.orchestration.tools import (
+        CancelJobTool,
+        ConfirmJobTool,
+        CreateJobTool,
+        GetJobTool,
+        ListJobsTool,
+        PauseJobTool,
+        ResumeJobTool,
+    )
+
+    job_store = SQLiteJobStore(":memory:")
+    tools = ToolRegistry()
+    for tool in (
+        CreateJobTool(store=job_store),
+        ListJobsTool(store=job_store),
+        GetJobTool(store=job_store),
+        ConfirmJobTool(store=job_store),
+        PauseJobTool(store=job_store),
+        ResumeJobTool(store=job_store),
+        CancelJobTool(store=job_store),
+    ):
+        tools.register(tool)
+    provider = provider or FakeProvider(reply)
+    jarvis = JarvisCore(provider=provider, memory=SQLiteMemoryStore(":memory:"), tools=tools)
+    return jarvis, job_store, provider
+
+
+def test_handle_chat_with_job_id_returns_the_created_jobs_id():
+    jarvis, job_store, _ = _orchestration_core()
+
+    reply, conversation_id, sources, job_id = jarvis.handle_chat_with_job_id(
+        "prepare a report for the meeting"
+    )
+
+    assert sources == []
+    assert job_id is not None
+    assert job_store.get(job_id) is not None
+    assert job_store.get(job_id).goal == "prepare a report for the meeting"
+
+
+def test_handle_chat_with_job_id_is_none_for_non_task_messages():
+    jarvis, _, _ = _orchestration_core("Tokyo.")
+
+    reply, _, _, job_id = jarvis.handle_chat_with_job_id("What is the capital of Japan?")
+
+    assert reply == "Tokyo."
+    assert job_id is None
+
+
+def test_handle_chat_still_returns_a_plain_three_tuple():
+    """handle_chat's own signature/behavior is completely unchanged -
+    still exactly 3 values, no job_id anywhere in it."""
+    jarvis, _, _ = _orchestration_core()
+
+    result = jarvis.handle_chat("prepare a report")
+
+    assert len(result) == 3
+    reply, conversation_id, sources = result
+    assert isinstance(reply, str)
+
+
+# --- TASK_STATUS: natural-language status queries ---------------------------
+
+
+def test_status_query_with_no_tasks_at_all():
+    jarvis, _, _ = _orchestration_core()
+
+    reply, _, sources = jarvis.handle_chat("what's the status of my task?")
+
+    assert sources == []
+    assert "don't have any tasks" in reply.lower()
+
+
+def test_is_that_finished_reports_a_completed_task_in_the_same_conversation():
+    jarvis, job_store, _ = _orchestration_core()
+
+    _, conversation_id, _ = jarvis.handle_chat("prepare a report")
+    job = job_store.list()[0]
+    job.status = JobStatus.COMPLETED
+    job.final_result = "The report is ready."
+    from datetime import datetime, timezone
+
+    job.updated_at = datetime.now(timezone.utc).isoformat()
+    job_store.save(job)
+
+    reply, _, sources = jarvis.handle_chat("is that finished?", conversation_id=conversation_id)
+
+    assert sources == []
+    assert "finished" in reply.lower()
+    assert "report is ready" in reply.lower() or "prepare a report" in reply.lower()
+
+
+def test_status_query_reports_a_running_task():
+    jarvis, job_store, _ = _orchestration_core()
+
+    _, conversation_id, _ = jarvis.handle_chat("organize my downloads folder")
+    job = job_store.list()[0]
+    job.status = JobStatus.RUNNING
+    job_store.save(job)
+
+    reply, _, _ = jarvis.handle_chat(
+        "what's the status of my task?", conversation_id=conversation_id
+    )
+
+    assert "in progress" in reply.lower() or "running" in reply.lower()
+
+
+def test_status_query_reports_a_failed_task_with_its_reason():
+    jarvis, job_store, _ = _orchestration_core()
+
+    _, conversation_id, _ = jarvis.handle_chat("plan a party")
+    job = job_store.list()[0]
+    job.status = JobStatus.FAILED
+    job.error = "no venue tool available"
+    job_store.save(job)
+
+    reply, _, _ = jarvis.handle_chat("is that finished?", conversation_id=conversation_id)
+
+    assert "failed" in reply.lower()
+    assert "no venue tool available" in reply
+
+
+def test_status_query_scopes_to_its_own_conversation():
+    jarvis, job_store, _ = _orchestration_core()
+
+    _, conv_a, _ = jarvis.handle_chat("prepare report A")
+    job_a = job_store.list()[0]
+    job_a.status = JobStatus.COMPLETED
+    job_a.final_result = "Report A done."
+    job_store.save(job_a)
+
+    _, conv_b, _ = jarvis.handle_chat("prepare report B")
+    job_b = next(j for j in job_store.list() if j.goal == "prepare report B")
+    job_b.status = JobStatus.RUNNING
+    job_store.save(job_b)
+
+    reply_a, _, _ = jarvis.handle_chat("is that finished?", conversation_id=conv_a)
+    reply_b, _, _ = jarvis.handle_chat("is that finished?", conversation_id=conv_b)
+
+    assert "report a" in reply_a.lower()
+    assert "report b" in reply_b.lower()
+
+
+def test_show_me_my_running_tasks_lists_active_jobs_only():
+    jarvis, job_store, _ = _orchestration_core()
+
+    jarvis.tools.execute("create_job", params={"goal": "task one"})
+    jarvis.tools.execute("create_job", params={"goal": "task two"})
+    jobs_by_goal = {j.goal: j for j in job_store.list()}
+    jobs_by_goal["task one"].status = JobStatus.RUNNING
+    job_store.save(jobs_by_goal["task one"])
+    jobs_by_goal["task two"].status = JobStatus.COMPLETED
+    job_store.save(jobs_by_goal["task two"])
+
+    reply, _, _ = jarvis.handle_chat("show me my running tasks")
+
+    assert "task one" in reply.lower()
+    assert "task two" not in reply.lower()
+
+
+# --- CONFIRMATION: natural-language yes/no ----------------------------------
+
+
+def test_yes_with_no_pending_confirmation_falls_back_to_direct():
+    jarvis, _, provider = _orchestration_core("Sure, happy to help!")
+
+    reply, _, sources = jarvis.handle_chat("yes")
+
+    assert reply == "Sure, happy to help!"
+    assert sources == []
+    assert provider.last_message is not None  # the DIRECT provider path really ran
+
+
+def test_yes_confirms_a_pending_task_in_the_same_conversation():
+    jarvis, job_store, _ = _orchestration_core()
+
+    _, conversation_id, _ = jarvis.handle_chat("prepare a report")
+    job = job_store.list()[0]
+    from app.orchestration.base import Plan, PlanStep
+
+    job.plan = Plan(steps=[PlanStep(id="s1", tool_name="send_email", permission="confirm")])
+    job.status = JobStatus.AWAITING_CONFIRMATION
+    job.pending_step_ids = ["s1"]
+    job.confirmation_message = "Send the report by email?"
+    job_store.save(job)
+
+    reply, _, sources = jarvis.handle_chat("yes", conversation_id=conversation_id)
+
+    assert sources == []
+    fetched = job_store.get(job.id)
+    assert fetched.status == JobStatus.RUNNING
+    assert fetched.plan.get("s1").confirmed is True
+
+
+def test_send_it_and_go_ahead_also_confirm():
+    for phrase in ("send it", "go ahead"):
+        jarvis, job_store, _ = _orchestration_core()
+        _, conversation_id, _ = jarvis.handle_chat("prepare a report")
+        job = job_store.list()[0]
+        from app.orchestration.base import Plan, PlanStep
+
+        job.plan = Plan(steps=[PlanStep(id="s1", tool_name="send_email", permission="confirm")])
+        job.status = JobStatus.AWAITING_CONFIRMATION
+        job.pending_step_ids = ["s1"]
+        job.confirmation_message = "Send it?"
+        job_store.save(job)
+
+        jarvis.handle_chat(phrase, conversation_id=conversation_id)
+
+        assert job_store.get(job.id).status == JobStatus.RUNNING, "failed for phrase: " + phrase
+
+
+def test_no_declines_a_pending_confirmation():
+    jarvis, job_store, _ = _orchestration_core()
+
+    _, conversation_id, _ = jarvis.handle_chat("prepare a report")
+    job = job_store.list()[0]
+    from app.orchestration.base import Plan, PlanStep
+
+    job.plan = Plan(steps=[PlanStep(id="s1", tool_name="send_email", permission="confirm")])
+    job.status = JobStatus.AWAITING_CONFIRMATION
+    job.pending_step_ids = ["s1"]
+    job.confirmation_message = "Send it?"
+    job_store.save(job)
+
+    jarvis.handle_chat("no", conversation_id=conversation_id)
+
+    fetched = job_store.get(job.id)
+    assert fetched.status == JobStatus.FAILED
+    assert "declined" in fetched.error.lower()
+
+
+def test_ambiguous_confirmation_across_conversations_asks_which_one():
+    jarvis, job_store, provider = _orchestration_core()
+    from app.orchestration.base import Plan, PlanStep
+
+    _, conv_a, _ = jarvis.handle_chat("prepare report A")
+    _, conv_b, _ = jarvis.handle_chat("prepare report B")
+    for job in job_store.list():
+        job.plan = Plan(steps=[PlanStep(id="s1", tool_name="send_email", permission="confirm")])
+        job.status = JobStatus.AWAITING_CONFIRMATION
+        job.pending_step_ids = ["s1"]
+        job.confirmation_message = "Send it?"
+        job_store.save(job)
+
+    # Ask "yes" from a THIRD, unrelated conversation - neither pending
+    # job is linked to it, so both remain candidates and it must ask
+    # rather than guess.
+    reply, _, _ = jarvis.handle_chat("yes")
+
+    assert "more than one" in reply.lower() or "which one" in reply.lower()
+    for job in job_store.list():
+        assert job.status == JobStatus.AWAITING_CONFIRMATION  # neither was touched
+    assert provider.last_message is None  # never fell through to DIRECT either
+
+
+def test_confirmation_scoped_to_conversation_resolves_unambiguously():
+    """Even with two pending confirmations system-wide, replying "yes"
+    FROM one of their own conversations resolves to that one directly -
+    no disambiguation needed, since conversation-scoping narrows it to
+    exactly one candidate."""
+    jarvis, job_store, _ = _orchestration_core()
+    from app.orchestration.base import Plan, PlanStep
+
+    _, conv_a, _ = jarvis.handle_chat("prepare report A")
+    _, conv_b, _ = jarvis.handle_chat("prepare report B")
+    jobs_by_goal = {j.goal: j for j in job_store.list()}
+    for job in jobs_by_goal.values():
+        job.plan = Plan(steps=[PlanStep(id="s1", tool_name="send_email", permission="confirm")])
+        job.status = JobStatus.AWAITING_CONFIRMATION
+        job.pending_step_ids = ["s1"]
+        job.confirmation_message = "Send it?"
+        job_store.save(job)
+
+    jarvis.handle_chat("yes", conversation_id=conv_a)
+
+    assert job_store.get(jobs_by_goal["prepare report A"].id).status == JobStatus.RUNNING
+    assert (
+        job_store.get(jobs_by_goal["prepare report B"].id).status
+        == JobStatus.AWAITING_CONFIRMATION
+    )

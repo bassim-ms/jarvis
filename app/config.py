@@ -123,6 +123,23 @@ class Settings(BaseSettings):
     # of Reminders; no scheduling, no notifications, no external sync.
     tasks_db_path: str = "jarvis_tasks.db"
 
+    # Orchestration (M15 - goal-driven Jobs: plan -> validate -> execute
+    # through the existing tool system, see app/orchestration/) - local
+    # SQLite file, how often the background JobEngine polls active Jobs,
+    # and the safety limits Plan Validator/JobEngine enforce so a plan or
+    # a chain of replans can never grow or loop without bound. A Job's
+    # default autonomy (see app/orchestration/base.py:AutonomyLevel) when
+    # a caller doesn't specify one - ASSISTED per this milestone's own
+    # default.
+    orchestration_db_path: str = "jarvis_orchestration.db"
+    orchestration_poll_interval_seconds: float = 15.0
+    orchestration_max_steps: int = 20
+    orchestration_max_total_steps: int = 40
+    orchestration_max_retries_per_step: int = 2
+    orchestration_retry_delay_seconds: float = 1.0
+    orchestration_max_replans: int = 2
+    orchestration_default_autonomy: str = "assisted"
+
     # Voice (hands-free wake-word + STT + TTS, see app/voice/) - $0/local
     # only: openWakeWord for wake-word detection, Vosk for STT, Windows
     # SAPI for TTS. Model paths have no default - they point at files the

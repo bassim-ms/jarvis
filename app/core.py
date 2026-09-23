@@ -63,7 +63,50 @@ deliberately Gemini-pinned ToolCallProvider - see app/tools/decision.py),
 so there's nothing to route there; SEARCH's routing lives in
 GeminiSearchAnswerGenerator instead (app/search/answer.py), since that's
 where the actual provider call happens.
+
+Since M15, TASK is a fourth capability (app/capability.py) alongside
+DIRECT/SEARCH/TOOL: `_handle_task` dispatches to the existing
+ToolRegistry's `create_job` tool by name, exactly like `_handle_tool`
+dispatches to any other tool - Core gains no orchestration-specific
+logic beyond that one line. Planning/validation/execution of the
+resulting Job all happen later, on JobEngine's own background thread
+(app/orchestration/engine.py, wired up in app/main.py the same way
+AutomationEngine/ReminderScheduler already are) - never synchronously
+inside `handle_chat`, so an ordinary DIRECT/SEARCH/TOOL request's latency
+and behavior are completely unaffected by TASK existing at all.
+
+Right after that initial TASK pass, two more capabilities closed the gap
+between "a Job exists" and "the user can actually find out what happened
+to it" through ordinary conversation, without changing what `handle_chat`
+returns to any existing caller:
+
+- TASK_STATUS (`_handle_task_status`): a natural-language status question
+  ("what's the status of my task?", "is that finished?", "what are you
+  doing?", "show me my running tasks") is answered by calling the
+  existing `list_jobs` tool and resolving/formatting the result - never a
+  second store, never a bypass of ToolRegistry.
+- CONFIRMATION (`_handle_confirmation`): a short reply ("yes", "send it",
+  "go ahead", "no") that MIGHT be answering a Job's pending confirmation
+  is resolved against real Job state (via `list_jobs`) and, if something
+  is actually awaiting confirmation, dispatched to the existing
+  `confirm_job` tool. If nothing is pending, `_handle_confirmation`
+  returns `None` and `handle_chat` falls back to ordinary `_handle_direct`
+  handling - so a stray "yes"/"ok" in normal conversation, with no Job
+  awaiting anything, behaves exactly as it always has.
+
+`handle_chat`'s own public signature and behavior (a 3-tuple: reply,
+conversation_id, sources) are completely unchanged by any of this - every
+existing caller (this project's whole test suite, the voice client, ...)
+is unaffected. A Job's id, when one is created, is instead exposed
+through the additive `handle_chat_with_job_id` (a 4-tuple, the 4th being
+`job_id: str | None`) that only `app/main.py`'s `/chat` endpoint uses, so
+API clients get a real structured field instead of having to parse the
+reply's prose for it. Both methods share one internal implementation
+(`_dispatch`) so there is exactly one place capability dispatch and
+conversation persistence happen, never two copies to keep in sync.
 """
+
+import re
 
 from app.capability import (
     Capability,
@@ -158,21 +201,46 @@ class JarvisCore:
         conversation's prior messages are loaded and combined with any
         stored user facts to give the provider context for this turn.
 
-        CapabilityRouter (deterministic, no AI call - M6.13/M6.14) decides
-        DIRECT vs SEARCH vs TOOL before that, not Core itself: DIRECT keeps
-        the existing prompt -> provider.generate_reply path unchanged;
-        SEARCH runs the message through WebSearchTool -> SearchResponse ->
-        SearchAnswerGenerator, using the generated answer as the reply;
-        TOOL dispatches to the existing ToolRegistry by name (see
-        _handle_tool). Either way, the final reply is persisted exactly the
-        same way. Both DIRECT and SEARCH reuse the same `history`/`facts`
-        already loaded below - neither the SEARCH nor the TOOL path issues
-        its own memory query.
+        CapabilityRouter (deterministic, no AI call - M6.13/M6.14, extended
+        in M15) decides DIRECT vs SEARCH vs TOOL vs TASK vs TASK_STATUS vs
+        CONFIRMATION before that, not Core itself - see this module's own
+        docstring for what each of those does. Either way, the final reply
+        is persisted exactly the same way.
 
         The third return value is the SearchAnswer's validated sources
-        (M6.11) - always `[]` for DIRECT and TOOL, since neither produces a
-        SearchAnswer.
+        (M6.11) - always `[]` for every capability except SEARCH, since
+        none of the others produce a SearchAnswer.
+
+        This method's own signature/behavior is unchanged by M15's
+        TASK_STATUS/CONFIRMATION additions - see `handle_chat_with_job_id`
+        for the one additive way a created Job's id is exposed structurally
+        instead of only in the reply's prose.
         """
+        reply, conversation_id, sources, _job_id = self._dispatch(message, conversation_id)
+        return reply, conversation_id, sources
+
+    def handle_chat_with_job_id(
+        self, message: str, conversation_id: str | None = None
+    ) -> tuple[str, str, list[SearchSource], str | None]:
+        """Identical to `handle_chat` in every respect, plus a 4th return
+        value: the id of the Job `_handle_task` just created, if this
+        message was a TASK request - `None` for every other capability, or
+        if TASK dispatch didn't actually create one (e.g. `create_job`
+        isn't registered). This is the one thing `handle_chat`'s own
+        existing 3-tuple contract can't grow to carry without breaking
+        every one of its current callers, so `app/main.py`'s `/chat`
+        endpoint uses this method instead, to give API clients a real
+        structured `job_id` field rather than one embedded in reply text.
+        """
+        return self._dispatch(message, conversation_id)
+
+    def _dispatch(
+        self, message: str, conversation_id: str | None
+    ) -> tuple[str, str, list[SearchSource], str | None]:
+        """The single implementation `handle_chat`/`handle_chat_with_job_id`
+        both call - capability dispatch and conversation persistence happen
+        exactly once, here, so the two public methods can never drift out
+        of sync with each other."""
         if conversation_id is None:
             conversation_id = self.memory.create_conversation()
         elif not self.memory.conversation_exists(conversation_id):
@@ -188,34 +256,64 @@ class JarvisCore:
         except CapabilityDecisionError as exc:
             raise ProviderError(f"Failed to decide a capability: {exc}") from exc
 
+        job_id: str | None = None
+
         if decision.capability is Capability.SEARCH:
             reply, sources = self._handle_search(message, history, facts)
         elif decision.capability is Capability.TOOL:
             reply, sources = self._handle_tool(message, decision)
+        elif decision.capability is Capability.TASK:
+            reply, sources, job_id = self._handle_task(decision, conversation_id)
+        elif decision.capability is Capability.TASK_STATUS:
+            reply, sources = self._handle_task_status(message, conversation_id)
+        elif decision.capability is Capability.CONFIRMATION:
+            confirmation_result = self._handle_confirmation(decision, conversation_id)
+            if confirmation_result is not None:
+                reply, sources = confirmation_result
+            else:
+                # Nothing is actually awaiting confirmation right now - the
+                # deterministic "yes"/"ok"/... pattern was only ever a
+                # hint (see Capability.CONFIRMATION's own docstring), so a
+                # stray affirmative/negative reply falls back to ordinary
+                # conversation, unaffected by CONFIRMATION existing at all.
+                reply, sources = self._handle_direct(message, history, facts, Capability.DIRECT)
         else:
-            prompt = self._build_prompt(message, history, facts)
-            # M14: `decision.capability` here is always DIRECT (SEARCH/TOOL
-            # are handled above) - passed through explicitly, rather than
-            # hardcoded, so classify_request always reflects the real
-            # capability decision Core already made (execution context)
-            # instead of re-deriving it. `context_char_count=len(prompt)`
-            # is the exact payload about to be sent - the most direct
-            # "how much context is this" signal available, no separate
-            # length heuristic invented. See app/providers/requirements.py
-            # for what this actually classifies (task type, long_context,
-            # ...) and app/providers/manager.py:call_with_requirements for
-            # why this is safe to call even when self.provider is a plain
-            # AIProvider that knows nothing about requirements.
-            requirements = classify_request(
-                message, capability=decision.capability, context_char_count=len(prompt)
-            )
-            reply = call_with_requirements(self.provider, prompt, requirements)
-            sources = []
+            reply, sources = self._handle_direct(message, history, facts, decision.capability)
 
         self.memory.add_message(conversation_id, "user", message)
         self.memory.add_message(conversation_id, "assistant", reply)
 
-        return reply, conversation_id, sources
+        return reply, conversation_id, sources, job_id
+
+    def _handle_direct(
+        self,
+        message: str,
+        history: list[Message],
+        facts: dict[str, str],
+        capability: Capability,
+    ) -> tuple[str, list[SearchSource]]:
+        """DIRECT path (extracted, M15, from what was previously inlined
+        in `handle_chat`'s own `else` branch) - also reused by
+        `_dispatch`'s CONFIRMATION fallback, so a "yes"/"ok" with nothing
+        actually pending is handled by the exact same code as an ordinary
+        DIRECT message, not a second copy of it. `capability` is passed
+        through to `classify_request` (M14) rather than hardcoded, exactly
+        as the original inline branch already did - always
+        `Capability.DIRECT` for both callers today."""
+        prompt = self._build_prompt(message, history, facts)
+        # `context_char_count=len(prompt)` is the exact payload about to be
+        # sent - the most direct "how much context is this" signal
+        # available, no separate length heuristic invented. See
+        # app/providers/requirements.py for what this actually classifies
+        # (task type, long_context, ...) and
+        # app/providers/manager.py:call_with_requirements for why this is
+        # safe to call even when self.provider is a plain AIProvider that
+        # knows nothing about requirements.
+        requirements = classify_request(
+            message, capability=capability, context_char_count=len(prompt)
+        )
+        reply = call_with_requirements(self.provider, prompt, requirements)
+        return reply, []
 
     def _handle_search(
         self, message: str, history: list[Message], facts: dict[str, str]
@@ -315,6 +413,190 @@ class JarvisCore:
 
         result = self.tools.execute(tool_call.tool_name, params=tool_call.parameters)
         return self._format_tool_result(result), []
+
+    def _handle_task(
+        self, decision: CapabilityDecision, conversation_id: str
+    ) -> tuple[str, list[SearchSource], str | None]:
+        """TASK path (M15): dispatches to the existing ToolRegistry's
+        `create_job` tool (app/orchestration/tools.py) by name, exactly
+        the same "Core never branches on which tool it is" pattern
+        `_handle_tool` already uses - the only difference is TASK's tool
+        name and argument (`goal`) are already fully known from the
+        CapabilityDecision itself (see Capability.TASK's own docstring),
+        so no ToolCallBuilder round-trip (deterministic or AI-backed) is
+        needed to construct the call. `conversation_id` is passed through
+        as `create_job`'s own `conversation_id` argument, so the new Job
+        is linked back to this conversation - what lets
+        `_handle_task_status`/`_handle_confirmation` later resolve "my
+        task"/a pending confirmation reply against it specifically.
+
+        This method only ever creates a PENDING Job and returns
+        immediately - planning and execution happen later, on
+        JobEngine's own background thread (app/orchestration/engine.py),
+        so a TASK request never blocks `/chat` waiting for a multi-step
+        plan to actually run. If `create_job` isn't registered (e.g. a
+        bare ToolRegistry with no orchestration tools, as in most of this
+        project's own unit tests), the registry's existing "Unknown
+        tool" ToolResult.error(...) is surfaced as plain reply text, same
+        convention as an unregistered TOOL-path tool_name, and the
+        returned job_id is `None`.
+
+        Returns a 3-tuple (reply, sources, job_id) rather than
+        `_handle_tool`'s 2-tuple - job_id is the one piece of structured
+        data `_dispatch` needs to thread through to
+        `handle_chat_with_job_id`'s own 4th return value; every other
+        handler still returns a plain 2-tuple since none of them create
+        anything with an id worth exposing this way."""
+        goal = decision.goal or ""
+        result = self.tools.execute(
+            "create_job", params={"goal": goal, "conversation_id": conversation_id}
+        )
+        job_id = None
+        if result.status is ToolResultStatus.SUCCESS and isinstance(result.data, dict):
+            job_id = result.data.get("id")
+        return self._format_tool_result(result), [], job_id
+
+    #: "show me my running tasks" / "list me my active tasks" (list intent)
+    #: vs "is that finished?" / "what's the status of my task?" (single-job
+    #: intent) - a narrow, local re-check of the SAME message
+    #: DeterministicCapabilityRouter already matched as TASK_STATUS (see
+    #: app/capability.py's own `_TASK_STATUS_PATTERNS`), just to pick which
+    #: of the two response shapes to build. Never a second capability
+    #: decision - `_handle_task_status` is only ever reached once the
+    #: router has already decided TASK_STATUS.
+    _TASK_STATUS_LIST_INTENT_PATTERN = re.compile(r"\b(?:show|list)\b.*\btasks\b", re.IGNORECASE)
+
+    #: Statuses that count as "still going" for "show me my running
+    #: tasks" - a terminal Job (COMPLETED/FAILED/CANCELLED) is deliberately
+    #: excluded from that listing, even though get_job/list_jobs still
+    #: return it (a status query about ALL history isn't what "running
+    #: tasks" asks for).
+    _ACTIVE_JOB_STATUS_VALUES = frozenset(
+        {"pending", "planning", "running", "awaiting_confirmation", "paused"}
+    )
+
+    def _handle_task_status(
+        self, message: str, conversation_id: str
+    ) -> tuple[str, list[SearchSource]]:
+        """TASK_STATUS path (M15): answers a natural-language question
+        about a Job's progress/outcome ("what's the status of my task?",
+        "is that finished?", "what are you doing?", "show me my running
+        tasks") using the existing `list_jobs` tool - never a second
+        store, never a ToolRegistry bypass. `list_jobs`'s own summary dict
+        already carries `final_result`/`error`/`confirmation_message`
+        alongside `status` (see app/orchestration/tools.py), so this never
+        needs a second `get_job` round-trip to describe an outcome.
+
+        Resolution for a single-job question prefers a Job linked to
+        THIS conversation (`conversation_id`, set by `_handle_task` at
+        creation time), falling back to considering every Job if none
+        match - reasonable for a single-user assistant where "my task"
+        outside its own conversation is still unambiguous when there's
+        only one candidate. Guessing "the most recently updated matching
+        Job" is safe here specifically because this is a read-only query
+        - contrast with `_handle_confirmation`, which never guesses among
+        multiple candidates for a consequential approval action."""
+        result = self.tools.execute("list_jobs", params={})
+        if result.status is not ToolResultStatus.SUCCESS:
+            return self._format_tool_result(result), []
+
+        jobs: list[dict] = result.data or []
+        if not jobs:
+            return "You don't have any tasks right now.", []
+
+        if self._TASK_STATUS_LIST_INTENT_PATTERN.search(message):
+            return self._format_job_list(jobs), []
+
+        return self._format_single_job_status(jobs, conversation_id), []
+
+    @classmethod
+    def _format_job_list(cls, jobs: list[dict]) -> str:
+        active = [j for j in jobs if j["status"] in cls._ACTIVE_JOB_STATUS_VALUES]
+        if not active:
+            return "You have no running tasks right now."
+        lines = [f"- {j['goal']} ({j['status']})" for j in active]
+        return "Your running tasks:\n" + "\n".join(lines)
+
+    @staticmethod
+    def _resolve_relevant_job(jobs: list[dict], conversation_id: str) -> dict:
+        """Pick the single most relevant Job for a status/confirmation
+        query: the most recently updated one linked to THIS conversation,
+        or - if none are - the most recently updated one overall. Shared
+        by `_handle_task_status` (safe to guess, read-only) -
+        `_handle_confirmation` uses the same conversation-scoping idea but
+        never calls this when more than one candidate remains, since
+        approving/declining is consequential (see its own docstring)."""
+        same_conversation = [j for j in jobs if j.get("conversation_id") == conversation_id]
+        candidates = same_conversation or jobs
+        return max(candidates, key=lambda j: j["updated_at"])
+
+    @classmethod
+    def _format_single_job_status(cls, jobs: list[dict], conversation_id: str) -> str:
+        job = cls._resolve_relevant_job(jobs, conversation_id)
+        goal, status = job["goal"], job["status"]
+
+        if status == "completed":
+            outcome = job.get("final_result") or "it finished successfully"
+            return f"Yes - your task '{goal}' is finished. {outcome}"
+        if status == "failed":
+            reason = job.get("error") or "no reason was recorded"
+            return f"Your task '{goal}' failed: {reason}"
+        if status == "awaiting_confirmation":
+            ask = job.get("confirmation_message") or "it needs your confirmation to continue"
+            return f"Your task '{goal}' is waiting on you: {ask}"
+        if status == "cancelled":
+            return f"Your task '{goal}' was cancelled."
+        if status == "paused":
+            return f"Your task '{goal}' is paused."
+        return f"Your task '{goal}' is still in progress ({status})."
+
+    def _handle_confirmation(
+        self, decision: CapabilityDecision, conversation_id: str
+    ) -> tuple[str, list[SearchSource]] | None:
+        """CONFIRMATION path (M15): resolves a short affirmative/negative
+        reply against whatever Job(s) are actually AWAITING_CONFIRMATION
+        right now (via the existing `list_jobs` tool), and - if exactly
+        one applies - dispatches to the existing `confirm_job` tool with
+        `decision.approve`. Returns `None` (never a reply) when there's
+        nothing pending at all, so `_dispatch` can fall back to ordinary
+        `_handle_direct` handling instead - the deterministic "yes"/"no"
+        pattern in app/capability.py is only ever a hint this message
+        MIGHT be a confirmation reply, and this is where that hint is
+        actually checked against reality.
+
+        Safe ambiguity handling: if MORE than one Job is awaiting
+        confirmation (after preferring ones linked to THIS conversation -
+        see `_resolve_relevant_job`), this never guesses which one the
+        user means - approving/declining is a consequential, potentially
+        irreversible action (see app/orchestration/engine.py's own
+        permission discipline), unlike a read-only status question. It
+        asks the user to disambiguate instead, and no `confirm_job` call
+        is made at all until they do.
+        """
+        result = self.tools.execute("list_jobs", params={"status": "awaiting_confirmation"})
+        if result.status is not ToolResultStatus.SUCCESS:
+            return None  # can't tell anything is pending - not a confirmation reply
+
+        pending: list[dict] = result.data or []
+        if not pending:
+            return None
+
+        same_conversation = [j for j in pending if j.get("conversation_id") == conversation_id]
+        candidates = same_conversation or pending
+
+        if len(candidates) > 1:
+            options = "; ".join(f"'{j['goal']}' (id {j['id']})" for j in candidates)
+            return (
+                "You have more than one task awaiting confirmation: "
+                f"{options}. Which one do you mean?",
+                [],
+            )
+
+        target = candidates[0]
+        confirm_result = self.tools.execute(
+            "confirm_job", params={"job_id": target["id"], "approve": bool(decision.approve)}
+        )
+        return self._format_tool_result(confirm_result), []
 
     @staticmethod
     def _format_tool_result(result: ToolResult) -> str:
