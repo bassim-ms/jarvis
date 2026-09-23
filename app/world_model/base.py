@@ -673,24 +673,37 @@ class ResourceLink:
 
 
 # ---------------------------------------------------------------------------
-# ContextSnapshot - model/interface only (M16.2 will populate this)
+# ContextSnapshot (M16.1 shape only) - populated by app.context_engine (M16.2)
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class ContextSnapshot:
-    """The shape a future Context Engine (M16.2+) will populate by
-    querying this module and MemoryStore together, then hand to AI
+    """The shape a Context Engine (M16.2, app/context_engine/) populates
+    by querying this module and MemoryStore together, then hands to AI
     reasoning ahead of M15 planning/execution.
 
-    M16.1 defines this shape only - nothing in this module constructs a
-    "real" ContextSnapshot (no `build_snapshot`-style function exists
-    here); a future milestone owns deciding *which* projects/goals/etc.
-    are "relevant" for a given moment. `relevant_memory` is a plain list
-    of strings (not app.memory.base.Message) so this module never has to
-    import MemoryStore's own types - the Context Engine that actually
-    populates this field owns translating memory into whatever form it
-    puts here.
+    M16.1 defined this shape only, with no builder; M16.2's
+    `app.context_engine.engine.ContextEngine.build_snapshot` is the one
+    place a "real" ContextSnapshot gets constructed - this module itself
+    still never builds one. `relevant_memory` is a plain list of strings
+    (not app.memory.base.Message) so this module never has to import
+    MemoryStore's own types - the Context Engine that actually populates
+    this field owns translating memory into whatever form it puts here.
+
+    `context_window`/`retrieval_metadata` (added for M16.2) are
+    deliberately bounded debug/explainability metadata, not a full
+    audit log - see app.context_engine.base.CategoryRetrieval's own
+    docstring for exactly what they hold. Their concrete types
+    (ContextWindow, CategoryRetrieval) live in app/context_engine/base.py,
+    not here: they're retrieval/scoring concepts (how the Context Engine
+    selected something), not World Model state (what's true) - this
+    module only needs to know their SHAPE well enough to hold them, via
+    a forward-reference string annotation (safe because this file starts
+    with `from __future__ import annotations`, so these annotations are
+    never evaluated at runtime and this module never has to import
+    app.context_engine - keeping the dependency direction World Model
+    -> nothing, Context Engine -> World Model, never the other way).
     """
 
     current_time: str
@@ -703,6 +716,12 @@ class ContextSnapshot:
     relevant_resources: list[Resource] = field(default_factory=list)
     relevant_preferences: list[Preference] = field(default_factory=list)
     relevant_memory: list[str] = field(default_factory=list)
+    #: app.context_engine.base.ContextWindow | None - forward reference,
+    #: see this class's own docstring for why no import exists here.
+    context_window: "ContextWindow | None" = None
+    #: dict[str, app.context_engine.base.CategoryRetrieval] - forward
+    #: reference, see this class's own docstring.
+    retrieval_metadata: "dict[str, CategoryRetrieval]" = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------

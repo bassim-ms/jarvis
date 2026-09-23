@@ -29,12 +29,18 @@ from pydantic import BaseModel
 from app.automation.factory import create_default_automation_store
 from app.calendar.factory import create_default_calendar_provider
 from app.config import settings
+from app.context_engine.factory import create_default_context_engine
 from app.core import ConversationNotFoundError, core
 from app.orchestration.factory import create_default_job_engine, create_default_job_store
 from app.providers.base import ProviderError
 from app.reminders.factory import create_default_reminder_store, create_default_scheduler
 from app.tasks.factory import create_default_task_store
 from app.tools.defaults import register_default_tools
+from app.world_model.factory import (
+    create_default_world_model_service,
+    create_default_world_model_store,
+)
+from app.world_model.sqlite_store import DEFAULT_WORLD_MODEL_DB_PATH
 
 # Application-level wiring: populate the running app's tool registry with
 # Jarvis's default tools. JarvisCore's own default (when no registry is
@@ -89,6 +95,27 @@ job_engine = create_default_job_engine(
     poll_interval_seconds=settings.orchestration_poll_interval_seconds,
     context_provider=core.memory.get_facts,
 )
+
+# Personal World Model + Context Engine (M16.1/M16.2) - wired onto the
+# already-constructed `core` singleton from outside, the exact same
+# "build it here, attach it to core" pattern every store/engine above
+# already uses (see e.g. `core.tools` populated by register_default_tools).
+# `core.context_engine` defaults to `None` (see app/core.py's own
+# JarvisCore.__init__), so this is what actually ACTIVATES the M16.2
+# integration for the real running app - without this, `_dispatch` would
+# never build a RequestContext/ContextSnapshot at all. No `settings.*`
+# field exists for the World Model's db path (deliberately - M16.1's own
+# correction: "the World Model should continue receiving db_path
+# explicitly through its store/factory APIs," never a config mechanism),
+# so `DEFAULT_WORLD_MODEL_DB_PATH` (app/world_model/sqlite_store.py) - the
+# one place that literal string is actually defined - is imported and
+# passed here explicitly, rather than a second hardcoded copy of it
+# living in this file too. `memory=core.memory` mirrors the same "share
+# the one real MemoryStore, never open a second connection to the same
+# file" convention every store above already follows.
+_world_model_store = create_default_world_model_store(DEFAULT_WORLD_MODEL_DB_PATH)
+_world_model_service = create_default_world_model_service(_world_model_store)
+core.context_engine = create_default_context_engine(_world_model_service, memory=core.memory)
 
 
 @asynccontextmanager

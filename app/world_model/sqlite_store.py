@@ -63,10 +63,21 @@ def new_id() -> str:
     return str(uuid.uuid4())
 
 
+#: The World Model's default db file path - deliberately NOT a
+#: `settings.*` field (M16.1's own correction: "the World Model should
+#: continue receiving db_path explicitly through its store/factory
+#: APIs," never a config mechanism). Named here, once, as the single
+#: source of truth for that literal string, so `app/main.py` (the one
+#: real caller that needs a concrete path to activate the World Model)
+#: imports and passes this explicitly rather than duplicating the
+#: string as a second hardcoded literal - see app/main.py's own wiring.
+DEFAULT_WORLD_MODEL_DB_PATH = "jarvis_world_model.db"
+
+
 class SQLiteWorldModelStore(WorldModelStore):
     """WorldModelStore backed by a local SQLite database file."""
 
-    def __init__(self, db_path: str = "jarvis_world_model.db"):
+    def __init__(self, db_path: str = DEFAULT_WORLD_MODEL_DB_PATH):
         self.db_path = db_path
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(db_path, check_same_thread=False)

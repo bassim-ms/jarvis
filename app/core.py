@@ -116,6 +116,8 @@ from app.capability import (
     DeterministicCapabilityRouter,
 )
 from app.config import settings
+from app.context_engine.engine import ContextEngine
+from app.context_engine.request_builder import build_request_context
 from app.memory.base import MemoryStore, Message
 from app.memory.sqlite_store import SQLiteMemoryStore
 from app.providers.base import AIProvider, ProviderError
@@ -135,6 +137,7 @@ from app.tools.base import ToolResult, ToolResultStatus
 from app.tools.decision import ToolCallBuilder, ToolCallError, ToolCallIncompleteError
 from app.tools.registry import ToolRegistry
 from app.tools.web_search import WebSearchTool
+from app.world_model.base import ContextSnapshot
 
 
 class ConversationNotFoundError(RuntimeError):
@@ -163,6 +166,7 @@ class JarvisCore:
         query_builder: SearchQueryBuilder | None = None,
         capability_router: CapabilityRouter | None = None,
         tool_call_builder: ToolCallBuilder | None = None,
+        context_engine: ContextEngine | None = None,
     ):
         self.provider = provider or create_default_ai_provider_manager()
         self.memory = memory or SQLiteMemoryStore(settings.memory_db_path)
@@ -189,6 +193,18 @@ class JarvisCore:
             search_router=self.router
         )
         self.tool_call_builder = tool_call_builder or ToolCallBuilder()
+        # M16.2: `None` by default (including for the module-level `core`
+        # singleton below) - no existing caller/test passes one, so every
+        # existing behavior is completely unaffected. When given, `_dispatch`
+        # additionally builds a RequestContext/ContextSnapshot for every
+        # message (any capability) and threads it through as a purely
+        # ADDITIVE output - see `handle_chat_with_context`. Nothing reads
+        # or acts on the snapshot itself here: it never reaches a prompt,
+        # a tool call, or a Job's context - Core only ever computes it and
+        # hands it back, so provider routing, M15 planning/execution, and
+        # ToolRegistry dispatch are all byte-for-byte unaffected by this
+        # parameter's mere presence.
+        self.context_engine = context_engine
 
     def handle_chat(
         self, message: str, conversation_id: str | None = None
@@ -214,9 +230,12 @@ class JarvisCore:
         This method's own signature/behavior is unchanged by M15's
         TASK_STATUS/CONFIRMATION additions - see `handle_chat_with_job_id`
         for the one additive way a created Job's id is exposed structurally
-        instead of only in the reply's prose.
+        instead of only in the reply's prose, and `handle_chat_with_context`
+        for the same treatment of M16.2's ContextSnapshot.
         """
-        reply, conversation_id, sources, _job_id = self._dispatch(message, conversation_id)
+        reply, conversation_id, sources, _job_id, _snapshot = self._dispatch(
+            message, conversation_id
+        )
         return reply, conversation_id, sources
 
     def handle_chat_with_job_id(
@@ -232,15 +251,34 @@ class JarvisCore:
         endpoint uses this method instead, to give API clients a real
         structured `job_id` field rather than one embedded in reply text.
         """
+        reply, conversation_id, sources, job_id, _snapshot = self._dispatch(
+            message, conversation_id
+        )
+        return reply, conversation_id, sources, job_id
+
+    def handle_chat_with_context(
+        self, message: str, conversation_id: str | None = None
+    ) -> tuple[str, str, list[SearchSource], str | None, ContextSnapshot | None]:
+        """Identical to `handle_chat_with_job_id`, plus a 5th return value:
+        the ContextSnapshot `_dispatch` built for this message (M16.2), or
+        `None` when no `context_engine` was configured on this JarvisCore
+        instance. Purely additive, the same "new method, existing ones
+        untouched" pattern `handle_chat_with_job_id` already established
+        for `job_id` - `handle_chat`/`handle_chat_with_job_id` keep their
+        exact existing signatures and behavior; this is simply where a
+        caller that actually wants the snapshot (e.g. a future caller
+        that decides what to do with it) can get it. Nothing in this
+        module itself reads or acts on the returned snapshot - it's
+        computed and handed back, never consumed here."""
         return self._dispatch(message, conversation_id)
 
     def _dispatch(
         self, message: str, conversation_id: str | None
-    ) -> tuple[str, str, list[SearchSource], str | None]:
-        """The single implementation `handle_chat`/`handle_chat_with_job_id`
-        both call - capability dispatch and conversation persistence happen
-        exactly once, here, so the two public methods can never drift out
-        of sync with each other."""
+    ) -> tuple[str, str, list[SearchSource], str | None, ContextSnapshot | None]:
+        """The single implementation `handle_chat`/`handle_chat_with_job_id`/
+        `handle_chat_with_context` all call - capability dispatch and
+        conversation persistence happen exactly once, here, so the three
+        public methods can never drift out of sync with each other."""
         if conversation_id is None:
             conversation_id = self.memory.create_conversation()
         elif not self.memory.conversation_exists(conversation_id):
@@ -255,6 +293,20 @@ class JarvisCore:
             decision = self.capability_router.route(message)
         except CapabilityDecisionError as exc:
             raise ProviderError(f"Failed to decide a capability: {exc}") from exc
+
+        # M16.2: purely additive - computed only when a context_engine was
+        # actually configured (never for the default `core` singleton or
+        # any existing test, none of which pass one), and never consumed
+        # by anything below. `build_request_context` reuses the SAME
+        # `decision.capability` this method already computed above - no
+        # second classifier - and ContextEngine.build_snapshot is
+        # read-only (see app/context_engine/engine.py's own module
+        # docstring), so this can never change `reply`/`sources`/`job_id`,
+        # never touches a provider, ToolRegistry, or a Job.
+        context_snapshot: ContextSnapshot | None = None
+        if self.context_engine is not None:
+            request_context = build_request_context(message, capability=decision.capability)
+            context_snapshot = self.context_engine.build_snapshot(request_context)
 
         job_id: str | None = None
 
@@ -276,14 +328,18 @@ class JarvisCore:
                 # hint (see Capability.CONFIRMATION's own docstring), so a
                 # stray affirmative/negative reply falls back to ordinary
                 # conversation, unaffected by CONFIRMATION existing at all.
-                reply, sources = self._handle_direct(message, history, facts, Capability.DIRECT)
+                reply, sources = self._handle_direct(
+                    message, history, facts, Capability.DIRECT, context_snapshot
+                )
         else:
-            reply, sources = self._handle_direct(message, history, facts, decision.capability)
+            reply, sources = self._handle_direct(
+                message, history, facts, decision.capability, context_snapshot
+            )
 
         self.memory.add_message(conversation_id, "user", message)
         self.memory.add_message(conversation_id, "assistant", reply)
 
-        return reply, conversation_id, sources, job_id
+        return reply, conversation_id, sources, job_id, context_snapshot
 
     def _handle_direct(
         self,
@@ -291,6 +347,7 @@ class JarvisCore:
         history: list[Message],
         facts: dict[str, str],
         capability: Capability,
+        context_snapshot: ContextSnapshot | None = None,
     ) -> tuple[str, list[SearchSource]]:
         """DIRECT path (extracted, M15, from what was previously inlined
         in `handle_chat`'s own `else` branch) - also reused by
@@ -299,8 +356,15 @@ class JarvisCore:
         DIRECT message, not a second copy of it. `capability` is passed
         through to `classify_request` (M14) rather than hardcoded, exactly
         as the original inline branch already did - always
-        `Capability.DIRECT` for both callers today."""
-        prompt = self._build_prompt(message, history, facts)
+        `Capability.DIRECT` for both callers today.
+
+        `context_snapshot` (M16.2) is the ONE place a ContextSnapshot
+        actually reaches "existing reasoning" - see `_build_prompt`'s own
+        docstring for exactly how. `None` (no context_engine configured)
+        or an empty snapshot (nothing retrieved) both produce byte-
+        identical prompt text to before this parameter existed - see
+        `_format_world_model_context`."""
+        prompt = self._build_prompt(message, history, facts, context_snapshot)
         # `context_char_count=len(prompt)` is the exact payload about to be
         # sent - the most direct "how much context is this" signal
         # available, no separate length heuristic invented. See
@@ -625,30 +689,122 @@ class JarvisCore:
         history: list[Message],
         facts: dict[str, str],
         max_messages: int | None = None,
+        world_model_context: str = "",
     ) -> str:
-        """Format stored facts and conversation history into plain text -
-        shared by `_build_prompt` (DIRECT, unbounded) and `_handle_search`
-        (SEARCH, bounded to a small recent window via `max_messages`) so
-        both build context the same way instead of duplicating this
-        formatting. Returns "" when there's nothing to include."""
+        """Format stored facts, conversation history, and (M16.2,
+        optional) World Model context into plain text - shared by
+        `_build_prompt` (DIRECT, unbounded, the only caller that ever
+        passes `world_model_context`) and `_handle_search` (SEARCH,
+        bounded to a small recent window via `max_messages`, never
+        passes `world_model_context` - SEARCH's own routing/query-
+        building stays completely untouched by M16.2) so both build
+        context the same way instead of duplicating this formatting.
+        Returns "" when there's nothing to include."""
         parts = []
         if facts:
             facts_text = "\n".join(f"- {key}: {value}" for key, value in facts.items())
             parts.append(f"Known facts about the user:\n{facts_text}")
+        if world_model_context:
+            parts.append(world_model_context)
         if history:
             recent = history if max_messages is None else history[-max_messages:]
             history_text = "\n".join(f"{m.role}: {m.content}" for m in recent)
             parts.append(f"Conversation so far:\n{history_text}")
         return "\n\n".join(parts)
 
+    #: Every ContextSnapshot category this formatter knows how to
+    #: serialize, in a fixed display order - (attribute name, display
+    #: label, per-item -> str). This is NOT a relevance whitelist: all
+    #: nine ContextSnapshot fields are listed here (the same nine
+    #: RequiredContextCategory names, app/context_engine/base.py), so
+    #: every category ContextEngine can ever populate has somewhere to
+    #: go. Whether a category actually HAS anything to show is decided
+    #: entirely by ContextEngine (an empty list here just means "not
+    #: populated," never "excluded by the formatter") - see
+    #: `_format_world_model_context`'s own docstring. `relevant_tasks`
+    #: has no human-readable name on the TaskLink itself (see
+    #: app/world_model/base.py:TaskLink's own docstring on why ref_id is
+    #: opaque) - shown by ref_type:ref_id, the only thing this formatter
+    #: can honestly say about it without importing app.tasks/
+    #: app.orchestration (which it must never do). `relevant_memory` is
+    #: already `list[str]` (ContextSnapshot's own shape - see
+    #: app/world_model/base.py) - the identity function.
+    _WORLD_MODEL_CATEGORIES: tuple = (
+        ("active_projects", "Active projects", lambda p: p.name),
+        ("relevant_goals", "Relevant goals", lambda g: g.title),
+        ("relevant_tasks", "Relevant tasks", lambda t: f"{t.ref_type.value}:{t.ref_id}"),
+        ("upcoming_commitments", "Upcoming commitments", lambda c: c.title),
+        ("upcoming_events", "Upcoming events", lambda e: e.title),
+        ("active_blockers", "Active blockers", lambda b: b.title),
+        ("relevant_resources", "Relevant resources", lambda r: r.name),
+        ("relevant_preferences", "Relevant preferences", lambda p: f"{p.key}={p.value}"),
+        ("relevant_memory", "Relevant memory", lambda m: m),
+    )
+
+    @classmethod
+    def _format_world_model_context(cls, snapshot: ContextSnapshot | None) -> str:
+        """The ONE place a ContextSnapshot (M16.2, app/context_engine/)
+        actually reaches "existing reasoning" - a pure SERIALIZER, never
+        a second decision-maker. Returns "" - contributing NOTHING to
+        the prompt - when `snapshot` is `None` (no context_engine
+        configured on this JarvisCore instance) or when every category
+        is empty (nothing relevant in the World Model for this request,
+        or that category simply wasn't in RequestContext.required_context
+        - ContextEngine.build_snapshot only ever populates a category's
+        list when it was actually requested, so an empty list here
+        already means "not relevant/not requested," with no separate
+        check needed), so an ordinary request with no meaningful
+        world-model context produces byte-identical prompt text to
+        before this integration existed (M16.2's own explicit backward-
+        compatibility requirement).
+
+        This method makes exactly one decision of its own: which of
+        ContextSnapshot's nine fields get a line AT ALL when non-empty
+        (`_WORLD_MODEL_CATEGORIES` above, covering all nine - not a
+        smaller whitelist) and what label/short string to show for each
+        item. It never re-ranks, filters by relevance, truncates, or
+        applies any item/category limit of its own: every category's
+        items are joined in EXACTLY the order `snapshot.<field>` already
+        holds them in - the order ContextEngine.build_snapshot's own
+        relevance sort produced - and every item ContextEngine selected
+        appears, however many that budget-selection actually decided on
+        (app/context_engine/base.py:ContextBudget is the only place a
+        count limit is ever decided). Only ever reads from the snapshot -
+        never queries the World Model itself (that's
+        ContextEngine.build_snapshot's job, already done by the time
+        this runs), and never touches MemoryStore directly either -
+        `relevant_memory` is serialized exactly as ContextEngine already
+        populated it, nothing added, nothing summarized, nothing
+        extracted here."""
+        if snapshot is None:
+            return ""
+
+        lines: list[str] = []
+        for field_name, label, describe in cls._WORLD_MODEL_CATEGORIES:
+            items = getattr(snapshot, field_name)
+            if not items:
+                continue
+            lines.append(f"- {label}: " + ", ".join(describe(item) for item in items))
+
+        if not lines:
+            return ""
+        return "What Rhasspy currently knows from the user's world model:\n" + "\n".join(lines)
+
     @staticmethod
     def _build_prompt(
-        message: str, history: list[Message], facts: dict[str, str]
+        message: str,
+        history: list[Message],
+        facts: dict[str, str],
+        context_snapshot: ContextSnapshot | None = None,
     ) -> str:
-        """Combine stored facts and conversation history into context for
-        the provider. With no facts or history, the raw message is sent
-        unchanged, matching the original single-turn behavior."""
-        context = JarvisCore._format_context(history, facts)
+        """Combine stored facts, conversation history, and (M16.2,
+        optional) World Model context into context for the provider.
+        With none of those, the raw message is sent unchanged, matching
+        the original single-turn behavior."""
+        world_model_context = JarvisCore._format_world_model_context(context_snapshot)
+        context = JarvisCore._format_context(
+            history, facts, world_model_context=world_model_context
+        )
         if not context:
             return message
         return f"{context}\n\nUser: {message}"
