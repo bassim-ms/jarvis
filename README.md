@@ -12,7 +12,7 @@ next milestone. See [Multi-Provider AI Foundation](#multi-provider-ai-foundation
 for the full provider table (base URL/required env/model config per
 provider) and what's still deliberately missing. `SearchRouter`,
 `CapabilityRouter`, `ToolCallBuilder`, Core's DIRECT/SEARCH/TOOL
-dispatch, Google Calendar + Local Rhasspy Tasks (M9), Persistent
+dispatch, Hands-Free Voice + Wake Word (M10), Google Calendar + Local Rhasspy Tasks (M9), Persistent
 Automation Engine (M8), Persistent Tasks, Reminders & Background
 Scheduling (M7), natural-language tool selection (M6.16), capability
 routing (M6.13-M6.15), and the search pipeline (M6.5-6.12) are all
@@ -70,7 +70,10 @@ Run these from inside the `jarvis` folder.
    Google Cloud "Desktop app" OAuth client) and run
    `python -m app.calendar.authorize` once (see
    [Google Calendar](#google-calendar-m9) below) - without that, the
-   calendar tools just fail gracefully with a clear error.
+   calendar tools just fail gracefully with a clear error. Voice
+   (`python -m app.voice.run`) needs a few things downloaded/configured
+   first - see [Hands-Free Voice + Wake Word](#hands-free-voice--wake-word-m10)'s
+   own Setup section below for the exact TODOs.
 
 ## Run the server
 
@@ -172,6 +175,17 @@ jarvis/
       sqlite_store.py      - SQLiteTaskStore: SQLite implementation of TaskStore
       tools.py              - CreateTaskTool/ListTasksTool/CompleteTaskTool/CancelTaskTool
       factory.py             - builds the default TaskStore from config
+    voice/
+      base.py             - Microphone/WakeWordProvider/SpeechToTextProvider/TextToSpeechProvider interfaces + *Error types
+      microphone.py         - SoundDeviceMicrophone: sounddevice-backed Microphone
+      wake_word.py           - OpenWakeWordProvider: local "hey rhasspy" wake-word detection
+      stt.py                  - VoskSTTProvider: local, offline speech-to-text
+      tts.py                   - WindowsSapiTTSProvider: powershell.exe + System.Speech.Synthesis
+      chat_client.py            - ChatClient: the only way this module ever reaches Rhasspy (POSTs to /chat)
+      session.py                 - VoiceState/VoiceSession: the wake-word -> listen -> STT -> /chat -> TTS loop
+      factory.py                  - builds the default Microphone/providers/ChatClient from config
+      run.py                       - `python -m app.voice.run`: the application entry point
+      download_wakeword_model.py    - `python -m app.voice.download_wakeword_model`: one-time model download
     search/
       base.py           - SearchProvider interface and the SearchResult type
       searxng.py         - SearXNG implementation of SearchProvider
@@ -234,6 +248,12 @@ jarvis/
     test_tasks_store.py            - unit tests for SQLiteTaskStore (persistence, lifecycle, restart behavior)
     test_tasks_tools.py            - unit tests for the Task tools, through the Tool Registry
     test_tasks_integration.py      - default-registry wiring + end-to-end Core TOOL dispatch onto tasks
+    test_voice_wake_word.py        - unit tests for OpenWakeWordProvider (threshold, debounce/reset, error mapping)
+    test_voice_stt.py               - unit tests for VoskSTTProvider (missing model, transcription, error mapping)
+    test_voice_tts.py               - unit tests for WindowsSapiTTSProvider (subprocess mocked out, interruption)
+    test_voice_microphone.py        - unit tests for SoundDeviceMicrophone (device open/read/close failures)
+    test_voice_chat_client.py       - unit tests for ChatClient (the /chat HTTP boundary, mocked out)
+    test_voice_session.py           - unit tests for VoiceSession's full state machine, with fakes for every provider
   requirements.txt    - exact dependency versions
   .env.example         - template for your local .env (never commit .env itself)
   .gitignore
@@ -1333,6 +1353,126 @@ Configuration:
 - `JARVIS_TASKS_DB_PATH` - local SQLite file tasks are stored in.
   Defaults to `jarvis_tasks.db`.
 
+## Hands-Free Voice + Wake Word (M10)
+
+A new `app/voice/` module adds a fully local, $0 voice interface - a
+separate process, `python -m app.voice.run`, that talks to the
+**already-running** Rhasspy server (`uvicorn app.main:app`) purely as an
+HTTP client of the existing `/chat` endpoint:
+
+```
+[app/voice/run.py - a separate process, requires the server already running]
+  microphone (continuous, wake-word-only listening)
+    -> WakeWordProvider.process_frame(frame) -> "hey rhasspy" heard?
+    -> Microphone.read() again, now capturing the utterance until silence
+    -> SpeechToTextProvider.transcribe(audio) -> text
+    -> ChatClient.send(text, conversation_id) -> POST 127.0.0.1:8000/chat  [EXISTING, unmodified]
+    -> TextToSpeechProvider.speak(reply)
+    -> back to wake-word listening
+```
+
+- **Never imports `app.core.core`.** `VoiceSession` (`app/voice/
+  session.py`) depends only on `ChatClient` (`app/voice/chat_client.py`),
+  which does nothing but `POST {base_url}/chat` with the exact
+  `{"message", "conversation_id"}` shape `ChatRequest` already expects -
+  voice is just another client, the same way curl or a future UI would
+  be. This milestone changed **zero lines** in `app/core.py`,
+  `app/main.py`, `ToolRegistry`, or any Tool.
+- **No push-to-talk key and no global keyboard listener** - the only
+  trigger is the wake word itself, detected from a continuous stream of
+  audio frames read from the microphone. Four provider interfaces, the
+  same "interface + swappable backend" shape as `AIProvider`/
+  `SearchProvider`/`CalendarProvider` (`app/voice/base.py`):
+  `Microphone`, `WakeWordProvider`, `SpeechToTextProvider`,
+  `TextToSpeechProvider` - each with its own `*Error` type, never a raw
+  third-party exception past its boundary.
+- **Wake word: openWakeWord** (`app/voice/wake_word.py`) - Apache-2.0,
+  fully local ONNX models, **no account or API key of any kind** (unlike
+  commercial wake-word SDKs that require a signed-up access key even on
+  their free tier). Ships a pretrained **"hey_rhasspy"** model - matching
+  the assistant's name (Rhasspy) - that you download once (see Setup below);
+  never fetched automatically. `OpenWakeWordProvider.process_frame`
+  resets the model's internal prediction buffer right after a detection
+  so one utterance of the wake word can't fire twice.
+- **Speech-to-text: Vosk** (`app/voice/stt.py`) - Apache-2.0, fully
+  offline, no account. A small local language model (you download once)
+  transcribes each already-segmented utterance in one shot - not a
+  running/streaming session.
+- **Text-to-speech: Windows SAPI** (`app/voice/tts.py`) - raised through
+  `powershell.exe -File <script>`, the *exact* technique
+  `app/reminders/notifier.py`'s `WindowsToastNotifier` (M7) already
+  established for native Windows capabilities: no pip package, no model
+  download, no account. Uses `subprocess.Popen` (not `.run`) so
+  `stop()` can terminate in-progress speech - the "user interruption
+  where reasonably possible" this milestone asks for, without building
+  full barge-in (listening while speaking, which needs echo cancellation
+  and is explicitly deferred).
+- **Microphone: `sounddevice`** (`app/voice/microphone.py`) - a thin
+  PortAudio binding with prebuilt Windows wheels, opened once at
+  construction so an unavailable microphone is reported clearly at
+  startup (`app/voice/run.py`), not deep inside the listening loop.
+- **Utterance segmentation without a VAD model**: `VoiceSession.
+  _capture_utterance` uses a simple mean-absolute-amplitude threshold -
+  capture ends after `JARVIS_VOICE_SILENCE_SECONDS` of continuous quiet,
+  whether that's "nothing was said at all" or "the user spoke, then
+  paused" (one unified rule, not two special cases), or after
+  `JARVIS_VOICE_MAX_UTTERANCE_SECONDS` regardless. An empty/whitespace-
+  only transcription (silence, or unintelligible audio) skips `/chat`
+  and TTS entirely and returns straight to wake-word listening - it's a
+  normal, expected outcome, not an error.
+- **Privacy**: raw microphone audio only ever exists as an in-memory
+  `bytes` buffer between `_capture_utterance` and
+  `SpeechToTextProvider.transcribe` - never written to disk, never
+  logged. Only the transcribed *text* - the same kind of data a typed
+  `/chat` request already carries - ever leaves this module, over
+  loopback HTTP to a server on the same machine. Every recognition step
+  (wake word, STT) runs locally; no audio or transcript is ever sent to
+  a third party.
+- **Failure isolation** mirrors `ReminderScheduler`/`AutomationEngine`
+  (M7/M8): `run_one_cycle` raises the underlying typed error normally (a
+  direct caller, e.g. a test, sees it); `run_forever` is what catches
+  and isolates a single bad interaction (a `/chat` timeout, a TTS
+  failure, a wake-word engine hiccup) so the process itself never
+  crashes because of it, then returns to wake-word listening. A TTS
+  failure specifically falls back to printing the reply as text rather
+  than losing it. Startup-time failures (no microphone, no downloaded
+  model) are reported once, clearly, by `app/voice/run.py` - never
+  discovered deep inside the loop.
+- Terminal status only - no GUI: `[rhasspy] wake-word listener active` /
+  `wake word detected` / `listening...` / `processing...` / `speaking...`
+  / `returning to wake-word listening`, plus clear one-line messages for
+  errors and empty/silent speech.
+
+### Setup (you need to do this once)
+
+1. `pip install -r requirements.txt` - adds `vosk`, `sounddevice`,
+   `numpy`, `openwakeword` (all free, offline, no account needed;
+   text-to-speech uses Windows SAPI directly, no new package).
+2. **TODO:** download the wake-word model:
+   `python -m app.voice.download_wakeword_model` (fetches the pretrained
+   "hey_rhasspy" model + openWakeWord's required feature models from its
+   GitHub releases - a one-time, $0 file download, not a runtime API
+   call). Set `JARVIS_VOICE_WAKEWORD_MODEL_PATH` to the path it prints.
+3. **TODO:** download a Vosk speech-to-text model yourself from
+   https://alphacephei.com/vosk/models (e.g. the small English model,
+   ~40MB) and extract it. Set `JARVIS_VOICE_VOSK_MODEL_PATH` to that
+   folder.
+4. **TODO (optional):** if you have more than one microphone, list
+   devices with `python -c "import sounddevice as sd; print(sd.query_devices())"`
+   and set `JARVIS_VOICE_INPUT_DEVICE` to the one you want; leave blank
+   for the system default.
+5. Start the server as usual (`uvicorn app.main:app`), then in a
+   separate terminal: `python -m app.voice.run`.
+
+Configuration - see `.env.example` for the full list with defaults:
+`JARVIS_VOICE_CHAT_URL`/`JARVIS_VOICE_CHAT_TIMEOUT_SECONDS` (the `/chat`
+endpoint to call), `JARVIS_VOICE_WAKEWORD_MODEL_PATH`/
+`JARVIS_VOICE_WAKEWORD_THRESHOLD`, `JARVIS_VOICE_VOSK_MODEL_PATH`,
+`JARVIS_VOICE_INPUT_DEVICE`, `JARVIS_VOICE_TTS_VOICE_NAME`/
+`JARVIS_VOICE_TTS_RATE`, `JARVIS_VOICE_SILENCE_SECONDS`/
+`JARVIS_VOICE_MAX_UTTERANCE_SECONDS`/
+`JARVIS_VOICE_SPEECH_AMPLITUDE_THRESHOLD`.
+
 ## Multi-Provider AI Foundation (M11)
 
 M11 adds five more `AIProvider` implementations alongside Gemini - Groq,
@@ -1343,8 +1483,8 @@ registry to construct one by stable name. This is **foundation only**:
 selected, no fallback, no retries, no quota tracking, and no health
 scoring or rotation - that's the next milestone. `SearchRouter`,
 `CapabilityRouter`, `ToolCallBuilder`, Core's DIRECT/SEARCH/TOOL
-dispatch, reminders, automations, calendar, and Rhasspy Tasks are all
-completely unchanged.
+dispatch, voice, reminders, automations, calendar, and Rhasspy Tasks are
+all completely unchanged.
 
 Every provider still implements the same `AIProvider.generate_reply(message: str) -> str`
 interface Gemini already used (`app/providers/base.py`) and raises the
@@ -1405,6 +1545,24 @@ These were not decided now, to avoid overbuilding before they're needed:
 - Database (SQLite) — added when the first feature that needs persistence
   (memory, the search cache, and now tasks/reminders as of M7) is built.
   Each still gets its own local SQLite file rather than a shared one.
+- Barge-in (interrupting Rhasspy mid-sentence by speaking), always-on
+  cloud transcription, wake-word/STT/TTS cloud services, a GUI, remote
+  voice clients, and voice-controlled hardware — all explicitly deferred
+  from M10. Barge-in specifically needs simultaneous mic-listening-
+  during-TTS-playback plus echo cancellation (so Rhasspy doesn't hear
+  itself) - meaningfully harder than push-word-triggered capture, and
+  not attempted here; `TextToSpeechProvider.stop()` covers the narrower
+  "Ctrl+C interrupts speech" case this milestone does support.
+- A dedicated voice activity detection (VAD) model — `VoiceSession`'s
+  amplitude-threshold heuristic is enough to segment one wake-word-
+  triggered utterance; a real VAD model would only earn its cost once
+  always-on listening or barge-in exist.
+- Multi-turn continuous conversation without re-saying the wake word
+  each time — every turn in M10 starts with a fresh wake-word detection,
+  by design (that's what "no push-to-talk key, no always-on listening"
+  means); `conversation_id` still carries across turns so the underlying
+  chat history is continuous even though each turn is separately
+  triggered.
 - Google Tasks sync, multi-calendar/multi-account support, attendee/
   invite management, full RRULE authoring for recurring events, and
   calendar write-conflict/double-booking detection — all explicitly

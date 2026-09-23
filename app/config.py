@@ -106,6 +106,24 @@ class Settings(BaseSettings):
     # of Reminders; no scheduling, no notifications, no external sync.
     tasks_db_path: str = "jarvis_tasks.db"
 
+    # Voice (hands-free wake-word + STT + TTS, see app/voice/) - $0/local
+    # only: openWakeWord for wake-word detection, Vosk for STT, Windows
+    # SAPI for TTS. Model paths have no default - they point at files the
+    # user downloads themselves (see .env.example / README's Voice
+    # Interface section); voice_chat_url is the existing /chat endpoint,
+    # never Core directly.
+    voice_chat_url: str = "http://127.0.0.1:8000"
+    voice_chat_timeout_seconds: float = 60.0
+    voice_wakeword_model_path: str = ""
+    voice_wakeword_threshold: float = 0.5
+    voice_vosk_model_path: str = ""
+    voice_input_device: str = ""  # "" = system default input device
+    voice_tts_voice_name: str = ""  # "" = system default SAPI voice
+    voice_tts_rate: int = 0  # SAPI rate, -10 (slowest) to 10 (fastest)
+    voice_silence_seconds: float = 1.2  # pause length that ends an utterance
+    voice_max_utterance_seconds: float = 15.0  # hard cap on one utterance
+    voice_speech_amplitude_threshold: int = 500  # int16 mean-abs "is this speech" cutoff
+
     model_config = SettingsConfigDict(env_file=".env", env_prefix="JARVIS_")
 
 

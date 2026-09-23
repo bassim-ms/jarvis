@@ -3,3 +3,13 @@ uvicorn[standard]==0.32.1
 pydantic-settings==2.7.0
 pytest==8.3.4
 httpx==0.28.1
+
+# Voice (M10) - wake word, speech-to-text, and microphone input. All
+# free/open-source, fully local/offline at runtime (no account, no API
+# key, no paid tier). Text-to-speech uses Windows SAPI via powershell.exe
+# (already on any Windows install) instead of a pip package - see
+# app/voice/tts.py.
+vosk==0.3.45
+sounddevice==0.5.6
+numpy==2.5.3
+openwakeword==0.6.0
