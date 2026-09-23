@@ -370,6 +370,63 @@ def test_all_providers_failing_raises_one_clean_error():
     assert "second down" in message
 
 
+# --- FreeLLMAPI as the final fallback (5-provider chain) ---------------------
+
+
+def test_full_five_provider_chain_falls_back_to_freellmapi_last():
+    gemini = FakeProvider(errors=[ProviderError("Gemini returned 500: down")])
+    groq = FakeProvider(errors=[ProviderError("Groq returned 500: down")])
+    openrouter = FakeProvider(errors=[ProviderError("OpenRouter returned 500: down")])
+    cloudflare = FakeProvider(errors=[ProviderError("Cloudflare returned 500: down")])
+    freellmapi = FakeProvider(reply="from freellmapi")
+    manager = AIProviderManager(
+        [
+            entry("gemini", gemini),
+            entry("groq", groq),
+            entry("openrouter", openrouter),
+            entry("cloudflare", cloudflare),
+            entry("freellmapi", freellmapi),
+        ],
+        retry_count=0,
+        sleep=no_sleep,
+    )
+
+    reply = manager.generate_reply("hi")
+
+    assert reply == "from freellmapi"
+    assert gemini.calls == 1
+    assert groq.calls == 1
+    assert openrouter.calls == 1
+    assert cloudflare.calls == 1
+    assert freellmapi.calls == 1
+
+
+def test_freellmapi_is_not_attempted_before_earlier_providers_succeed():
+    gemini = FakeProvider(reply="from gemini")
+    freellmapi = FakeProvider(reply="from freellmapi")
+    manager = AIProviderManager([entry("gemini", gemini), entry("freellmapi", freellmapi)])
+
+    reply = manager.generate_reply("hi")
+
+    assert reply == "from gemini"
+    assert freellmapi.calls == 0
+
+
+def test_five_provider_chain_all_failing_raises_one_clean_error_naming_freellmapi():
+    gemini = FakeProvider(errors=[ProviderError("Gemini returned 500: down")])
+    freellmapi = FakeProvider(errors=[ProviderError("FreeLLMAPI returned 500: down")])
+    manager = AIProviderManager(
+        [entry("gemini", gemini), entry("freellmapi", freellmapi)],
+        retry_count=0,
+        sleep=no_sleep,
+    )
+
+    with pytest.raises(AllProvidersFailedError) as excinfo:
+        manager.generate_reply("hi")
+
+    assert "freellmapi" in str(excinfo.value)
+
+
 # --- Disabled providers -------------------------------------------------------
 
 

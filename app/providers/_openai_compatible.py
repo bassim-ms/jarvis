@@ -1,18 +1,22 @@
 """
 Shared HTTP/JSON handling for vendors exposing an OpenAI-compatible
-`/chat/completions` endpoint - Groq, OpenRouter, Mistral, and xAI all
-document this exact request shape (`{"model", "messages": [{"role",
-"content"}]}`) and response shape (`choices[0].message.content`), so this
-base class implements that shape once instead of four times.
+`/chat/completions` endpoint - Groq and OpenRouter both document this
+exact request shape (`{"model", "messages": [{"role", "content"}]}`) and
+response shape (`choices[0].message.content`), so this base class
+implements that shape once instead of twice. Kept as a shared base
+(rather than inlined into groq.py/openrouter.py) because it's also the
+natural extension point if a future OpenAI-compatible provider is added
+later (e.g. a self-hosted local model reachable over the local network
+frequently exposes this same shape).
 
 This is a private module (leading underscore): it is not itself a
 provider and is never selected by name in app/providers/factory.py. Each
-vendor still gets its own module (groq.py, openrouter.py, mistral.py,
-xai.py) with its own error class, base URL, and settings fields - "keep
-the base URL/model configuration provider-specific rather than hardcoding
-assumptions into Core" (M11 requirement) means Core/this base class never
-hardcode a specific vendor's URL or model; only the small, distinct
-subclasses below do, one per vendor.
+vendor still gets its own module (groq.py, openrouter.py) with its own
+error class, base URL, and settings fields - "keep the base URL/model
+configuration provider-specific rather than hardcoding assumptions into
+Core" (M11 requirement) means Core/this base class never hardcode a
+specific vendor's URL or model; only the small, distinct subclasses below
+do, one per vendor.
 
 Gemini and Cloudflare Workers AI are NOT built on this: both have their
 own, meaningfully different request/response JSON (see

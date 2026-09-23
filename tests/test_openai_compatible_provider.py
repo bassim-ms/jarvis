@@ -1,12 +1,11 @@
 """
 Tests for the shared OpenAI-compatible base class
-(app/providers/_openai_compatible.py) that Groq/OpenRouter/Mistral/xAI
-build on. Exercised through a local dummy subclass rather than a real
-vendor, since this base class's JSON handling is identical across all
-four - each vendor's own test file only needs to check its own
-URL/model/key wiring (see tests/test_groq_provider.py etc.), not this
-logic again. All HTTP calls are monkeypatched; no real network call is
-made.
+(app/providers/_openai_compatible.py) that Groq/OpenRouter build on.
+Exercised through a local dummy subclass rather than a real vendor, since
+this base class's JSON handling is identical across both - each vendor's
+own test file only needs to check its own URL/model/key wiring (see
+tests/test_groq_provider.py etc.), not this logic again. All HTTP calls
+are monkeypatched; no real network call is made.
 """
 
 import httpx

@@ -13,7 +13,9 @@ expose regardless of what's configured in .env.
 Audited against the actual current model configuration (verified against
 app/config.py's defaults AND the live .env, which match exactly): Gemini
 `gemini-3.8-flash`, Groq `openai/gpt-oss-120b`, OpenRouter
-`openrouter/auto`, Cloudflare `@cf/meta/llama-3.1-8b-instruct`.
+`openrouter/auto`, Cloudflare `@cf/meta/llama-3.1-8b-instruct`, FreeLLMAPI
+always `auto` (its own internal routing choice, not a fixed model - see
+app/providers/freellmapi.py).
 
 IMPORTANT distinction this audit is built on: whether a *vendor model*
 can technically do something (e.g. gpt-oss and Llama 3.1 both document
@@ -46,14 +48,20 @@ a benchmark:
   only Gemini has an actual prompt-and-validator pair built for here.
   SEARCH_SYNTHESIS records the third, but is treated differently by
   ProviderRouter - see below.
-- Groq, OpenRouter, and Cloudflare are all plain single-turn
-  chat-completion adapters (see _openai_compatible.py, cloudflare.py)
-  that this project has never prompted or validated for structured JSON
-  or tool-call output, so none of them claim those two capabilities. This
-  is an absence of in-repo validation, not a claim that their underlying
-  models are incapable of it - if a future milestone builds and tests a
-  Groq/OpenRouter/Cloudflare prompt+validator pair for either, this
-  registry should be updated to reflect that new, demonstrated fact.
+- Groq, OpenRouter, Cloudflare, and FreeLLMAPI are all plain single-turn
+  chat-completion adapters (see _openai_compatible.py, cloudflare.py,
+  freellmapi.py) that this project has never prompted or validated for
+  structured JSON or tool-call output, so none of them claim those two
+  capabilities. This is an absence of in-repo validation, not a claim
+  that their underlying models are incapable of it - if a future
+  milestone builds and tests a prompt+validator pair for any of them,
+  this registry should be updated to reflect that new, demonstrated
+  fact. FreeLLMAPI specifically routes to whichever free-tier backend it
+  picks per request (model="auto") - even if that backend could support
+  tool-calling/structured output, Jarvis has no visibility into or control
+  over which one answered a given request, so claiming either capability
+  for it would be a guess about an unknown, request-varying backend, not
+  a fact about this adapter.
 - SEARCH_SYNTHESIS is a narrower, more clearly non-unique task than the
   two above: turning already-retrieved search evidence into a grounded,
   cited answer needs no structured/parseable output at all -
@@ -79,6 +87,12 @@ a benchmark:
   intentional, operator-adjustable signal for ProviderRouter's soft
   scoring (never a hard gate), so treat them as "prefer this provider
   when X is requested," not "this provider is objectively faster/bigger."
+  FreeLLMAPI gets neither: its actual latency/context depend entirely on
+  whichever free-tier backend it happens to route a given request to,
+  which varies request to request and is invisible to Jarvis - there is no
+  single, stable characteristic to record a preference for, so it's
+  STANDARD latency and no LONG_CONTEXT claim, same as Cloudflare/
+  OpenRouter.
 - REASONING and CODING are deliberately unassigned to any provider:
   nothing in this codebase measures or differentiates provider quality on
   either axis, so claiming either would be inventing a capability rather
@@ -116,6 +130,7 @@ PROVIDER_CAPABILITIES: dict[str, frozenset[ProviderCapability]] = {
     "groq": frozenset({ProviderCapability.GENERAL_CONVERSATION}),
     "openrouter": frozenset({ProviderCapability.GENERAL_CONVERSATION}),
     "cloudflare": frozenset({ProviderCapability.GENERAL_CONVERSATION}),
+    "freellmapi": frozenset({ProviderCapability.GENERAL_CONVERSATION}),
 }
 
 PROVIDER_LATENCY: dict[str, LatencyTier] = {
@@ -123,6 +138,7 @@ PROVIDER_LATENCY: dict[str, LatencyTier] = {
     "groq": LatencyTier.LOW,
     "openrouter": LatencyTier.STANDARD,
     "cloudflare": LatencyTier.STANDARD,
+    "freellmapi": LatencyTier.STANDARD,
 }
 
 

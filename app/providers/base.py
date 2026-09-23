@@ -5,9 +5,10 @@ Jarvis Core depends only on this interface, never on a specific AI vendor's
 SDK or API shape. New providers get added by implementing AIProvider.
 
 Since M11 (multi-provider foundation), several AIProvider implementations
-exist side by side (Gemini, Groq, OpenRouter, Cloudflare Workers AI,
-Mistral, xAI - see app/providers/factory.py for how they're selected by
-name). The interface itself is unchanged: every provider still takes a
+exist side by side (Gemini, Groq, OpenRouter, Cloudflare Workers AI -
+see app/providers/factory.py for how they're selected by name; this is
+the deliberate, exact set of cloud providers for now). The interface
+itself is unchanged: every provider still takes a
 single prompt string and returns a single reply string, and still raises
 ProviderError (or one of its per-provider subclasses, e.g. GeminiError) on
 failure - that return type and error type ARE "the normalized response/

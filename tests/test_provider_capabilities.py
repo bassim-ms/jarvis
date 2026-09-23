@@ -15,7 +15,7 @@ from app.providers.capabilities import (
     latency_tier_for,
 )
 
-_ALL_PROVIDER_NAMES = {"gemini", "groq", "openrouter", "cloudflare"}
+_ALL_PROVIDER_NAMES = {"gemini", "groq", "openrouter", "cloudflare", "freellmapi"}
 
 
 def test_every_registered_provider_has_capability_metadata():

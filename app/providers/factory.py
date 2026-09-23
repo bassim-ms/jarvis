@@ -7,26 +7,33 @@ no notion of provider selection - this registry exists so a future
 provider-manager milestone (fallback/rotation/health scoring) has
 somewhere to select from, without Core ever needing to know provider
 names itself. Adding a new provider means one entry in
-PROVIDER_FACTORIES/_PROVIDER_INFO - no changes needed anywhere else.
+PROVIDER_FACTORIES/describe_providers - no changes needed anywhere else.
+
+Deliberately exactly four cloud providers for now: Gemini, Groq,
+OpenRouter, Cloudflare Workers AI. A dedicated local model (hosted on a
+separate machine, reached over the local network) is planned as the
+eventual last-resort fallback after these four, and a browser/computer-use
+fallback after that - both future milestones, not built yet. This
+registry's by-name construction is exactly the extension point either
+will need: a local/browser provider is still just another AIProvider
+implementation registered here.
 """
 
 from app.config import settings
 from app.providers.base import AIProvider, ProviderInfo
 from app.providers.cloudflare import CLOUDFLARE_URL, CloudflareProvider
+from app.providers.freellmapi import FreeLLMAPIProvider, freellmapi_url
 from app.providers.gemini import GEMINI_URL, GeminiProvider
 from app.providers.groq import GROQ_URL, GroqProvider
 from app.providers.manager import AIProviderEntry, AIProviderManager
-from app.providers.mistral import MISTRAL_URL, MistralProvider
 from app.providers.openrouter import OPENROUTER_URL, OpenRouterProvider
-from app.providers.xai import XAI_URL, XAIProvider
 
 PROVIDER_FACTORIES: dict[str, type[AIProvider]] = {
     "gemini": GeminiProvider,
     "groq": GroqProvider,
     "openrouter": OpenRouterProvider,
     "cloudflare": CloudflareProvider,
-    "mistral": MistralProvider,
-    "xai": XAIProvider,
+    "freellmapi": FreeLLMAPIProvider,
 }
 
 
@@ -89,32 +96,61 @@ def describe_providers() -> list[ProviderInfo]:
             ),
         ),
         ProviderInfo(
-            name="mistral",
-            display_name="Mistral",
-            base_url=MISTRAL_URL,
-            required_env=["JARVIS_MISTRAL_API_KEY"],
-            model_env="JARVIS_MISTRAL_MODEL",
-            configured=bool(settings.mistral_api_key),
-        ),
-        ProviderInfo(
-            name="xai",
-            display_name="xAI",
-            base_url=XAI_URL,
-            required_env=["JARVIS_XAI_API_KEY"],
-            model_env="JARVIS_XAI_MODEL",
-            configured=bool(settings.xai_api_key),
+            name="freellmapi",
+            display_name="FreeLLMAPI",
+            base_url=freellmapi_url(),
+            required_env=["JARVIS_FREELLMAPI_API_KEY"],
+            # No model_env: FreeLLMAPI always uses "auto" - see
+            # app/providers/freellmapi.py. ProviderInfo.model_env already
+            # defaults to "", so it's simply left unset here.
+            configured=bool(settings.freellmapi_api_key),
         ),
     ]
 
 
-def build_ai_provider_entries() -> list[AIProviderEntry]:
-    """Instantiate the providers named in settings.ai_provider_order, in
-    order, each wrapped in an AIProviderEntry under its registry name -
-    mirrors app/search/factory.py:build_search_providers for AI providers."""
+def _effective_provider_order() -> list[str]:
+    """The actual provider order build_ai_provider_entries() uses - almost
+    always just settings.ai_provider_order, parsed the same way it always
+    has been, with one automatic adjustment: "freellmapi" (see
+    app/providers/freellmapi.py) is appended as the final entry whenever
+    JARVIS_FREELLMAPI_API_KEY is configured, even if
+    JARVIS_AI_PROVIDER_ORDER predates FreeLLMAPI and never mentions it -
+    the only manual configuration step FreeLLMAPI needs is its own API
+    key, never a second edit to JARVIS_AI_PROVIDER_ORDER (an existing,
+    explicit override in .env is not exempt from this). If "freellmapi" is
+    already named anywhere in JARVIS_AI_PROVIDER_ORDER - auto-appended
+    here on a previous call, or typed in by hand - it's always moved to
+    the end: FreeLLMAPI must never be attempted before any other
+    configured provider. If the key is blank and "freellmapi" isn't
+    explicitly named, nothing changes: exactly today's parsed list, in
+    today's order - existing behavior for anyone not using FreeLLMAPI is
+    completely unaffected.
+
+    This derives the effective order in application logic rather than
+    ever writing to settings.ai_provider_order or .env itself - no second
+    routing system, no change to M13's ProviderRouter (which only ever
+    sees whatever ordered entries build_ai_provider_entries() below
+    produces, exactly as it always has)."""
     names = [
         name.strip() for name in settings.ai_provider_order.split(",") if name.strip()
     ]
-    return [AIProviderEntry(name=name, provider=create_provider(name)) for name in names]
+
+    if "freellmapi" in names:
+        names = [name for name in names if name != "freellmapi"] + ["freellmapi"]
+    elif settings.freellmapi_api_key:
+        names = [*names, "freellmapi"]
+
+    return names
+
+
+def build_ai_provider_entries() -> list[AIProviderEntry]:
+    """Instantiate the providers named in _effective_provider_order(), in
+    order, each wrapped in an AIProviderEntry under its registry name -
+    mirrors app/search/factory.py:build_search_providers for AI providers."""
+    return [
+        AIProviderEntry(name=name, provider=create_provider(name))
+        for name in _effective_provider_order()
+    ]
 
 
 def create_default_ai_provider_manager() -> AIProviderManager:

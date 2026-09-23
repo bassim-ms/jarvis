@@ -1,7 +1,7 @@
 """
 Tests for the Cloudflare Workers AI provider. All HTTP calls are
 monkeypatched, so no real API call is made. Cloudflare has its own
-request/response shape (unlike Groq/OpenRouter/Mistral/xAI, which share
+request/response shape (unlike Groq/OpenRouter, which share
 OpenAICompatibleProvider), so it gets its own full test suite rather than
 just a wiring smoke test.
 """

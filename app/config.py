@@ -26,10 +26,12 @@ class Settings(BaseSettings):
     # for the registry these are selected through). Each is independently
     # optional: leaving a provider's API key blank just means that
     # provider raises a clear config error if it's ever actually invoked -
-    # it never affects importing, testing, or starting Rhasspy, and Core
-    # still defaults to Gemini alone (no provider selection/fallback yet).
+    # it never affects importing, testing, or starting Rhasspy. FreeLLMAPI
+    # (below, after Cloudflare) extends this same set as the final
+    # fallback - it's a self-hosted gateway rather than a cloud vendor, so
+    # its base URL is user-configurable instead of fixed like the others.
     groq_api_key: str = ""
-    groq_model: str = "llama-3.3-70b-versatile"
+    groq_model: str = "openai/gpt-oss-120b"
 
     openrouter_api_key: str = ""
     openrouter_model: str = "openrouter/auto"
@@ -40,6 +42,21 @@ class Settings(BaseSettings):
     cloudflare_account_id: str = ""
     cloudflare_model: str = "@cf/meta/llama-3.1-8b-instruct"
 
+    # FreeLLMAPI - a self-hosted, OpenAI-compatible AI gateway
+    # (https://github.com/tashfeenahmed/freellmapi) the user runs locally
+    # (e.g. via Docker Compose); it performs its OWN provider routing/
+    # fallback across whatever free-tier backends it's configured with, so
+    # Jarvis always requests model="auto" (see app/providers/freellmapi.py)
+    # and never reproduces that routing itself - deliberately no
+    # JARVIS_FREELLMAPI_MODEL setting. The key is FreeLLMAPI's own
+    # "unified" key (its Dashboard -> Keys page) - never one of the
+    # individual provider keys FreeLLMAPI may hold internally (e.g. its
+    # own Gemini key), which Jarvis never sees. The base URL is genuinely
+    # configurable, unlike the fixed vendor URLs above, since this is a
+    # locally-hosted address the user controls.
+    freellmapi_api_key: str = ""
+    freellmapi_base_url: str = "http://localhost:3001/v1"
+
     # AI provider manager (M12 - see app/providers/manager.py and
     # app/providers/factory.py:create_default_ai_provider_manager) - ordered
     # fallback with retry/cooldown across the providers above. Local AI is
@@ -47,6 +64,12 @@ class Settings(BaseSettings):
     # Ordered, comma-separated list of provider names to try, with automatic
     # fallback to the next on failure; a name left out of this list is
     # effectively disabled. Same convention as JARVIS_SEARCH_PROVIDER_ORDER.
+    # Deliberately still the original four - FreeLLMAPI is NOT listed here.
+    # factory.py:build_ai_provider_entries() derives the actual effective
+    # order from this value, automatically appending "freellmapi" as the
+    # final entry whenever JARVIS_FREELLMAPI_API_KEY is configured - so
+    # this setting (and any pre-existing JARVIS_AI_PROVIDER_ORDER override
+    # in .env) never needs to be touched to enable FreeLLMAPI.
     ai_provider_order: str = "gemini,groq,openrouter,cloudflare"
     # Extra attempts against the SAME provider for a transient (5xx) error
     # before falling back to the next provider - 2 means up to 3 attempts
@@ -56,12 +79,6 @@ class Settings(BaseSettings):
     # How long a provider that returned a rate-limit (429) error is skipped
     # for, in seconds, before the manager will try it again.
     ai_provider_cooldown_seconds: float = 60.0
-
-    mistral_api_key: str = ""
-    mistral_model: str = "mistral-small-latest"
-
-    xai_api_key: str = ""
-    xai_model: str = "grok-2-latest"
 
     # Memory (local SQLite persistence for conversations and user facts)
     memory_db_path: str = "jarvis_memory.db"
