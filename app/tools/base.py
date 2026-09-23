@@ -110,7 +110,7 @@ class ToolRequirements:
 
 
 class Tool(ABC):
-    """A single capability Jarvis can invoke.
+    """A single capability Rhasspy can invoke.
 
     Implementations declare their own name, description, parameters, and
     permission level, and provide `execute`. Nothing outside a Tool's own

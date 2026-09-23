@@ -64,7 +64,7 @@ class WindowsToastNotifier(Notifier):
     temp `.ps1` file, cleaned up like any other temp file at process exit)
     and reused for every `notify()` call on this instance."""
 
-    def __init__(self, app_id: str = "Jarvis", timeout: float = 15.0):
+    def __init__(self, app_id: str = "Rhasspy", timeout: float = 15.0):
         self.app_id = app_id
         self.timeout = timeout
         self._script_path = self._write_script()
@@ -121,7 +121,7 @@ class WindowsToastNotifier(Notifier):
 class ConsoleNotifier(Notifier):
     """Fallback Notifier for non-Windows environments (see
     app/reminders/factory.py): prints instead of raising a native toast, so
-    Jarvis still runs - just without OS notifications - on a platform
+    Rhasspy still runs - just without OS notifications - on a platform
     WindowsToastNotifier doesn't support."""
 
     def notify(self, title: str, message: str) -> None:

@@ -16,4 +16,4 @@ def test_health_check_returns_ok():
 
     data = response.json()
     assert data["status"] == "ok"
-    assert data["app"] == "Jarvis"
+    assert data["app"] == "Rhasspy"

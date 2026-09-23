@@ -10,7 +10,7 @@ Permission levels are the whole point of this module's safety story:
 `list_events` is READ (no side effects); `create_event`/`update_event`
 are CONFIRM (a calendar event can be visible to other people, unlike a
 local reminder/task); `delete_event` is DANGEROUS (destructive, and
-calendar deletion isn't easily undone from Jarvis's side). None of that
+calendar deletion isn't easily undone from Rhasspy's side). None of that
 is enforced here - ToolRegistry.execute (app/tools/registry.py) already
 does it, unchanged, for every tool - these classes only ever declare
 their own `permission`. A direct, useful consequence: AutomationEngine
@@ -223,7 +223,7 @@ class UpdateEventTool(Tool):
 
 class DeleteEventTool(Tool):
     """Deletes a calendar event. DANGEROUS: destructive and not easily
-    undone from Jarvis's side - requires explicit/strong confirmation,
+    undone from Rhasspy's side - requires explicit/strong confirmation,
     ToolRegistry.execute's existing DANGEROUS handling, unchanged."""
 
     name = "delete_event"

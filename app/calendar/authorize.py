@@ -1,5 +1,5 @@
 """
-Run this once to interactively authorize Jarvis's access to your Google
+Run this once to interactively authorize Rhasspy's access to your Google
 Calendar:
 
     python -m app.calendar.authorize

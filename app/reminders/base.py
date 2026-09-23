@@ -123,7 +123,7 @@ _RECURRENCE_DELTA_KWARGS = {
 def advance_by_recurrence(timestamp: str, recurrence: Recurrence) -> str:
     """Advance an ISO 8601 UTC `timestamp` by one recurrence interval,
     relative to `timestamp` itself - not "now" - so a delay in
-    *processing* a recurring occurrence (Jarvis was offline, or a poll
+    *processing* a recurring occurrence (Rhasspy was offline, or a poll
     was late) doesn't also shift every future occurrence later; it just
     catches up one tick per poll until the timestamp is back in the
     future. Shared by ReminderScheduler (app/reminders/scheduler.py) and
@@ -197,7 +197,7 @@ class ReminderStore(ABC):
     def list_due(self, now: str) -> list[Reminder]:
         """Return every PENDING reminder whose `due_at` is <= `now` - the
         scheduler's only query. Persistence-backed, so it naturally
-        recovers anything that became due while Jarvis wasn't running; no
+        recovers anything that became due while Rhasspy wasn't running; no
         separate "missed reminder" recovery logic is needed anywhere."""
 
     @abstractmethod

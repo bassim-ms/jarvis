@@ -47,7 +47,7 @@ from app.search.router import SearchDecision, SearchRouter
 
 
 class Capability(Enum):
-    """A handler Jarvis can dispatch a message to.
+    """A handler Rhasspy can dispatch a message to.
 
     Only DIRECT, SEARCH, and TOOL exist today. MEMORY/EMAIL/CALENDAR/
     PRINTER/ROBOTIC_ARM/etc. are deliberately not added as members until a

@@ -3,7 +3,7 @@ SQLite-backed implementation of TaskStore, using Python's stdlib sqlite3 -
 the exact same pattern as SQLiteReminderStore/SQLiteMemoryStore: one
 connection held for the store's lifetime, guarded by a lock since
 FastAPI can call into a store from more than one thread, backed by a
-plain local file so tasks survive a Jarvis restart with no special
+plain local file so tasks survive a Rhasspy restart with no special
 recovery code.
 """
 

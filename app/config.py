@@ -1,9 +1,9 @@
 """
-Central configuration for Jarvis.
+Central configuration for Rhasspy.
 
 All settings are read from environment variables (or a local .env file).
 Nothing sensitive is hard-coded here — see .env.example for the list of
-variables Jarvis understands.
+variables Rhasspy understands.
 """
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -11,7 +11,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     # Basic app info
-    app_name: str = "Jarvis"
+    app_name: str = "Rhasspy"
     environment: str = "development"  # development | production
 
     # Server
@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     # for the registry these are selected through). Each is independently
     # optional: leaving a provider's API key blank just means that
     # provider raises a clear config error if it's ever actually invoked -
-    # it never affects importing, testing, or starting Jarvis, and Core
+    # it never affects importing, testing, or starting Rhasspy, and Core
     # still defaults to Gemini alone (no provider selection/fallback yet).
     groq_api_key: str = ""
     groq_model: str = "llama-3.3-70b-versatile"
@@ -102,7 +102,7 @@ class Settings(BaseSettings):
     calendar_id: str = "primary"
     calendar_token_db_path: str = "jarvis_calendar_token.db"
 
-    # Jarvis Tasks (local-only todo items, see app/tasks/) - independent
+    # Rhasspy Tasks (local-only todo items, see app/tasks/) - independent
     # of Reminders; no scheduling, no notifications, no external sync.
     tasks_db_path: str = "jarvis_tasks.db"
 

@@ -1,7 +1,7 @@
 """
 Default tool registration for the running application.
 
-This is the one place that knows the concrete set of tools Jarvis ships
+This is the one place that knows the concrete set of tools Rhasspy ships
 with by default (`web_search`, the reminder tools since M7, the
 automation tools since M8, and the calendar/task tools since M9). It
 exists so the actual application (app/main.py) can get a fully-populated
@@ -62,7 +62,7 @@ def register_default_tools(
     calendar_provider: CalendarProvider | None = None,
     task_store: TaskStore | None = None,
 ) -> AutomationEngine:
-    """Register every tool Jarvis ships with by default onto `registry`,
+    """Register every tool Rhasspy ships with by default onto `registry`,
     and return the AutomationEngine built alongside the automation tools
     (see below) - the one piece of default wiring that isn't itself a
     Tool, so a caller that also needs to start/stop it (app/main.py) gets
