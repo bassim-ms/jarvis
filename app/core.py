@@ -116,9 +116,11 @@ from app.capability import (
     DeterministicCapabilityRouter,
 )
 from app.config import settings
-from app.context_engine.base import RequestContext
+from app.context_engine.base import ContextIntent, RequestContext
 from app.context_engine.engine import ContextEngine
 from app.context_engine.request_builder import build_request_context
+from app.context_planning.base import PlanningDirective
+from app.context_planning.planner import ContextPlanner, ContextPlanningError
 from app.context_reasoning.base import ReasoningResult
 from app.context_reasoning.reasoner import ContextReasoner, ContextReasonerError
 from app.memory.base import MemoryStore, Message
@@ -171,6 +173,7 @@ class JarvisCore:
         tool_call_builder: ToolCallBuilder | None = None,
         context_engine: ContextEngine | None = None,
         context_reasoner: ContextReasoner | None = None,
+        context_planner: ContextPlanner | None = None,
     ):
         self.provider = provider or create_default_ai_provider_manager()
         self.memory = memory or SQLiteMemoryStore(settings.memory_db_path)
@@ -226,6 +229,26 @@ class JarvisCore:
         # M15 planning/execution, or ToolRegistry dispatch beyond the
         # DIRECT-path prompt text it's designed to enrich.
         self.context_reasoner = context_reasoner
+        # M16.4: `None` by default, same "purely additive, off unless
+        # explicitly configured" convention as `context_reasoner` above.
+        # When given, `_dispatch` asks it to classify a strategic
+        # PlanningDirective ONLY for the same two branches that already
+        # reason (DIRECT, and CONFIRMATION's fallback to DIRECT), AND
+        # only when `request_context.context_intent` is itself planning/
+        # action-oriented (PLANNING/TASK_EXECUTION/DECISION_SUPPORT) -
+        # see `_plan_about_context`'s own docstring for exactly why an
+        # informational request never even asks. Threaded into
+        # `_handle_direct`/`_build_prompt` the same way `reasoning_result`
+        # already is - see `_format_planning_directive`. ContextPlanner
+        # itself never executes anything, never mutates the World Model,
+        # and never builds a competing executable plan - M15
+        # (app/orchestration/) remains the sole authoritative executable
+        # planning/execution system (see app/context_planning/planner.py's
+        # own module docstring), so this parameter's mere presence can
+        # never affect provider routing, M15 planning/execution, or
+        # ToolRegistry dispatch beyond the DIRECT-path prompt text it's
+        # designed to enrich.
+        self.context_planner = context_planner
 
     def handle_chat(
         self, message: str, conversation_id: str | None = None
@@ -254,7 +277,7 @@ class JarvisCore:
         instead of only in the reply's prose, and `handle_chat_with_context`
         for the same treatment of M16.2's ContextSnapshot.
         """
-        reply, conversation_id, sources, _job_id, _snapshot, _reasoning = self._dispatch(
+        reply, conversation_id, sources, _job_id, _snapshot, _reasoning, _plan = self._dispatch(
             message, conversation_id
         )
         return reply, conversation_id, sources
@@ -272,7 +295,7 @@ class JarvisCore:
         endpoint uses this method instead, to give API clients a real
         structured `job_id` field rather than one embedded in reply text.
         """
-        reply, conversation_id, sources, job_id, _snapshot, _reasoning = self._dispatch(
+        reply, conversation_id, sources, job_id, _snapshot, _reasoning, _plan = self._dispatch(
             message, conversation_id
         )
         return reply, conversation_id, sources, job_id
@@ -291,11 +314,11 @@ class JarvisCore:
         that decides what to do with it) can get it. Nothing in this
         module itself reads or acts on the returned snapshot - it's
         computed and handed back, never consumed here. Kept as its own
-        5-tuple method (rather than growing to 6) so a caller that only
-        ever wanted M16.2's snapshot is unaffected by M16.3 existing -
-        see `handle_chat_with_reasoning` for the 6-tuple that also
-        exposes the ReasoningResult."""
-        reply, conversation_id, sources, job_id, snapshot, _reasoning = self._dispatch(
+        5-tuple method (rather than growing to 6 or 7) so a caller that
+        only ever wanted M16.2's snapshot is unaffected by M16.3/M16.4
+        existing - see `handle_chat_with_reasoning`/`handle_chat_with_planning`
+        for the wider tuples that also expose those."""
+        reply, conversation_id, sources, job_id, snapshot, _reasoning, _plan = self._dispatch(
             message, conversation_id
         )
         return reply, conversation_id, sources, job_id, snapshot
@@ -317,16 +340,51 @@ class JarvisCore:
         (see `_reason_about_context`'s safe-degradation handling of
         ContextReasonerError). Purely additive, the same "new method,
         existing ones untouched" pattern `handle_chat_with_context`
-        already established for the ContextSnapshot itself."""
+        already established for the ContextSnapshot itself. Kept as its
+        own 6-tuple (rather than growing to 7) so a caller that only
+        ever wanted M16.3's result is unaffected by M16.4 existing - see
+        `handle_chat_with_planning` for the 7-tuple that also exposes
+        the PlanningDirective."""
+        reply, conversation_id, sources, job_id, snapshot, reasoning, _plan = self._dispatch(
+            message, conversation_id
+        )
+        return reply, conversation_id, sources, job_id, snapshot, reasoning
+
+    def handle_chat_with_planning(
+        self, message: str, conversation_id: str | None = None
+    ) -> tuple[
+        str,
+        str,
+        list[SearchSource],
+        str | None,
+        ContextSnapshot | None,
+        ReasoningResult | None,
+        PlanningDirective | None,
+    ]:
+        """Identical to `handle_chat_with_reasoning`, plus a 7th return
+        value: the PlanningDirective `_dispatch` built for this message
+        (M16.4), or `None` when no `context_planner` was configured, no
+        `reasoning_result` was produced, the request's own
+        `RequestContext.context_intent` isn't planning/action-oriented
+        (see `_plan_about_context`'s own docstring for the exact set),
+        or the planner itself failed (safe-degradation, mirroring
+        `_reason_about_context`). Purely additive, the same "new
+        method, existing ones untouched" pattern this module has used
+        for every milestone since M15's own `job_id`."""
         return self._dispatch(message, conversation_id)
 
     def _dispatch(
         self, message: str, conversation_id: str | None
     ) -> tuple[
-        str, str, list[SearchSource], str | None, ContextSnapshot | None, ReasoningResult | None
+        str,
+        str,
+        list[SearchSource],
+        str | None,
+        ContextSnapshot | None,
+        ReasoningResult | None,
+        PlanningDirective | None,
     ]:
-        """The single implementation `handle_chat`/`handle_chat_with_job_id`/
-        `handle_chat_with_context`/`handle_chat_with_reasoning` all call -
+        """The single implementation every `handle_chat*` method calls -
         capability dispatch and conversation persistence happen exactly
         once, here, so the public methods can never drift out of sync
         with each other."""
@@ -374,6 +432,7 @@ class JarvisCore:
         # `_reason_about_context`'s own docstring for the full rationale.
         job_id: str | None = None
         reasoning_result: ReasoningResult | None = None
+        planning_directive: PlanningDirective | None = None
 
         if decision.capability is Capability.SEARCH:
             reply, sources = self._handle_search(message, history, facts)
@@ -393,26 +452,53 @@ class JarvisCore:
                 # hint (see Capability.CONFIRMATION's own docstring), so a
                 # stray affirmative/negative reply falls back to ordinary
                 # conversation, unaffected by CONFIRMATION existing at all -
-                # including M16.3's reasoning step, only reached here
-                # because this fallback is about to call `_handle_direct`.
+                # including M16.3's reasoning step and M16.4's planning
+                # step, only reached here because this fallback is about
+                # to call `_handle_direct`.
                 reasoning_result = self._reason_about_context(
                     message, request_context, context_snapshot
                 )
+                planning_directive = self._plan_about_context(
+                    message, request_context, context_snapshot, reasoning_result
+                )
                 reply, sources = self._handle_direct(
-                    message, history, facts, Capability.DIRECT, context_snapshot, reasoning_result
+                    message,
+                    history,
+                    facts,
+                    Capability.DIRECT,
+                    context_snapshot,
+                    reasoning_result,
+                    planning_directive,
                 )
         else:
             reasoning_result = self._reason_about_context(
                 message, request_context, context_snapshot
             )
+            planning_directive = self._plan_about_context(
+                message, request_context, context_snapshot, reasoning_result
+            )
             reply, sources = self._handle_direct(
-                message, history, facts, decision.capability, context_snapshot, reasoning_result
+                message,
+                history,
+                facts,
+                decision.capability,
+                context_snapshot,
+                reasoning_result,
+                planning_directive,
             )
 
         self.memory.add_message(conversation_id, "user", message)
         self.memory.add_message(conversation_id, "assistant", reply)
 
-        return reply, conversation_id, sources, job_id, context_snapshot, reasoning_result
+        return (
+            reply,
+            conversation_id,
+            sources,
+            job_id,
+            context_snapshot,
+            reasoning_result,
+            planning_directive,
+        )
 
     def _reason_about_context(
         self,
@@ -445,6 +531,66 @@ class JarvisCore:
         except ContextReasonerError:
             return None
 
+    #: RequestContext.context_intent values M16.4 treats as "planning/
+    #: action-oriented" - the ONLY gate `_plan_about_context` applies
+    #: beyond "a reasoning_result exists." Deliberately a small, fixed
+    #: set (the same discipline every other closed-set gate in this
+    #: codebase uses), reusing ContextIntent - itself already derived
+    #: from M13/M14's Capability plus M16.2's own deterministic pattern
+    #: matching (app/context_engine/request_builder.py) - rather than
+    #: adding a new classifier. PROJECT_FOCUS/STATUS/SCHEDULING/GENERAL
+    #: are deliberately excluded: "what's happening with my robotics
+    #: project?" (PROJECT_FOCUS) and "what's the status of X" (STATUS)
+    #: are informational, not planning-oriented, even though they're
+    #: still DIRECT capability and still get a ReasoningResult.
+    _PLANNING_ORIENTED_INTENTS = frozenset(
+        {ContextIntent.PLANNING, ContextIntent.TASK_EXECUTION, ContextIntent.DECISION_SUPPORT}
+    )
+
+    def _plan_about_context(
+        self,
+        message: str,
+        request_context: RequestContext | None,
+        context_snapshot: ContextSnapshot | None,
+        reasoning_result: ReasoningResult | None,
+    ) -> PlanningDirective | None:
+        """M16.4: called from the SAME two `_dispatch` branches as
+        `_reason_about_context` (DIRECT, and CONFIRMATION's fallback to
+        DIRECT) - never for SEARCH/TOOL/TASK/TASK_STATUS/a resolved
+        CONFIRMATION, for the identical "never pay for a call whose
+        result is discarded" reason `_reason_about_context`'s own
+        docstring explains. On TOP of that, this method applies one
+        further gate M16.3's own wiring doesn't need: it only actually
+        asks `context_planner` when `request_context.context_intent` is
+        planning/action-oriented (`_PLANNING_ORIENTED_INTENTS` above) -
+        "do not make every chat message generate a planning directive"
+        (M16.4's own explicit requirement). An informational DIRECT
+        request (e.g. PROJECT_FOCUS/STATUS/GENERAL) still gets ordinary
+        reasoning enrichment from M16.3, but never reaches M16.4 at all.
+
+        Returns `None` when no `context_planner` is configured, no
+        `context_snapshot`/`reasoning_result` exists (a PlanningDirective
+        needs both - M16.4's own stated inputs), the intent isn't
+        planning-oriented, or the planner fails - read-only and never
+        executes anything (see app/context_planning/planner.py's own
+        module docstring), so this can never change `reply`/`sources`/
+        `job_id`, never touches ToolRegistry, the World Model, or a Job,
+        and never creates a competing executable plan (M15 remains the
+        sole authority for that)."""
+        if self.context_planner is None or context_snapshot is None or reasoning_result is None:
+            return None
+        if (
+            request_context is None
+            or request_context.context_intent not in self._PLANNING_ORIENTED_INTENTS
+        ):
+            return None
+        try:
+            return self.context_planner.plan(
+                message, request_context, context_snapshot, reasoning_result
+            )
+        except ContextPlanningError:
+            return None
+
     def _handle_direct(
         self,
         message: str,
@@ -453,6 +599,7 @@ class JarvisCore:
         capability: Capability,
         context_snapshot: ContextSnapshot | None = None,
         reasoning_result: ReasoningResult | None = None,
+        planning_directive: PlanningDirective | None = None,
     ) -> tuple[str, list[SearchSource]]:
         """DIRECT path (extracted, M15, from what was previously inlined
         in `handle_chat`'s own `else` branch) - also reused by
@@ -473,8 +620,11 @@ class JarvisCore:
         `_format_reasoning_result`, which returns "" (no prompt change)
         for `None` or an empty/trivial result, exactly mirroring
         `_format_world_model_context`'s own backward-compatibility
-        guarantee one layer up."""
-        prompt = self._build_prompt(message, history, facts, context_snapshot, reasoning_result)
+        guarantee one layer up. `planning_directive` (M16.4) gets the
+        same treatment again via `_format_planning_directive`."""
+        prompt = self._build_prompt(
+            message, history, facts, context_snapshot, reasoning_result, planning_directive
+        )
         # `context_char_count=len(prompt)` is the exact payload about to be
         # sent - the most direct "how much context is this" signal
         # available, no separate length heuristic invented. See
@@ -801,20 +951,21 @@ class JarvisCore:
         max_messages: int | None = None,
         world_model_context: str = "",
         reasoning_context: str = "",
+        planning_context: str = "",
     ) -> str:
-        """Format stored facts, conversation history, and (M16.2/M16.3,
-        optional) World Model context/reasoning into plain text - shared
-        by `_build_prompt` (DIRECT, unbounded, the only caller that ever
-        passes `world_model_context`/`reasoning_context`) and
-        `_handle_search` (SEARCH, bounded to a small recent window via
-        `max_messages`, never passes either - SEARCH's own routing/
-        query-building stays completely untouched by M16.2/M16.3) so both
-        build context the same way instead of duplicating this
-        formatting. Returns "" when there's nothing to include.
-        `reasoning_context` is placed immediately after
-        `world_model_context` - the reasoning is downstream of, and
-        about, that same context, so it reads naturally right after it,
-        before the conversation history."""
+        """Format stored facts, conversation history, and (M16.2/M16.3/
+        M16.4, optional) World Model context/reasoning/planning into
+        plain text - shared by `_build_prompt` (DIRECT, unbounded, the
+        only caller that ever passes these three) and `_handle_search`
+        (SEARCH, bounded to a small recent window via `max_messages`,
+        never passes any of them - SEARCH's own routing/query-building
+        stays completely untouched by M16.2/M16.3/M16.4) so both build
+        context the same way instead of duplicating this formatting.
+        Returns "" when there's nothing to include. `reasoning_context`
+        is placed immediately after `world_model_context`, and
+        `planning_context` immediately after that - each is downstream
+        of, and about, the one before it, so they read naturally in
+        that order, before the conversation history."""
         parts = []
         if facts:
             facts_text = "\n".join(f"- {key}: {value}" for key, value in facts.items())
@@ -823,6 +974,8 @@ class JarvisCore:
             parts.append(world_model_context)
         if reasoning_context:
             parts.append(reasoning_context)
+        if planning_context:
+            parts.append(planning_context)
         if history:
             recent = history if max_messages is None else history[-max_messages:]
             history_text = "\n".join(f"{m.role}: {m.content}" for m in recent)
@@ -956,24 +1109,83 @@ class JarvisCore:
         )
 
     @staticmethod
+    def _format_planning_directive(planning_directive: PlanningDirective | None) -> str:
+        """The ONE place a PlanningDirective (M16.4, app/context_planning/)
+        actually reaches "existing response generation" - a pure
+        SERIALIZER, exactly the same role `_format_reasoning_result`
+        plays for a ReasoningResult one layer down, and the same
+        backward-compatibility guarantee: returns "" - contributing
+        NOTHING to the prompt - when `planning_directive` is `None` (no
+        context_planner configured, no reasoning_result to plan from,
+        the request's intent wasn't planning-oriented, or the planner
+        failed) or when `planning_directive.is_empty()` (NONE, with
+        nothing else - see app/context_planning/planner.py's own
+        empty-context short circuit), so an informational/non-planning
+        request produces byte-identical prompt text to before M16.4
+        existed.
+
+        Never re-derives, re-classifies, or second-guesses anything in
+        `planning_directive` - only decides how to lay its already-
+        validated fields out as text. `provenance` identifiers are
+        deliberately NOT shown here, same as `_format_reasoning_result`
+        (internal grounding metadata, not end-user-facing text). This
+        method NEVER creates, suggests creating verbatim, or dispatches
+        to `create_job`/any tool - it only ever describes the
+        directive's own already-validated fields as plain text; whether
+        and how a reply built from this actually invites the user to
+        start a task remains entirely up to the provider's own
+        response, exactly as it already is for any other prompt
+        content."""
+        if planning_directive is None or planning_directive.is_empty():
+            return ""
+
+        lines = [
+            f"Objective: {planning_directive.objective}",
+            f"Planning type: {planning_directive.planning_type.value}",
+        ]
+        for field_name, label in (
+            ("contextual_constraints", "Contextual constraints"),
+            ("relevant_resources", "Relevant resources"),
+            ("dependencies", "Dependencies"),
+        ):
+            items = getattr(planning_directive, field_name)
+            if items:
+                lines.append(f"{label}: " + "; ".join(item.text for item in items))
+        if planning_directive.assumptions:
+            lines.append("Assumptions: " + "; ".join(planning_directive.assumptions))
+        if planning_directive.suggested_approach:
+            lines.append(f"Suggested approach: {planning_directive.suggested_approach}")
+        if planning_directive.requires_execution:
+            lines.append(
+                "This may require actually starting a task - only if the user "
+                "asks for that, it goes through Rhasspy's existing task system."
+            )
+        return "What Rhasspy's planning about this request concluded:\n" + "\n".join(
+            f"- {line}" for line in lines
+        )
+
+    @staticmethod
     def _build_prompt(
         message: str,
         history: list[Message],
         facts: dict[str, str],
         context_snapshot: ContextSnapshot | None = None,
         reasoning_result: ReasoningResult | None = None,
+        planning_directive: PlanningDirective | None = None,
     ) -> str:
-        """Combine stored facts, conversation history, and (M16.2/M16.3,
-        optional) World Model context/reasoning into context for the
-        provider. With none of those, the raw message is sent unchanged,
-        matching the original single-turn behavior."""
+        """Combine stored facts, conversation history, and (M16.2/M16.3/
+        M16.4, optional) World Model context/reasoning/planning into
+        context for the provider. With none of those, the raw message
+        is sent unchanged, matching the original single-turn behavior."""
         world_model_context = JarvisCore._format_world_model_context(context_snapshot)
         reasoning_context = JarvisCore._format_reasoning_result(reasoning_result)
+        planning_context = JarvisCore._format_planning_directive(planning_directive)
         context = JarvisCore._format_context(
             history,
             facts,
             world_model_context=world_model_context,
             reasoning_context=reasoning_context,
+            planning_context=planning_context,
         )
         if not context:
             return message

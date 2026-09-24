@@ -30,6 +30,7 @@ from app.automation.factory import create_default_automation_store
 from app.calendar.factory import create_default_calendar_provider
 from app.config import settings
 from app.context_engine.factory import create_default_context_engine
+from app.context_planning.factory import create_default_context_planner
 from app.context_reasoning.factory import create_default_context_reasoner
 from app.core import ConversationNotFoundError, core
 from app.orchestration.factory import create_default_job_engine, create_default_job_store
@@ -129,6 +130,21 @@ core.context_engine = create_default_context_engine(_world_model_service, memory
 # provider at all, keeping this activation backward-compatible with
 # every ordinary request the way M16.2's own activation above already is.
 core.context_reasoner = create_default_context_reasoner(core.provider)
+
+# Context-Aware Planning (M16.4) - wired onto `core` the same way M16.3
+# just was, immediately above: `core.context_planner` defaults to `None`
+# (see JarvisCore.__init__), so this is what actually ACTIVATES M16.4 for
+# the real running app. Also routed through `core.provider` - never a
+# second, separately configured AI client. See app/core.py's own
+# `_plan_about_context` for why this only ever runs for planning/action-
+# oriented requests (never every chat message), and
+# app/context_planning/planner.py for why a request with nothing to plan
+# around never reaches the provider at all - both keep this activation
+# backward-compatible with every ordinary/informational request the way
+# M16.2/M16.3's own activation above already is. M16.4 never creates a
+# Job itself: JarvisCore._handle_task's existing `create_job` dispatch
+# (untouched by this milestone) remains the only path that does.
+core.context_planner = create_default_context_planner(core.provider)
 
 
 @asynccontextmanager
