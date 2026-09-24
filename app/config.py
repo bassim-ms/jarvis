@@ -83,6 +83,14 @@ class Settings(BaseSettings):
     # Memory (local SQLite persistence for conversations and user facts)
     memory_db_path: str = "jarvis_memory.db"
 
+    # Identity context (small, local, human-editable Markdown files - see
+    # app/identity.py) - Jarvis's own personality and what it knows about
+    # the user, loaded once as static prompt context for the DIRECT path.
+    # Plain relative paths, same convention as every other *_db_path
+    # setting above; defaults point at the repo root, next to README.md.
+    personality_file_path: str = "personality.md"
+    user_profile_file_path: str = "user_profile.md"
+
     # SearXNG (web search provider) - base URL of a running SearXNG instance
     searxng_url: str = ""
 

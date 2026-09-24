@@ -33,6 +33,7 @@ from app.context_engine.factory import create_default_context_engine
 from app.context_planning.factory import create_default_context_planner
 from app.context_reasoning.factory import create_default_context_reasoner
 from app.core import ConversationNotFoundError, core
+from app.identity import load_identity_context
 from app.orchestration.factory import create_default_job_engine, create_default_job_store
 from app.providers.base import ProviderError
 from app.reminders.factory import create_default_reminder_store, create_default_scheduler
@@ -145,6 +146,19 @@ core.context_reasoner = create_default_context_reasoner(core.provider)
 # Job itself: JarvisCore._handle_task's existing `create_job` dispatch
 # (untouched by this milestone) remains the only path that does.
 core.context_planner = create_default_context_planner(core.provider)
+
+# Identity context (personality.md/user_profile.md, repo root - see
+# app/identity.py) - `core.identity_context` defaults to `None` (see
+# JarvisCore.__init__), so this is what actually ACTIVATES it for the
+# real running app. Loaded ONCE here (a plain, static string - these are
+# small local files, not a per-request lookup), the same "build it here,
+# attach it to core" pattern every store/engine above already uses.
+# `load_identity_context` degrades to "" for a missing/unreadable file -
+# never an error - so a not-yet-created or briefly malformed file never
+# breaks server startup or an ordinary chat turn.
+core.identity_context = load_identity_context(
+    settings.personality_file_path, settings.user_profile_file_path
+)
 
 
 @asynccontextmanager

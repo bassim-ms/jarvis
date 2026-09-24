@@ -174,6 +174,7 @@ class JarvisCore:
         context_engine: ContextEngine | None = None,
         context_reasoner: ContextReasoner | None = None,
         context_planner: ContextPlanner | None = None,
+        identity_context: str | None = None,
     ):
         self.provider = provider or create_default_ai_provider_manager()
         self.memory = memory or SQLiteMemoryStore(settings.memory_db_path)
@@ -249,6 +250,19 @@ class JarvisCore:
         # ToolRegistry dispatch beyond the DIRECT-path prompt text it's
         # designed to enrich.
         self.context_planner = context_planner
+        # Identity context (personality.md/user_profile.md - see
+        # app/identity.py): `None` by default, same "purely additive, off
+        # unless explicitly configured" convention as context_engine/
+        # context_reasoner/context_planner above - no existing caller/
+        # test passes one. When given, `_handle_direct` includes it in
+        # every DIRECT prompt as plain, static, already-loaded text (see
+        # `_build_prompt`) - it is never re-read per request, never
+        # parsed for tool-call syntax, never reaches ToolRegistry or the
+        # World Model, and never affects SEARCH/TOOL/TASK/TASK_STATUS/
+        # CONFIRMATION dispatch, which don't call `_handle_direct` at all
+        # (a resolved CONFIRMATION included - only its fallback-to-DIRECT
+        # branch does).
+        self.identity_context = identity_context
 
     def handle_chat(
         self, message: str, conversation_id: str | None = None
@@ -621,9 +635,22 @@ class JarvisCore:
         for `None` or an empty/trivial result, exactly mirroring
         `_format_world_model_context`'s own backward-compatibility
         guarantee one layer up. `planning_directive` (M16.4) gets the
-        same treatment again via `_format_planning_directive`."""
+        same treatment again via `_format_planning_directive`.
+
+        `self.identity_context` (personality.md/user_profile.md, see
+        app/identity.py) is read here rather than threaded through
+        `_dispatch` - it's a static string computed once at Core
+        construction, never derived per-request the way the other three
+        are, so there's nothing for `_dispatch` to compute or pass
+        down."""
         prompt = self._build_prompt(
-            message, history, facts, context_snapshot, reasoning_result, planning_directive
+            message,
+            history,
+            facts,
+            context_snapshot,
+            reasoning_result,
+            planning_directive,
+            self.identity_context,
         )
         # `context_char_count=len(prompt)` is the exact payload about to be
         # sent - the most direct "how much context is this" signal
@@ -952,21 +979,27 @@ class JarvisCore:
         world_model_context: str = "",
         reasoning_context: str = "",
         planning_context: str = "",
+        identity_context: str = "",
     ) -> str:
-        """Format stored facts, conversation history, and (M16.2/M16.3/
-        M16.4, optional) World Model context/reasoning/planning into
-        plain text - shared by `_build_prompt` (DIRECT, unbounded, the
-        only caller that ever passes these three) and `_handle_search`
-        (SEARCH, bounded to a small recent window via `max_messages`,
-        never passes any of them - SEARCH's own routing/query-building
-        stays completely untouched by M16.2/M16.3/M16.4) so both build
-        context the same way instead of duplicating this formatting.
-        Returns "" when there's nothing to include. `reasoning_context`
-        is placed immediately after `world_model_context`, and
-        `planning_context` immediately after that - each is downstream
-        of, and about, the one before it, so they read naturally in
-        that order, before the conversation history."""
+        """Format identity context, stored facts, conversation history,
+        and (M16.2/M16.3/M16.4, optional) World Model context/reasoning/
+        planning into plain text - shared by `_build_prompt` (DIRECT,
+        unbounded, the only caller that ever passes any of these) and
+        `_handle_search` (SEARCH, bounded to a small recent window via
+        `max_messages`, never passes any of them - SEARCH's own routing/
+        query-building stays completely untouched) so both build context
+        the same way instead of duplicating this formatting. Returns ""
+        when there's nothing to include. `identity_context` (app/
+        identity.py) goes FIRST - static personality/user-profile
+        framing, not derived from this request, so it reads naturally
+        ahead of everything else. `reasoning_context` is placed
+        immediately after `world_model_context`, and `planning_context`
+        immediately after that - each is downstream of, and about, the
+        one before it, so they read naturally in that order, before the
+        conversation history."""
         parts = []
+        if identity_context:
+            parts.append(identity_context)
         if facts:
             facts_text = "\n".join(f"- {key}: {value}" for key, value in facts.items())
             parts.append(f"Known facts about the user:\n{facts_text}")
@@ -1172,11 +1205,18 @@ class JarvisCore:
         context_snapshot: ContextSnapshot | None = None,
         reasoning_result: ReasoningResult | None = None,
         planning_directive: PlanningDirective | None = None,
+        identity_context: str | None = None,
     ) -> str:
-        """Combine stored facts, conversation history, and (M16.2/M16.3/
-        M16.4, optional) World Model context/reasoning/planning into
-        context for the provider. With none of those, the raw message
-        is sent unchanged, matching the original single-turn behavior."""
+        """Combine identity context, stored facts, conversation history,
+        and (M16.2/M16.3/M16.4, optional) World Model context/reasoning/
+        planning into context for the provider. With none of those, the
+        raw message is sent unchanged, matching the original single-turn
+        behavior. `identity_context` (app/identity.py) is already a
+        plain, pre-formatted string (or `None`/"") - this method makes
+        no decision about its content, only where it goes: first, ahead
+        of everything else, since it's static background identity/
+        personality framing rather than anything derived from this
+        specific request."""
         world_model_context = JarvisCore._format_world_model_context(context_snapshot)
         reasoning_context = JarvisCore._format_reasoning_result(reasoning_result)
         planning_context = JarvisCore._format_planning_directive(planning_directive)
@@ -1186,6 +1226,7 @@ class JarvisCore:
             world_model_context=world_model_context,
             reasoning_context=reasoning_context,
             planning_context=planning_context,
+            identity_context=identity_context or "",
         )
         if not context:
             return message
