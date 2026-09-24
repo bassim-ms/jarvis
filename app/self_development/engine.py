@@ -61,7 +61,12 @@ from app.self_development.base import (
 )
 from app.self_development.git import GitClient, branch_name_for
 from app.self_development.planner import DevelopmentPlanner, DevelopmentPlanningError
-from app.self_development.safety import is_protected_system_path
+from app.self_development.safety import (
+    PathSafetyError,
+    PathTraversalError,
+    is_protected_system_path,
+    resolve_within_root,
+)
 from app.tools.base import ToolResultStatus
 from app.tools.registry import ToolRegistry
 
@@ -227,6 +232,17 @@ class SelfDevelopmentEngine:
             session.log(f"Could not produce a development plan: {exc}")
             return session
 
+        ungrounded = self._find_ungrounded_file_paths(plan)
+        if ungrounded:
+            session.stage = SessionStage.PLAN_REJECTED
+            session.log(
+                "Rejected an ungrounded development plan - proposed "
+                f"file(s) not grounded in the actual repository: "
+                f"{', '.join(ungrounded)}. Ask again, or narrow the "
+                "request to files/directories that already exist."
+            )
+            return session
+
         session.plan = plan
         session.stage = SessionStage.PLAN_PROPOSED
         session.log("Development plan proposed - awaiting approval.")
@@ -241,6 +257,39 @@ class SelfDevelopmentEngine:
                 "specific files can be touched."
             )
         return session
+
+    def _find_ungrounded_file_paths(self, plan: DevelopmentPlan) -> tuple[str, ...]:
+        """A proposed EDIT to a real, already-existing file is always
+        grounded. A proposed BRAND-NEW file is grounded only if it
+        belongs inside a directory that already exists in this
+        repository - self-development may add a new file, but never
+        invents an entirely new directory/subsystem out of thin air
+        just because the planner's own LLM call happened to mention one
+        (a live test surfaced exactly this: a plan naming files under a
+        made-up "schemas/"-style location that doesn't exist anywhere
+        in the real repository). Returns every offending path, so the
+        caller rejects the WHOLE plan - never silently drops just the
+        offending file(s), the same fail-closed discipline every other
+        structural check in this package already uses (unexpected JSON
+        fields, unknown permissions, protected/secret paths, ...)."""
+        ungrounded: list[str] = []
+        for change in plan.files_affected:
+            if is_protected_system_path(change.path):
+                # A SEPARATE, already fully-enumerated fixed allowlist
+                # (PROTECTED_SYSTEM_PATH_PREFIXES) - never a free-form
+                # path the LLM could hallucinate into existing, so
+                # directory-existence grounding doesn't apply to it;
+                # SECURITY_EDIT's own separate approval gate is what
+                # actually protects these paths.
+                continue
+            try:
+                resolved = resolve_within_root(self.project_root, change.path)
+            except (PathSafetyError, PathTraversalError):
+                ungrounded.append(change.path)
+                continue
+            if not resolved.parent.is_dir():
+                ungrounded.append(change.path)
+        return tuple(ungrounded)
 
     def _build_repo_digest(self) -> str:
         result = self.tools.execute("self_dev_list_files")

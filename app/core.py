@@ -485,6 +485,12 @@ class JarvisCore:
         reasoning_result: ReasoningResult | None = None
         planning_directive: PlanningDirective | None = None
 
+        # Computed ONCE, before dispatch, and reused by the SELF_
+        # DEVELOPMENT/SELF_DEV_APPROVAL/plain-fallback branches below -
+        # see `_active_self_dev_sessions`'s own docstring for exactly
+        # what "active" means and why this is conversation-scoped only.
+        active_self_dev_sessions = self._active_self_dev_sessions(conversation_id)
+
         if decision.capability is Capability.SEARCH:
             reply, sources = self._handle_search(message, history, facts)
         elif decision.capability is Capability.TOOL:
@@ -505,44 +511,41 @@ class JarvisCore:
                 # conversation, unaffected by CONFIRMATION existing at all -
                 # including M16.3's reasoning step and M16.4's planning
                 # step, only reached here because this fallback is about
-                # to call `_handle_direct`.
-                reasoning_result = self._reason_about_context(
-                    message, request_context, context_snapshot
-                )
-                planning_directive = self._plan_about_context(
-                    message, request_context, context_snapshot, reasoning_result
-                )
-                reply, sources = self._handle_direct(
-                    message,
-                    history,
-                    facts,
-                    Capability.DIRECT,
-                    context_snapshot,
-                    reasoning_result,
-                    planning_directive,
+                # to call `_handle_direct`. Deliberately NEVER guarded by
+                # `active_self_dev_sessions` - an M15 Job's own "yes"/"no"
+                # must keep working exactly as before regardless of any
+                # self-development session also pending in this same
+                # conversation (see `_active_self_dev_sessions`'s own
+                # docstring), and a self-development session's approval
+                # has its own, separate SELF_DEV_APPROVAL capability.
+                reply, sources, reasoning_result, planning_directive = (
+                    self._fallback_to_direct(
+                        message, history, facts, request_context, context_snapshot
+                    )
                 )
         elif decision.capability is Capability.SELF_DEVELOPMENT:
-            if self.self_development_engine is None:
+            if active_self_dev_sessions:
+                # A self-development session is ALREADY awaiting an
+                # explicit decision in THIS conversation - a new
+                # development request must never silently start a
+                # second, competing session (which would effectively
+                # abandon the first) - see `_format_pending_self_dev_
+                # notice`. No engine call, no LLM call.
+                reply, sources = (
+                    self._format_pending_self_dev_notice(active_self_dev_sessions),
+                    [],
+                )
+            elif self.self_development_engine is None:
                 # No engine configured (every existing caller/test, and
                 # the module-level `core` singleton unless app/main.py
                 # wires one) - a clearly-identified development request
                 # falls back to ordinary DIRECT handling rather than a
                 # dead end, the exact same "hint, not a guarantee" fallback
                 # CONFIRMATION's own branch above already uses.
-                reasoning_result = self._reason_about_context(
-                    message, request_context, context_snapshot
-                )
-                planning_directive = self._plan_about_context(
-                    message, request_context, context_snapshot, reasoning_result
-                )
-                reply, sources = self._handle_direct(
-                    message,
-                    history,
-                    facts,
-                    Capability.DIRECT,
-                    context_snapshot,
-                    reasoning_result,
-                    planning_directive,
+                reply, sources, reasoning_result, planning_directive = (
+                    self._fallback_to_direct(
+                        message, history, facts, request_context, context_snapshot
+                    )
                 )
             else:
                 reply, sources = self._handle_self_development(
@@ -556,41 +559,40 @@ class JarvisCore:
             )
             if approval_result is not None:
                 reply, sources = approval_result
+            elif active_self_dev_sessions:
+                # The named gate ("approve the commit", say) didn't match
+                # what's actually pending (e.g. still awaiting plan
+                # approval) - tell the user the real pending gate instead
+                # of falling through to a generic, LLM-authored reply.
+                reply, sources = (
+                    self._format_pending_self_dev_notice(active_self_dev_sessions),
+                    [],
+                )
             else:
-                # Either no engine is configured, or no session in THIS
+                # Either no engine is configured, or no session in ANY
                 # conversation is actually awaiting the named gate right
                 # now - the same "hint, not a guarantee" fallback
                 # CONFIRMATION/SELF_DEVELOPMENT already use above.
-                reasoning_result = self._reason_about_context(
-                    message, request_context, context_snapshot
+                reply, sources, reasoning_result, planning_directive = (
+                    self._fallback_to_direct(
+                        message, history, facts, request_context, context_snapshot
+                    )
                 )
-                planning_directive = self._plan_about_context(
-                    message, request_context, context_snapshot, reasoning_result
-                )
-                reply, sources = self._handle_direct(
-                    message,
-                    history,
-                    facts,
-                    Capability.DIRECT,
-                    context_snapshot,
-                    reasoning_result,
-                    planning_directive,
-                )
+        elif active_self_dev_sessions:
+            # Every other capability this router can produce for an
+            # otherwise-unclassified message (DIRECT/SEARCH's own
+            # "else") - a self-development session is awaiting an
+            # explicit decision in THIS conversation, so this message is
+            # treated as a self-development follow-up rather than being
+            # handed to a generic, ungrounded LLM reply that could
+            # invent unrelated content (V1's own explicit requirement).
+            # SEARCH/TOOL/TASK/TASK_STATUS/CONFIRMATION are unaffected -
+            # they're each already handled by their own branch above,
+            # never reaching here.
+            reply, sources = self._format_pending_self_dev_notice(active_self_dev_sessions), []
         else:
-            reasoning_result = self._reason_about_context(
-                message, request_context, context_snapshot
-            )
-            planning_directive = self._plan_about_context(
-                message, request_context, context_snapshot, reasoning_result
-            )
-            reply, sources = self._handle_direct(
-                message,
-                history,
-                facts,
-                decision.capability,
-                context_snapshot,
-                reasoning_result,
-                planning_directive,
+            reply, sources, reasoning_result, planning_directive = self._fallback_to_direct(
+                message, history, facts, request_context, context_snapshot
             )
 
         self.memory.add_message(conversation_id, "user", message)
@@ -1127,6 +1129,119 @@ class JarvisCore:
         "security_edit": SessionStage.AWAITING_SECURITY_APPROVAL,
         "commit": SessionStage.AWAITING_COMMIT_APPROVAL,
     }
+
+    #: Derived from `_SELF_DEV_GATE_STAGES` (never a second, hand-
+    #: maintained list) - the stages that mean "this session is
+    #: genuinely awaiting one of the three explicit approval gates
+    #: right now," used by `_active_self_dev_sessions` to decide
+    #: whether a conversation has a session actively awaiting
+    #: interaction. Deliberately excludes every terminal/declined stage
+    #: (COMMITTED, PLAN_REJECTED, SECURITY_EDIT_DECLINED, COMMIT_
+    #: DECLINED, ROLLED_BACK, CHECKS_FAILED, ...) - once a session is
+    #: resolved one way or another, it stops being "active" and a new
+    #: request in the same conversation is free to start a fresh one.
+    _AWAITING_SELF_DEV_INTERACTION_STAGES = frozenset(_SELF_DEV_GATE_STAGES.values())
+
+    def _active_self_dev_sessions(self, conversation_id: str) -> list[DevelopmentSession]:
+        """Every session THIS SAME conversation itself started that is
+        still sitting at one of the three explicit approval gates -
+        NEVER a session from a different conversation (see `_handle_
+        self_dev_approval`'s own docstring for why cross-conversation
+        lookup is never done at all: SECURITY_EDIT/COMMIT are
+        DANGEROUS-tier, so association must be exact).
+
+        Used for two things, both in `_dispatch`: refusing to start a
+        REDUNDANT new self-development session while one is already
+        pending in this conversation (which would otherwise silently
+        abandon the pending one), and refusing to let a message that
+        doesn't resolve the pending gate fall through to a generic,
+        ungrounded DIRECT/SEARCH reply - the exact failure mode a live
+        test surfaced: a follow-up message that didn't match any
+        approval gate reached ordinary DIRECT handling and the LLM
+        answered with an invented, unrelated "plan" of its own, with no
+        connection to the real, still-pending session at all.
+
+        Deliberately does NOT affect TOOL/TASK/TASK_STATUS/CONFIRMATION -
+        each of those is handled by its own `_dispatch` branch before
+        this is ever consulted, so an M15 Job's own pending confirmation
+        keeps working exactly as before regardless of a self-development
+        session also being active in the same conversation, and vice
+        versa (see tests/test_core_self_dev_approval_integration.py's
+        own M15-isolation tests)."""
+        if self.self_development_engine is None:
+            return []
+        return [
+            session
+            for session in self.self_development_engine.sessions.values()
+            if session.conversation_id == conversation_id
+            and session.stage in self._AWAITING_SELF_DEV_INTERACTION_STAGES
+        ]
+
+    @staticmethod
+    def _format_pending_self_dev_notice(sessions: list[DevelopmentSession]) -> str:
+        """Pure, deterministic, LLM-free text - never calls the
+        provider, never starts or advances any session. Tells the user
+        exactly which reply resolves the pending session, and restates
+        the conversation_id so a client that isn't already tracking it
+        has an explicit, unmissable reminder to send it back (the
+        actual client-contract gap a live test exposed: `/chat` already
+        returns `conversation_id` in every response, and its own
+        docstring in app/main.py already says to pass it back, but
+        nothing in the reply text itself said so)."""
+        if len(sessions) > 1:
+            ids = ", ".join(session.id for session in sessions)
+            return (
+                "You have more than one self-development session awaiting "
+                f"a decision in this conversation: {ids}. Resolve one "
+                "before starting or continuing another."
+            )
+
+        session = sessions[0]
+        gate_phrase = {
+            SessionStage.PLAN_PROPOSED: "the plan",
+            SessionStage.AWAITING_SECURITY_APPROVAL: "the security edit",
+            SessionStage.AWAITING_COMMIT_APPROVAL: "the commit",
+        }[session.stage]
+        return (
+            f"You already have a self-development session ({session.id}) "
+            f"awaiting a decision on {gate_phrase}. Reply 'Approve "
+            f"{gate_phrase}.' or 'Reject {gate_phrase}.' before starting a "
+            "new request. Keep using conversation_id "
+            f"'{session.conversation_id}' so this reply continues the same "
+            "session."
+        )
+
+    def _fallback_to_direct(
+        self,
+        message: str,
+        history: list[Message],
+        facts,
+        request_context: RequestContext | None,
+        context_snapshot: ContextSnapshot | None,
+    ) -> tuple[str, list[SearchSource], ReasoningResult | None, PlanningDirective | None]:
+        """The shared "nothing more specific actually applies, answer
+        directly" tail every fallback case uses (CONFIRMATION/SELF_
+        DEVELOPMENT/SELF_DEV_APPROVAL's own "nothing pending" cases, and
+        the plain DIRECT/SEARCH catch-all) - one copy instead of four,
+        so they can never drift out of sync. Behavior is identical to
+        each of those branches' own inlined version before this was
+        factored out."""
+        reasoning_result = self._reason_about_context(
+            message, request_context, context_snapshot
+        )
+        planning_directive = self._plan_about_context(
+            message, request_context, context_snapshot, reasoning_result
+        )
+        reply, sources = self._handle_direct(
+            message,
+            history,
+            facts,
+            Capability.DIRECT,
+            context_snapshot,
+            reasoning_result,
+            planning_directive,
+        )
+        return reply, sources, reasoning_result, planning_directive
 
     def _handle_self_dev_approval(
         self, decision: CapabilityDecision, conversation_id: str

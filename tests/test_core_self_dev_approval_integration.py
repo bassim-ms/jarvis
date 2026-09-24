@@ -291,12 +291,39 @@ def test_commit_rejection_through_chat_leaves_the_change_uncommitted(repo):
 # -- ambiguous approval does not approve anything -------------------------
 
 
-def test_ambiguous_approval_across_two_sessions_in_the_same_conversation_approves_neither(repo):
+def test_a_second_chat_request_never_creates_a_competing_session(repo):
+    """The NEW active-session guard (added after a live test showed a
+    follow-up silently abandoning a pending session) refuses to start
+    a second session in a conversation that already has one pending -
+    covered separately below. This test only confirms that refusal:
+    ordinary chat can never even reach the two-sessions-in-one-
+    conversation state `test_ambiguous_approval_...` (below) has to
+    construct directly through the engine's own API instead."""
     engine = _make_engine(repo, ScriptedProvider())
     core = _make_core(engine)
 
     _, conversation_id, _ = core.handle_chat("self-develop: add a greeting function")
-    core.handle_chat("self-develop: add another greeting function", conversation_id=conversation_id)
+    reply, _, _ = core.handle_chat(
+        "self-develop: add another greeting function", conversation_id=conversation_id
+    )
+
+    assert len(engine.sessions) == 1  # no second session was created
+    assert "already have a self-development session" in reply.lower()
+    assert conversation_id in reply
+
+
+def test_ambiguous_approval_across_two_sessions_in_the_same_conversation_approves_neither(repo):
+    """Two sessions genuinely pending in the same conversation at the
+    same gate can only happen through direct engine API use bypassing
+    chat (the guard above prevents it through ordinary chat) - e.g. a
+    session started before this fix existed, or a caller other than
+    JarvisCore. Either way, chat-level approval must still never guess
+    which one the user means."""
+    engine = _make_engine(repo, ScriptedProvider())
+    core = _make_core(engine)
+    conversation_id = core.memory.create_conversation()
+    engine.start("add a greeting function", conversation_id=conversation_id)
+    engine.start("add another greeting function", conversation_id=conversation_id)
     assert len(engine.sessions) == 2
 
     reply, _, _ = core.handle_chat("Approve the plan.", conversation_id=conversation_id)
@@ -460,3 +487,142 @@ def test_self_dev_approval_falls_back_to_direct_without_an_engine():
 
     assert reply == "fake reply"
     assert sources == []
+
+
+# -- the live-test regression: a follow-up without the conversation_id ----
+# ---------------------------------------------------------------------------
+# What actually happened: a client sent a follow-up WITHOUT the original
+# conversation_id, so /chat started a brand-new conversation; the new
+# conversation correctly has no session of its own (conversation-scoped
+# association was already correct), but the message then fell through to
+# ordinary DIRECT handling and the LLM answered with an invented, unrelated
+# "plan" that had nothing to do with the real, still-pending session. The
+# tests below cover: (a) a different/missing conversation_id never leaks or
+# silently continues the original session, and (b) a message that IS a
+# self-development follow-up in the SAME conversation as a pending session
+# never reaches that same ungrounded DIRECT path at all.
+
+
+def test_followup_with_a_different_conversation_id_never_touches_the_original_session(repo):
+    engine = _make_engine(repo, ScriptedProvider())
+    provider = _RecordingProvider(reply="a plain direct reply")
+    core = _make_core(engine, provider=provider)
+
+    _, conversation_a, _ = core.handle_chat("self-develop: add a greeting function")
+    reply, conversation_b, sources = core.handle_chat(
+        "Approve the plan."
+    )  # no conversation_id at all -> a brand new conversation
+
+    assert conversation_b != conversation_a
+    assert reply == "a plain direct reply"  # ordinary DIRECT fallback, not a hallucinated plan
+    assert sources == []
+    session_a = next(iter(engine.sessions.values()))
+    assert session_a.stage is SessionStage.PLAN_PROPOSED  # completely untouched
+    assert session_a.dev_branch is None
+
+
+def test_missing_conversation_id_is_handled_safely_even_with_a_session_pending_elsewhere(repo):
+    """No crash, no wrong-session lookup, no cross-conversation
+    guessing (requirement: never a generic 'most recent session'
+    lookup) - a bare request with no conversation_id at all always
+    starts its own fresh conversation, exactly as it does with no
+    self-development engine involved at all."""
+    engine = _make_engine(repo, ScriptedProvider())
+    provider = _RecordingProvider(reply="fine, no problem")
+    core = _make_core(engine, provider=provider)
+
+    core.handle_chat("self-develop: add a greeting function")  # session pending elsewhere
+    reply, new_conversation_id, sources = core.handle_chat("What's 2 + 2?")
+
+    assert reply == "fine, no problem"
+    assert sources == []
+    assert new_conversation_id is not None
+
+
+def test_a_new_self_development_request_in_a_different_conversation_is_not_blocked(repo):
+    """The active-session guard is conversation-scoped ONLY - a
+    genuinely separate conversation may always start its own, separate
+    self-development session even while another conversation has one
+    pending (requirement: never a cross-conversation lookup, in
+    either direction)."""
+    engine = _make_engine(repo, ScriptedProvider())
+    core = _make_core(engine)
+
+    core.handle_chat("self-develop: add a greeting function")
+    reply, conversation_b, _ = core.handle_chat("self-develop: add a different greeting function")
+
+    assert "proposed development plan" in reply.lower()  # a real new plan, not a refusal
+    assert len(engine.sessions) == 2
+    session_b = next(s for s in engine.sessions.values() if s.conversation_id == conversation_b)
+    assert session_b.stage is SessionStage.PLAN_PROPOSED
+
+
+def test_generic_planning_cannot_replace_an_active_self_development_session(repo):
+    """A message in the SAME conversation as a pending session that is
+    neither a matching approval reply NOR a new self-development
+    invocation (so it would otherwise fall through to plain DIRECT)
+    must never reach the LLM at all - the exact failure mode the live
+    test surfaced."""
+    engine = _make_engine(repo, ScriptedProvider())
+    provider = _RecordingProvider(reply="I would normally answer this directly")
+    core = _make_core(engine, provider=provider)
+
+    _, conversation_id, _ = core.handle_chat("self-develop: add a greeting function")
+    reply, _, sources = core.handle_chat(
+        "actually can we also add authentication and a deployment plan?",
+        conversation_id=conversation_id,
+    )
+
+    assert sources == []
+    assert provider.prompts == []  # the LLM was never consulted
+    assert "already have a self-development session" in reply.lower()
+    assert "approve the plan" in reply.lower()
+    session = next(iter(engine.sessions.values()))
+    assert session.stage is SessionStage.PLAN_PROPOSED  # completely untouched
+
+
+def test_approval_still_resolves_the_correct_session_after_a_blocked_duplicate_attempt(repo):
+    engine = _make_engine(repo, ScriptedProvider())
+    core = _make_core(engine)
+
+    _, conversation_id, _ = core.handle_chat("self-develop: add a greeting function")
+    core.handle_chat(  # blocked by the guard - must not create a second session
+        "self-develop: add a totally different feature", conversation_id=conversation_id
+    )
+    reply, _, _ = core.handle_chat("Approve the plan.", conversation_id=conversation_id)
+
+    assert len(engine.sessions) == 1
+    session = next(iter(engine.sessions.values()))
+    assert session.stage is SessionStage.AWAITING_COMMIT_APPROVAL
+    assert "greet.py" in session.edited_files
+
+
+def test_unrelated_tool_task_and_task_status_capabilities_are_unaffected_by_a_pending_session(
+    repo,
+):
+    """The guard only ever intercepts a SELF_DEVELOPMENT follow-up or
+    the plain DIRECT/SEARCH catch-all - TOOL/TASK/TASK_STATUS keep
+    working exactly as before regardless of a pending self-development
+    session in the same conversation (mirrors the existing M15-
+    CONFIRMATION isolation tests above)."""
+    from app.tools.base import PermissionLevel, Tool, ToolResult
+
+    class _EchoTool(Tool):
+        name = "echo"
+        description = "Echoes back a fixed message."
+        permission = PermissionLevel.READ
+
+        def execute(self) -> ToolResult:
+            return ToolResult.success(message="echoed")
+
+    engine = _make_engine(repo, ScriptedProvider())
+    tools = ToolRegistry()
+    tools.register(_EchoTool())
+    core = _make_core(engine, tools=tools)
+
+    _, conversation_id, _ = core.handle_chat("self-develop: add a greeting function")
+    reply, _, _ = core.handle_chat("use tool echo", conversation_id=conversation_id)
+
+    assert "echoed" in reply.lower()
+    session = next(iter(engine.sessions.values()))
+    assert session.stage is SessionStage.PLAN_PROPOSED  # unaffected either way
