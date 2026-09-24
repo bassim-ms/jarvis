@@ -116,8 +116,11 @@ from app.capability import (
     DeterministicCapabilityRouter,
 )
 from app.config import settings
+from app.context_engine.base import RequestContext
 from app.context_engine.engine import ContextEngine
 from app.context_engine.request_builder import build_request_context
+from app.context_reasoning.base import ReasoningResult
+from app.context_reasoning.reasoner import ContextReasoner, ContextReasonerError
 from app.memory.base import MemoryStore, Message
 from app.memory.sqlite_store import SQLiteMemoryStore
 from app.providers.base import AIProvider, ProviderError
@@ -167,6 +170,7 @@ class JarvisCore:
         capability_router: CapabilityRouter | None = None,
         tool_call_builder: ToolCallBuilder | None = None,
         context_engine: ContextEngine | None = None,
+        context_reasoner: ContextReasoner | None = None,
     ):
         self.provider = provider or create_default_ai_provider_manager()
         self.memory = memory or SQLiteMemoryStore(settings.memory_db_path)
@@ -205,6 +209,23 @@ class JarvisCore:
         # ToolRegistry dispatch are all byte-for-byte unaffected by this
         # parameter's mere presence.
         self.context_engine = context_engine
+        # M16.3: `None` by default, same "purely additive, off unless
+        # explicitly configured" convention as `context_engine` above -
+        # no existing caller/test passes one. When given (and a
+        # ContextSnapshot was actually built - i.e. `context_engine` is
+        # also configured), `_dispatch` asks it to reason over that
+        # snapshot ONLY for the capability branches that actually read
+        # the result (DIRECT, and CONFIRMATION's fallback to DIRECT) -
+        # see `_reason_about_context`'s own docstring - and threads the
+        # resulting ReasoningResult into `_handle_direct`/`_build_prompt`
+        # the same way `context_snapshot` already is - see
+        # `_format_reasoning_result`.
+        # ContextReasoner itself never executes anything or mutates the
+        # World Model (see app/context_reasoning/reasoner.py), so this
+        # parameter's mere presence can never affect provider routing,
+        # M15 planning/execution, or ToolRegistry dispatch beyond the
+        # DIRECT-path prompt text it's designed to enrich.
+        self.context_reasoner = context_reasoner
 
     def handle_chat(
         self, message: str, conversation_id: str | None = None
@@ -233,7 +254,7 @@ class JarvisCore:
         instead of only in the reply's prose, and `handle_chat_with_context`
         for the same treatment of M16.2's ContextSnapshot.
         """
-        reply, conversation_id, sources, _job_id, _snapshot = self._dispatch(
+        reply, conversation_id, sources, _job_id, _snapshot, _reasoning = self._dispatch(
             message, conversation_id
         )
         return reply, conversation_id, sources
@@ -251,7 +272,7 @@ class JarvisCore:
         endpoint uses this method instead, to give API clients a real
         structured `job_id` field rather than one embedded in reply text.
         """
-        reply, conversation_id, sources, job_id, _snapshot = self._dispatch(
+        reply, conversation_id, sources, job_id, _snapshot, _reasoning = self._dispatch(
             message, conversation_id
         )
         return reply, conversation_id, sources, job_id
@@ -269,16 +290,46 @@ class JarvisCore:
         caller that actually wants the snapshot (e.g. a future caller
         that decides what to do with it) can get it. Nothing in this
         module itself reads or acts on the returned snapshot - it's
-        computed and handed back, never consumed here."""
+        computed and handed back, never consumed here. Kept as its own
+        5-tuple method (rather than growing to 6) so a caller that only
+        ever wanted M16.2's snapshot is unaffected by M16.3 existing -
+        see `handle_chat_with_reasoning` for the 6-tuple that also
+        exposes the ReasoningResult."""
+        reply, conversation_id, sources, job_id, snapshot, _reasoning = self._dispatch(
+            message, conversation_id
+        )
+        return reply, conversation_id, sources, job_id, snapshot
+
+    def handle_chat_with_reasoning(
+        self, message: str, conversation_id: str | None = None
+    ) -> tuple[
+        str, str, list[SearchSource], str | None, ContextSnapshot | None, ReasoningResult | None
+    ]:
+        """Identical to `handle_chat_with_context`, plus a 6th return
+        value: the ReasoningResult `_dispatch` built for this message
+        (M16.3), or `None` when no `context_reasoner` was configured on
+        this JarvisCore instance, no `context_engine` was configured (a
+        ReasoningResult needs a ContextSnapshot to reason over), the
+        message's capability never reaches a branch that actually
+        consumes one (SEARCH/TOOL/TASK/TASK_STATUS/a resolved
+        CONFIRMATION - see `_reason_about_context`'s own docstring for
+        exactly which two branches do), or the reasoner itself failed
+        (see `_reason_about_context`'s safe-degradation handling of
+        ContextReasonerError). Purely additive, the same "new method,
+        existing ones untouched" pattern `handle_chat_with_context`
+        already established for the ContextSnapshot itself."""
         return self._dispatch(message, conversation_id)
 
     def _dispatch(
         self, message: str, conversation_id: str | None
-    ) -> tuple[str, str, list[SearchSource], str | None, ContextSnapshot | None]:
+    ) -> tuple[
+        str, str, list[SearchSource], str | None, ContextSnapshot | None, ReasoningResult | None
+    ]:
         """The single implementation `handle_chat`/`handle_chat_with_job_id`/
-        `handle_chat_with_context` all call - capability dispatch and
-        conversation persistence happen exactly once, here, so the three
-        public methods can never drift out of sync with each other."""
+        `handle_chat_with_context`/`handle_chat_with_reasoning` all call -
+        capability dispatch and conversation persistence happen exactly
+        once, here, so the public methods can never drift out of sync
+        with each other."""
         if conversation_id is None:
             conversation_id = self.memory.create_conversation()
         elif not self.memory.conversation_exists(conversation_id):
@@ -304,11 +355,25 @@ class JarvisCore:
         # docstring), so this can never change `reply`/`sources`/`job_id`,
         # never touches a provider, ToolRegistry, or a Job.
         context_snapshot: ContextSnapshot | None = None
+        request_context = None
         if self.context_engine is not None:
             request_context = build_request_context(message, capability=decision.capability)
             context_snapshot = self.context_engine.build_snapshot(request_context)
 
+        # M16.3: `reasoning_result` starts `None` and is only ever
+        # computed inside the two branches below that actually pass it
+        # to `_handle_direct` - the ordinary DIRECT branch (the final
+        # `else`) and CONFIRMATION's fallback-to-DIRECT branch. It is
+        # deliberately NOT computed here, unconditionally, before the
+        # capability branch: SEARCH/TOOL/TASK/TASK_STATUS/a resolved
+        # CONFIRMATION never read a ReasoningResult at all (see
+        # `_handle_search`/`_handle_tool`/`_handle_task`/
+        # `_handle_task_status`/`_handle_confirmation`'s own signatures),
+        # so reasoning over `context_snapshot` for one of those would be
+        # a real LLM call whose result is immediately discarded - see
+        # `_reason_about_context`'s own docstring for the full rationale.
         job_id: str | None = None
+        reasoning_result: ReasoningResult | None = None
 
         if decision.capability is Capability.SEARCH:
             reply, sources = self._handle_search(message, history, facts)
@@ -327,19 +392,58 @@ class JarvisCore:
                 # deterministic "yes"/"ok"/... pattern was only ever a
                 # hint (see Capability.CONFIRMATION's own docstring), so a
                 # stray affirmative/negative reply falls back to ordinary
-                # conversation, unaffected by CONFIRMATION existing at all.
+                # conversation, unaffected by CONFIRMATION existing at all -
+                # including M16.3's reasoning step, only reached here
+                # because this fallback is about to call `_handle_direct`.
+                reasoning_result = self._reason_about_context(
+                    message, request_context, context_snapshot
+                )
                 reply, sources = self._handle_direct(
-                    message, history, facts, Capability.DIRECT, context_snapshot
+                    message, history, facts, Capability.DIRECT, context_snapshot, reasoning_result
                 )
         else:
+            reasoning_result = self._reason_about_context(
+                message, request_context, context_snapshot
+            )
             reply, sources = self._handle_direct(
-                message, history, facts, decision.capability, context_snapshot
+                message, history, facts, decision.capability, context_snapshot, reasoning_result
             )
 
         self.memory.add_message(conversation_id, "user", message)
         self.memory.add_message(conversation_id, "assistant", reply)
 
-        return reply, conversation_id, sources, job_id, context_snapshot
+        return reply, conversation_id, sources, job_id, context_snapshot, reasoning_result
+
+    def _reason_about_context(
+        self,
+        message: str,
+        request_context: RequestContext | None,
+        context_snapshot: ContextSnapshot | None,
+    ) -> ReasoningResult | None:
+        """M16.3: called ONLY from the two `_dispatch` branches that
+        actually consume a ReasoningResult (the DIRECT branch and
+        CONFIRMATION's fallback-to-DIRECT branch) - never for SEARCH/
+        TOOL/TASK/TASK_STATUS/a resolved CONFIRMATION, so this milestone
+        never spends an LLM call reasoning over context for a reply that
+        was never going to read the result. This is a WIRING decision
+        only: no new `context_intent`/`required_context` heuristic is
+        added here - M16.2 already decided what's relevant, and
+        ContextReasoner.reason's own empty-ContextSnapshot short circuit
+        (app/context_reasoning/reasoner.py) still independently skips
+        the provider call entirely for an empty snapshot, unchanged.
+
+        Returns `None` when no `context_reasoner` is configured, no
+        `context_snapshot` exists (no `context_engine` configured), or
+        the reasoner fails - read-only and never executes anything (see
+        app/context_reasoning/reasoner.py's own module docstring), so
+        this can never change `reply`/`sources`/`job_id`, never touches
+        ToolRegistry, the World Model, or a Job."""
+        if self.context_reasoner is None or context_snapshot is None:
+            return None
+        try:
+            return self.context_reasoner.reason(message, request_context, context_snapshot)
+        except ContextReasonerError:
+            return None
 
     def _handle_direct(
         self,
@@ -348,6 +452,7 @@ class JarvisCore:
         facts: dict[str, str],
         capability: Capability,
         context_snapshot: ContextSnapshot | None = None,
+        reasoning_result: ReasoningResult | None = None,
     ) -> tuple[str, list[SearchSource]]:
         """DIRECT path (extracted, M15, from what was previously inlined
         in `handle_chat`'s own `else` branch) - also reused by
@@ -363,8 +468,13 @@ class JarvisCore:
         docstring for exactly how. `None` (no context_engine configured)
         or an empty snapshot (nothing retrieved) both produce byte-
         identical prompt text to before this parameter existed - see
-        `_format_world_model_context`."""
-        prompt = self._build_prompt(message, history, facts, context_snapshot)
+        `_format_world_model_context`. `reasoning_result` (M16.3) is the
+        same treatment for a ReasoningResult - see
+        `_format_reasoning_result`, which returns "" (no prompt change)
+        for `None` or an empty/trivial result, exactly mirroring
+        `_format_world_model_context`'s own backward-compatibility
+        guarantee one layer up."""
+        prompt = self._build_prompt(message, history, facts, context_snapshot, reasoning_result)
         # `context_char_count=len(prompt)` is the exact payload about to be
         # sent - the most direct "how much context is this" signal
         # available, no separate length heuristic invented. See
@@ -690,22 +800,29 @@ class JarvisCore:
         facts: dict[str, str],
         max_messages: int | None = None,
         world_model_context: str = "",
+        reasoning_context: str = "",
     ) -> str:
-        """Format stored facts, conversation history, and (M16.2,
-        optional) World Model context into plain text - shared by
-        `_build_prompt` (DIRECT, unbounded, the only caller that ever
-        passes `world_model_context`) and `_handle_search` (SEARCH,
-        bounded to a small recent window via `max_messages`, never
-        passes `world_model_context` - SEARCH's own routing/query-
-        building stays completely untouched by M16.2) so both build
-        context the same way instead of duplicating this formatting.
-        Returns "" when there's nothing to include."""
+        """Format stored facts, conversation history, and (M16.2/M16.3,
+        optional) World Model context/reasoning into plain text - shared
+        by `_build_prompt` (DIRECT, unbounded, the only caller that ever
+        passes `world_model_context`/`reasoning_context`) and
+        `_handle_search` (SEARCH, bounded to a small recent window via
+        `max_messages`, never passes either - SEARCH's own routing/
+        query-building stays completely untouched by M16.2/M16.3) so both
+        build context the same way instead of duplicating this
+        formatting. Returns "" when there's nothing to include.
+        `reasoning_context` is placed immediately after
+        `world_model_context` - the reasoning is downstream of, and
+        about, that same context, so it reads naturally right after it,
+        before the conversation history."""
         parts = []
         if facts:
             facts_text = "\n".join(f"- {key}: {value}" for key, value in facts.items())
             parts.append(f"Known facts about the user:\n{facts_text}")
         if world_model_context:
             parts.append(world_model_context)
+        if reasoning_context:
+            parts.append(reasoning_context)
         if history:
             recent = history if max_messages is None else history[-max_messages:]
             history_text = "\n".join(f"{m.role}: {m.content}" for m in recent)
@@ -791,19 +908,72 @@ class JarvisCore:
         return "What Rhasspy currently knows from the user's world model:\n" + "\n".join(lines)
 
     @staticmethod
+    def _format_reasoning_result(reasoning_result: ReasoningResult | None) -> str:
+        """The ONE place a ReasoningResult (M16.3, app/context_reasoning/)
+        actually reaches "existing response generation" - a pure
+        SERIALIZER, exactly the same role `_format_world_model_context`
+        plays for a ContextSnapshot one layer up, and the same
+        backward-compatibility guarantee: returns "" - contributing
+        NOTHING to the prompt - when `reasoning_result` is `None` (no
+        context_reasoner configured, no context_engine configured, or
+        the reasoner failed and `_dispatch` degraded to `None`) or when
+        `reasoning_result.is_empty()` (nothing was found worth reasoning
+        about - see app/context_reasoning/reasoner.py's own empty-
+        ContextSnapshot short circuit), so a request with nothing
+        relevant produces byte-identical prompt text to before M16.3
+        existed.
+
+        Never re-derives, re-scores, or second-guesses anything in
+        `reasoning_result` - only decides how to lay its already-
+        validated fields out as text. `provenance` identifiers are
+        deliberately NOT shown here (they're internal grounding
+        metadata for app/context_reasoning/reasoner.py's own
+        anti-hallucination validation, not something the end user or
+        the downstream prompt needs to see)."""
+        if reasoning_result is None or reasoning_result.is_empty():
+            return ""
+
+        lines = [f"Interpretation: {reasoning_result.interpretation}"]
+        for field_name, label in (
+            ("relevant_facts", "Relevant facts"),
+            ("constraints", "Constraints"),
+            ("conflicts", "Conflicts"),
+            ("opportunities", "Opportunities"),
+            ("conclusions", "Conclusions"),
+        ):
+            items = getattr(reasoning_result, field_name)
+            if items:
+                lines.append(f"{label}: " + "; ".join(item.text for item in items))
+        if reasoning_result.recommended_next_step:
+            lines.append(f"Recommended next step: {reasoning_result.recommended_next_step}")
+        if reasoning_result.requires_clarification:
+            lines.append(
+                f"This request is ambiguous given what's known - ask the user: "
+                f"{reasoning_result.clarification_question}"
+            )
+        return "What Rhasspy's reasoning about this request concluded:\n" + "\n".join(
+            f"- {line}" for line in lines
+        )
+
+    @staticmethod
     def _build_prompt(
         message: str,
         history: list[Message],
         facts: dict[str, str],
         context_snapshot: ContextSnapshot | None = None,
+        reasoning_result: ReasoningResult | None = None,
     ) -> str:
-        """Combine stored facts, conversation history, and (M16.2,
-        optional) World Model context into context for the provider.
-        With none of those, the raw message is sent unchanged, matching
-        the original single-turn behavior."""
+        """Combine stored facts, conversation history, and (M16.2/M16.3,
+        optional) World Model context/reasoning into context for the
+        provider. With none of those, the raw message is sent unchanged,
+        matching the original single-turn behavior."""
         world_model_context = JarvisCore._format_world_model_context(context_snapshot)
+        reasoning_context = JarvisCore._format_reasoning_result(reasoning_result)
         context = JarvisCore._format_context(
-            history, facts, world_model_context=world_model_context
+            history,
+            facts,
+            world_model_context=world_model_context,
+            reasoning_context=reasoning_context,
         )
         if not context:
             return message

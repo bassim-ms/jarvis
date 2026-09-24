@@ -30,6 +30,7 @@ from app.automation.factory import create_default_automation_store
 from app.calendar.factory import create_default_calendar_provider
 from app.config import settings
 from app.context_engine.factory import create_default_context_engine
+from app.context_reasoning.factory import create_default_context_reasoner
 from app.core import ConversationNotFoundError, core
 from app.orchestration.factory import create_default_job_engine, create_default_job_store
 from app.providers.base import ProviderError
@@ -116,6 +117,18 @@ job_engine = create_default_job_engine(
 _world_model_store = create_default_world_model_store(DEFAULT_WORLD_MODEL_DB_PATH)
 _world_model_service = create_default_world_model_service(_world_model_store)
 core.context_engine = create_default_context_engine(_world_model_service, memory=core.memory)
+
+# Context-Aware Reasoning (M16.3) - wired onto `core` the same way M16.2
+# just was, immediately above: `core.context_reasoner` defaults to `None`
+# (see JarvisCore.__init__), so this is what actually ACTIVATES M16.3 for
+# the real running app. Routed through `core.provider` - the same
+# AIProviderManager/provider-routing chain every other AI call in this
+# app already goes through (app/providers/) - never a second, separately
+# configured AI client. See app/context_reasoning/reasoner.py for why a
+# request whose ContextSnapshot has nothing relevant never reaches the
+# provider at all, keeping this activation backward-compatible with
+# every ordinary request the way M16.2's own activation above already is.
+core.context_reasoner = create_default_context_reasoner(core.provider)
 
 
 @asynccontextmanager
