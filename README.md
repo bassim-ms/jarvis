@@ -112,7 +112,7 @@ pytest
 
 Expected output ends with something like:
 ```
-659 passed in 0.XXs
+707 passed in 0.XXs
 ```
 
 Tests never call the real Gemini or SearXNG APIs — `httpx.post` / `httpx.get`

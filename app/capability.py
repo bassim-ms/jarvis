@@ -89,6 +89,17 @@ class Capability(Enum):
     #: handling - this capability is a hint the message COULD be a
     #: confirmation reply, never a guarantee that it is one.
     CONFIRMATION = "confirmation"
+    #: A clearly-identified request to modify/inspect Jarvis's OWN
+    #: codebase - "add X to your code", "fix the voice module", "modify
+    #: the personality system", "inspect why this test is failing" -
+    #: dispatched to the Self-Development Engine (app/self_development/)
+    #: rather than an ordinary DIRECT reply or M15 TASK. Deliberately
+    #: narrow (see `_SELF_DEV_VERB_PATTERN`/`_SELF_DEV_TARGET_PATTERN`
+    #: below): an ordinary conversational request ("search for X",
+    #: "remind me tomorrow", "what's on my calendar?") must never trigger
+    #: this - see JarvisCore._handle_self_development's own safe fallback
+    #: to DIRECT when no engine is configured.
+    SELF_DEVELOPMENT = "self_development"
 
 
 @dataclass
@@ -120,6 +131,13 @@ class CapabilityDecision:
     `approve` is used only when `capability` is `CONFIRMATION`: `True` for
     an affirmative reply ("yes", "send it", "go ahead"), `False` for a
     negative one ("no", "cancel that"). `None` and unused otherwise.
+
+    `goal` is ALSO used when `capability` is `SELF_DEVELOPMENT`: the
+    development request text JarvisCore._handle_self_development passes
+    to the Self-Development Engine's own `start()` - either the explicit-
+    invocation phrasing's captured text ("self-develop: <request>") or
+    the raw message itself, the same "captured text, or the whole
+    message" convention TASK's own `goal` already uses.
     """
 
     capability: Capability
@@ -259,11 +277,46 @@ _TASK_STATUS_PATTERNS = (
     re.compile(r"\bmy\s+(?:running|active|in[- ]progress)\s+tasks\b", re.IGNORECASE),
 )
 
+#: SELF_DEVELOPMENT (Self-Development Engine, app/self_development/) is
+#: deliberately gated on BOTH a dev-action verb AND an explicit
+#: self-referential target appearing anywhere in the message - neither
+#: alone is enough. "fix the printer" (verb, no matching target) and
+#: "your code is great" (target-ish phrase, no verb) both stay DIRECT;
+#: only a message naming BOTH ("fix the voice module", "add X to your
+#: code", "modify the personality system", "inspect why this test is
+#: failing") routes here. This is the same "narrow, explicit, no fuzzy
+#: matching" discipline every other pattern in this file already uses,
+#: chosen specifically because a normal conversational request must
+#: NEVER accidentally invoke self-development (V1's own explicit
+#: requirement) - see tests/test_capability_self_development.py for the
+#: worked trigger/non-trigger examples this combination was checked
+#: against.
+_SELF_DEV_VERB_PATTERN = re.compile(
+    r"\b(?:add|fix|modify|update|change|implement|refactor|debug|patch|improve|inspect)\b",
+    re.IGNORECASE,
+)
+_SELF_DEV_TARGET_PATTERN = re.compile(
+    r"\byour\s+(?:own\s+)?code(?:base)?\b|\bthe\s+codebase\b|\bthis\s+repo(?:sitory)?\b|"
+    r"\byour\s+system\b|\byourself\b|\bthe\s+\w+\s+(?:module|system|engine)\b|"
+    r"\bthis\s+test\b|\bthe\s+tests?\b|\byour\s+source\s+code\b",
+    re.IGNORECASE,
+)
+
+#: The explicit, unambiguous form - "self-develop: <request>"/"dev
+#: task: <request>"/"modify your code: <request>" - the same
+#: colon-invocation convention `_TASK_INVOCATION_PATTERN` already uses,
+#: taking priority even over the verb+target heuristic since it's
+#: unambiguous.
+_SELF_DEV_INVOCATION_PATTERN = re.compile(
+    r"^\s*(?:self[- ]develop|dev(?:elopment)?\s+task|modify\s+your\s+code)\s*:\s*(.+)$",
+    re.IGNORECASE | re.DOTALL,
+)
+
 
 class DeterministicCapabilityRouter(CapabilityRouter):
     """The only capability decision maker for now: TOOL, then CONFIRMATION,
-    then TASK_STATUS, then TASK, then DIRECT vs SEARCH, all without any
-    Gemini/LLM call.
+    then SELF_DEVELOPMENT, then TASK_STATUS, then TASK, then DIRECT vs
+    SEARCH, all without any Gemini/LLM call.
 
     TOOL is checked first, via two narrow explicit-invocation phrasings -
     `_TOOL_INVOCATION_PATTERN` ("use tool echo") and `_TOOL_MENTION_PATTERN`
@@ -285,6 +338,15 @@ class DeterministicCapabilityRouter(CapabilityRouter):
     stray "yes"/"ok" with nothing pending behaves exactly as before.
     Checked before TASK_STATUS/TASK since neither of those patterns can
     match a bare "yes" anyway, but placed early for clarity of intent.
+
+    SELF_DEVELOPMENT is checked next: `_SELF_DEV_INVOCATION_PATTERN` (an
+    explicit "self-develop: ..."/"dev task: ..." phrasing) or the
+    combination of `_SELF_DEV_VERB_PATTERN` AND `_SELF_DEV_TARGET_PATTERN`
+    both matching somewhere in the message - see those patterns' own
+    module-level comment for why BOTH are required and worked trigger/
+    non-trigger examples. Checked before TASK_STATUS/TASK since a
+    self-development request ("fix the voice module") is a more specific
+    signal than either.
 
     TASK_STATUS is checked next: `_TASK_STATUS_PATTERNS` match a small
     fixed set of natural-language status questions ("what's the status of
@@ -330,6 +392,15 @@ class DeterministicCapabilityRouter(CapabilityRouter):
             return CapabilityDecision(capability=Capability.CONFIRMATION, approve=True)
         if _CONFIRMATION_NO_PATTERN.match(message):
             return CapabilityDecision(capability=Capability.CONFIRMATION, approve=False)
+
+        self_dev_invocation_match = _SELF_DEV_INVOCATION_PATTERN.match(message)
+        if self_dev_invocation_match:
+            return CapabilityDecision(
+                capability=Capability.SELF_DEVELOPMENT,
+                goal=self_dev_invocation_match.group(1).strip(),
+            )
+        if _SELF_DEV_VERB_PATTERN.search(message) and _SELF_DEV_TARGET_PATTERN.search(message):
+            return CapabilityDecision(capability=Capability.SELF_DEVELOPMENT, goal=message.strip())
 
         if any(pattern.search(message) for pattern in _TASK_STATUS_PATTERNS):
             return CapabilityDecision(capability=Capability.TASK_STATUS)

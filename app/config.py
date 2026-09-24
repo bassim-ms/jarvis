@@ -166,6 +166,27 @@ class Settings(BaseSettings):
     voice_max_utterance_seconds: float = 15.0  # hard cap on one utterance
     voice_speech_amplitude_threshold: int = 500  # int16 mean-abs "is this speech" cutoff
 
+    # Self-Development Engine (V1, see app/self_development/) - lets
+    # Jarvis propose and, only with explicit approval at each gate, apply
+    # bounded changes to its own codebase. `self_dev_project_root` is the
+    # ONE directory this whole subsystem is ever allowed to touch (see
+    # app/self_development/safety.py) - configurable here rather than
+    # hardcoded, but every path operation still re-validates against it at
+    # runtime regardless of what this setting says.
+    self_dev_project_root: str = (
+        r"C:\Users\bassim.ms\Documents\claude-access\jarvis-foundation\jarvis"
+    )
+    # A small, fixed ceiling on bounded self-repair iterations after a
+    # failed test/check - never unlimited (V1's own explicit requirement).
+    self_dev_max_repair_iterations: int = 2
+    # Bounds every single command this engine ever runs (git/pytest/
+    # python -m ...) - "no infinite processes" (V1's own requirement).
+    self_dev_command_timeout_seconds: float = 120.0
+    # The fixed, non-AI-supplied command TEST_RUN always uses - never an
+    # arbitrary command (see app/self_development/command_runner.py:
+    # RunTestsTool). Tokenized with shlex.split, same as COMMAND_RUN.
+    self_dev_test_command: str = "pytest -q"
+
     model_config = SettingsConfigDict(env_file=".env", env_prefix="JARVIS_")
 
 

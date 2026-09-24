@@ -129,6 +129,8 @@ from app.providers.base import AIProvider, ProviderError
 from app.providers.factory import create_default_ai_provider_manager
 from app.providers.manager import call_with_requirements
 from app.providers.requirements import classify_request
+from app.self_development.base import DevelopmentSession
+from app.self_development.engine import SelfDevelopmentEngine
 from app.search.answer import (
     GeminiSearchAnswerGenerator,
     SearchAnswerError,
@@ -175,6 +177,7 @@ class JarvisCore:
         context_reasoner: ContextReasoner | None = None,
         context_planner: ContextPlanner | None = None,
         identity_context: str | None = None,
+        self_development_engine: SelfDevelopmentEngine | None = None,
     ):
         self.provider = provider or create_default_ai_provider_manager()
         self.memory = memory or SQLiteMemoryStore(settings.memory_db_path)
@@ -263,6 +266,20 @@ class JarvisCore:
         # (a resolved CONFIRMATION included - only its fallback-to-DIRECT
         # branch does).
         self.identity_context = identity_context
+        # Self-Development Engine (app/self_development/): `None` by
+        # default, same "purely additive, off unless explicitly
+        # configured" convention as every M16.x layer above - no
+        # existing caller/test passes one. When given, a message the
+        # deterministic router identifies as SELF_DEVELOPMENT (see
+        # Capability.SELF_DEVELOPMENT, app/capability.py) dispatches to
+        # `_handle_self_development` instead of ordinary DIRECT handling;
+        # with no engine configured, that same message falls back to
+        # ordinary DIRECT handling exactly like an unresolved CONFIRMATION
+        # does. The engine has its OWN, entirely separate ToolRegistry
+        # (app/self_development/factory.py) - it never touches `self.tools`
+        # and `self.tools` never touches it, so self-development stays
+        # completely unreachable through the ordinary TOOL capability.
+        self.self_development_engine = self_development_engine
 
     def handle_chat(
         self, message: str, conversation_id: str | None = None
@@ -484,6 +501,31 @@ class JarvisCore:
                     reasoning_result,
                     planning_directive,
                 )
+        elif decision.capability is Capability.SELF_DEVELOPMENT:
+            if self.self_development_engine is None:
+                # No engine configured (every existing caller/test, and
+                # the module-level `core` singleton unless app/main.py
+                # wires one) - a clearly-identified development request
+                # falls back to ordinary DIRECT handling rather than a
+                # dead end, the exact same "hint, not a guarantee" fallback
+                # CONFIRMATION's own branch above already uses.
+                reasoning_result = self._reason_about_context(
+                    message, request_context, context_snapshot
+                )
+                planning_directive = self._plan_about_context(
+                    message, request_context, context_snapshot, reasoning_result
+                )
+                reply, sources = self._handle_direct(
+                    message,
+                    history,
+                    facts,
+                    Capability.DIRECT,
+                    context_snapshot,
+                    reasoning_result,
+                    planning_directive,
+                )
+            else:
+                reply, sources = self._handle_self_development(decision, message)
         else:
             reasoning_result = self._reason_about_context(
                 message, request_context, context_snapshot
@@ -948,6 +990,76 @@ class JarvisCore:
             "confirm_job", params={"job_id": target["id"], "approve": bool(decision.approve)}
         )
         return self._format_tool_result(confirm_result), []
+
+    def _handle_self_development(
+        self, decision: CapabilityDecision, message: str
+    ) -> tuple[str, list[SearchSource]]:
+        """SELF_DEVELOPMENT path: dispatches to
+        `self.self_development_engine.start(...)`, which proposes a
+        DevelopmentPlan and stops there - no branch is created, no file
+        is touched, nothing is committed or rolled back (see
+        app/self_development/engine.py:SelfDevelopmentEngine.start's own
+        docstring). `sources` is always `[]`.
+
+        V1's own chat integration goes exactly this far: proposing and
+        reporting a plan. Approving that plan, approving a commit, and
+        rolling back are all available through SelfDevelopmentEngine's
+        own directly-callable API (`approve_plan`/`approve_commit`/
+        `rollback`) - not yet through a second chat turn. This is a
+        deliberate, explicit V1 scope boundary (see this project's own
+        Self-Development Engine documentation) rather than a rushed,
+        under-tested multi-turn approval flow for a subsystem whose
+        entire point is that nothing happens without explicit approval."""
+        request_text = decision.goal or message
+        session = self.self_development_engine.start(request_text)
+        return self._format_self_dev_session(session), []
+
+    @staticmethod
+    def _format_self_dev_session(session: DevelopmentSession) -> str:
+        """Pure serializer - describes `session`'s own already-decided
+        state, never a second decision-maker. Never includes a secret
+        file's contents (nothing here reads file content at all) and
+        never claims an action happened that didn't (a plan is only
+        ever described as "proposed," never as "done")."""
+        from app.self_development.base import SessionStage
+
+        if session.stage is SessionStage.BLOCKED_DIRTY_TREE:
+            return (
+                "I can't start a self-development session right now - the "
+                "repository already has uncommitted changes. Please commit or "
+                "stash them first, then ask again."
+            )
+        if session.plan is None:
+            reason = session.messages[-1] if session.messages else "an unknown error"
+            return f"I couldn't put together a development plan for that ({reason})."
+
+        plan = session.plan
+        files = ", ".join(f.path for f in plan.files_affected) or "no files (investigation only)"
+        risks = ", ".join(plan.risks) if plan.risks else "none noted"
+        lines = [
+            f"Here's my proposed development plan (session {session.id}):",
+            f"- Objective: {plan.objective}",
+            f"- Files affected: {files}",
+            f"- Risks: {risks}",
+        ]
+        # Surfaced clearly BEFORE editing begins (V1's own explicit
+        # requirement) - a plan touching a protected security-critical
+        # path (app/self_development/safety.py:is_protected_system_path)
+        # will need a SEPARATE SECURITY_EDIT approval that ordinary plan
+        # approval never grants - see app/self_development/engine.py's
+        # own module docstring.
+        protected = plan.protected_file_paths()
+        if protected:
+            lines.append(
+                "- ⚠ Protected security-critical file(s) in this plan: "
+                f"{', '.join(sorted(protected))} - these require a SEPARATE "
+                "SECURITY_EDIT approval, which ordinary plan approval does not grant."
+            )
+        lines.append(
+            "\nI won't create a branch, edit anything, or commit anything until "
+            "this plan is explicitly approved."
+        )
+        return "\n".join(lines)
 
     @staticmethod
     def _format_tool_result(result: ToolResult) -> str:

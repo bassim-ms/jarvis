@@ -29,8 +29,9 @@ from app.search.router import SearchDecision, SearchRouter
 
 def test_capability_only_has_the_implemented_set():
     """M6.13/M6.14 implement DIRECT, SEARCH, and TOOL; M15 adds TASK,
-    TASK_STATUS, and CONFIRMATION - no other future capability (MEMORY/
-    EMAIL/CALENDAR/PRINTER/ROBOTIC_ARM/...) is added as an unused enum
+    TASK_STATUS, and CONFIRMATION; the Self-Development Engine (V1)
+    adds SELF_DEVELOPMENT - no other future capability (MEMORY/EMAIL/
+    CALENDAR/PRINTER/ROBOTIC_ARM/...) is added as an unused enum
     member."""
     assert {member.name for member in Capability} == {
         "DIRECT",
@@ -39,6 +40,7 @@ def test_capability_only_has_the_implemented_set():
         "TASK",
         "TASK_STATUS",
         "CONFIRMATION",
+        "SELF_DEVELOPMENT",
     }
 
 

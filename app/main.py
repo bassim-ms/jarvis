@@ -36,6 +36,7 @@ from app.core import ConversationNotFoundError, core
 from app.identity import load_identity_context
 from app.orchestration.factory import create_default_job_engine, create_default_job_store
 from app.providers.base import ProviderError
+from app.self_development.factory import create_default_self_development_engine
 from app.reminders.factory import create_default_reminder_store, create_default_scheduler
 from app.tasks.factory import create_default_task_store
 from app.tools.defaults import register_default_tools
@@ -158,6 +159,24 @@ core.context_planner = create_default_context_planner(core.provider)
 # breaks server startup or an ordinary chat turn.
 core.identity_context = load_identity_context(
     settings.personality_file_path, settings.user_profile_file_path
+)
+
+# Self-Development Engine V1 (see app/self_development/) -
+# `core.self_development_engine` defaults to `None` (see JarvisCore.
+# __init__), so this is what actually ACTIVATES it for the real running
+# app: a chat message the deterministic router identifies as
+# SELF_DEVELOPMENT (Capability.SELF_DEVELOPMENT, app/capability.py) now
+# reaches it instead of falling back to ordinary DIRECT handling. Routed
+# through `core.provider` - never a second, separately configured AI
+# client. `self_dev_project_root` bounds every file/command this engine
+# will ever touch (app/self_development/safety.py) - configurable via
+# settings, but re-validated at runtime regardless of what's configured.
+core.self_development_engine = create_default_self_development_engine(
+    core.provider,
+    project_root=settings.self_dev_project_root,
+    max_repair_iterations=settings.self_dev_max_repair_iterations,
+    command_timeout_seconds=settings.self_dev_command_timeout_seconds,
+    test_command=settings.self_dev_test_command,
 )
 
 
