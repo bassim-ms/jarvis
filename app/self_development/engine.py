@@ -180,12 +180,18 @@ class SelfDevelopmentEngine:
 
     # -- 1-3: understand request -> inspect repo -> create change plan ------
 
-    def start(self, request: str) -> DevelopmentSession:
+    def start(
+        self, request: str, *, conversation_id: str | None = None
+    ) -> DevelopmentSession:
         """Refuses to start at all if the working tree already has
         uncommitted changes - "detect and report rather than blindly
         resetting" (V1's own explicit requirement). Otherwise proposes
         a DevelopmentPlan and stops there - no branch is created and no
-        file is touched until `approve_plan` explicitly says so."""
+        file is touched until `approve_plan` explicitly says so.
+
+        `conversation_id` is purely additive bookkeeping (see
+        DevelopmentSession.conversation_id's own docstring) - it never
+        affects anything this method decides."""
         original_branch = self.git.current_branch()
 
         if self.git.has_uncommitted_changes():
@@ -194,6 +200,7 @@ class SelfDevelopmentEngine:
                 request=request,
                 stage=SessionStage.BLOCKED_DIRTY_TREE,
                 original_branch=original_branch,
+                conversation_id=conversation_id,
             )
             session.log(
                 "Uncommitted changes already exist in the working tree - "
@@ -208,6 +215,7 @@ class SelfDevelopmentEngine:
             request=request,
             stage=SessionStage.STARTED,
             original_branch=original_branch,
+            conversation_id=conversation_id,
         )
         self.sessions[session.id] = session
 

@@ -100,6 +100,21 @@ class Capability(Enum):
     #: this - see JarvisCore._handle_self_development's own safe fallback
     #: to DIRECT when no engine is configured.
     SELF_DEVELOPMENT = "self_development"
+    #: An explicit "approve/reject the plan/security edit/commit" reply
+    #: continuing an ALREADY-STARTED self-development session
+    #: (Capability.SELF_DEVELOPMENT, above) through a later chat turn -
+    #: see `_SELF_DEV_APPROVAL_PATTERN` below. Deliberately its own
+    #: capability, never folded into CONFIRMATION: CONFIRMATION's own
+    #: "yes"/"no" patterns are intentionally bare and ambiguous (resolved
+    #: against whatever Job happens to be pending), which is fine for an
+    #: M15 Job but never acceptable for SECURITY_EDIT/COMMIT - DANGEROUS-
+    #: tier actions (app/tools/base.py) that must never be approved by an
+    #: ambiguous word. This capability instead requires the explicit gate
+    #: name ("the plan"/"the security edit"/"the commit") in the message
+    #: itself - see JarvisCore._handle_self_dev_approval, which is also
+    #: where "does a matching session actually exist" is checked; this
+    #: capability alone is only ever a hint, exactly like CONFIRMATION.
+    SELF_DEV_APPROVAL = "self_development_approval"
 
 
 @dataclass
@@ -138,12 +153,27 @@ class CapabilityDecision:
     invocation phrasing's captured text ("self-develop: <request>") or
     the raw message itself, the same "captured text, or the whole
     message" convention TASK's own `goal` already uses.
+
+    `approve` is ALSO used when `capability` is `SELF_DEV_APPROVAL`: `True`
+    for "approve ...", `False` for "reject"/"decline"/"deny ...", exactly
+    the same meaning as for CONFIRMATION, just for a different pending
+    thing.
+
+    `self_dev_gate` is used ONLY when `capability` is `SELF_DEV_APPROVAL`:
+    which of the Self-Development Engine's three explicit approval gates
+    the message named - `"plan"`, `"security_edit"`, or `"commit"` (see
+    `_SELF_DEV_APPROVAL_PATTERN` below). JarvisCore._handle_self_dev_approval
+    uses this to find the one pending session actually awaiting THAT gate -
+    never the LLM, never plan/file content, only this field, which is
+    itself set only from the user's own raw message text. `None` and
+    unused for every other capability.
     """
 
     capability: Capability
     tool_name: str | None = None
     goal: str | None = None
     approve: bool | None = None
+    self_dev_gate: str | None = None
 
 
 class CapabilityRouter(ABC):
@@ -248,6 +278,24 @@ _CONFIRMATION_NO_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+#: SELF_DEV_APPROVAL: the explicit "approve/reject/decline/deny the
+#: plan/security edit/commit" phrasing - anchored to the WHOLE message
+#: (plus optional leading "please" and trailing punctuation), the same
+#: "explicit, closed, narrow signal, never a substring match" discipline
+#: `_CONFIRMATION_YES_PATTERN` already uses. Deliberately requires the
+#: gate's own name spelled out - bare "approve"/"yes"/"ok" is left to
+#: CONFIRMATION (which "approve[ds]?" is already one of), and never
+#: resolves anything here: an ambiguous word must never be capable of
+#: approving a DANGEROUS-tier SECURITY_EDIT or COMMIT (V1's own explicit
+#: requirement). The captured gate name is normalized to
+#: "plan"/"security_edit"/"commit" by `DeterministicCapabilityRouter.
+#: route` below.
+_SELF_DEV_APPROVAL_PATTERN = re.compile(
+    r"^\s*(?:please\s+)?(approve|reject|decline|deny)\s+(?:the\s+)?"
+    r"(plan|security\s+edit|commit)\s*[.!]?\s*$",
+    re.IGNORECASE,
+)
+
 #: A natural-language question about a Job's status/progress - a small,
 #: fixed set of phrasings matching this project's own worked examples
 #: ("what's the status of my task?", "what are you doing?", "is that
@@ -315,8 +363,8 @@ _SELF_DEV_INVOCATION_PATTERN = re.compile(
 
 class DeterministicCapabilityRouter(CapabilityRouter):
     """The only capability decision maker for now: TOOL, then CONFIRMATION,
-    then SELF_DEVELOPMENT, then TASK_STATUS, then TASK, then DIRECT vs
-    SEARCH, all without any Gemini/LLM call.
+    then SELF_DEV_APPROVAL, then SELF_DEVELOPMENT, then TASK_STATUS, then
+    TASK, then DIRECT vs SEARCH, all without any Gemini/LLM call.
 
     TOOL is checked first, via two narrow explicit-invocation phrasings -
     `_TOOL_INVOCATION_PATTERN` ("use tool echo") and `_TOOL_MENTION_PATTERN`
@@ -338,6 +386,18 @@ class DeterministicCapabilityRouter(CapabilityRouter):
     stray "yes"/"ok" with nothing pending behaves exactly as before.
     Checked before TASK_STATUS/TASK since neither of those patterns can
     match a bare "yes" anyway, but placed early for clarity of intent.
+
+    SELF_DEV_APPROVAL is checked next: `_SELF_DEV_APPROVAL_PATTERN`
+    ("approve the plan", "reject the security edit", "approve the
+    commit", ...) is, like CONFIRMATION, only ever a HINT that this
+    message continues a pending self-development session -
+    JarvisCore._handle_self_dev_approval checks whether any session in
+    THIS conversation is actually awaiting that exact gate and falls
+    back to ordinary DIRECT handling if not. Checked before
+    SELF_DEVELOPMENT so that, e.g., "approve the plan" (no dev-action
+    verb, no self-referential target) is never left to fall all the way
+    through to DIRECT/SEARCH before this narrower, more specific pattern
+    gets a chance.
 
     SELF_DEVELOPMENT is checked next: `_SELF_DEV_INVOCATION_PATTERN` (an
     explicit "self-develop: ..."/"dev task: ..." phrasing) or the
@@ -392,6 +452,16 @@ class DeterministicCapabilityRouter(CapabilityRouter):
             return CapabilityDecision(capability=Capability.CONFIRMATION, approve=True)
         if _CONFIRMATION_NO_PATTERN.match(message):
             return CapabilityDecision(capability=Capability.CONFIRMATION, approve=False)
+
+        self_dev_approval_match = _SELF_DEV_APPROVAL_PATTERN.match(message)
+        if self_dev_approval_match:
+            verb = self_dev_approval_match.group(1).lower()
+            gate = re.sub(r"\s+", "_", self_dev_approval_match.group(2).lower())
+            return CapabilityDecision(
+                capability=Capability.SELF_DEV_APPROVAL,
+                approve=(verb == "approve"),
+                self_dev_gate=gate,
+            )
 
         self_dev_invocation_match = _SELF_DEV_INVOCATION_PATTERN.match(message)
         if self_dev_invocation_match:

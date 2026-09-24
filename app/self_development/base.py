@@ -382,6 +382,15 @@ class DevelopmentSession:
     checks_run: tuple[CheckRun, ...] = field(default_factory=tuple)
     summary: DevelopmentSummary | None = None
     messages: tuple[str, ...] = ()
+    #: The chat conversation (app/memory/) this session was started from,
+    #: if any - `None` for a session started directly through the
+    #: engine's own Python API (every existing test, and every manual
+    #: validation run). Set once, at `start()`, and used only to scope a
+    #: later chat-based approval reply to the ONE conversation that
+    #: actually started this session (app/core.py:
+    #: JarvisCore._handle_self_dev_approval) - never read or written by
+    #: anything else in this package.
+    conversation_id: str | None = None
 
     def log(self, message: str) -> None:
         self.messages = self.messages + (message,)

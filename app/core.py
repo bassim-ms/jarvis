@@ -94,6 +94,26 @@ returns to any existing caller:
   handling - so a stray "yes"/"ok" in normal conversation, with no Job
   awaiting anything, behaves exactly as it always has.
 
+The Self-Development Engine (app/self_development/) integration follows
+the exact same "hint, not a guarantee, resolved against real state"
+shape:
+
+- SELF_DEVELOPMENT (`_handle_self_development`): a clearly-identified
+  development request ("fix the voice module") starts a new session via
+  `self_development_engine.start(...)`, which proposes a plan and stops -
+  nothing is branched, edited, or committed yet.
+- SELF_DEV_APPROVAL (`_handle_self_dev_approval`): a LATER message
+  explicitly naming a gate ("approve the plan", "reject the security
+  edit", "approve the commit") is resolved against whichever session in
+  THIS SAME conversation is actually awaiting THAT exact gate right now,
+  then dispatched to the engine's own existing `approve_plan`/
+  `approve_security_edit`/`approve_commit`. If no such session exists,
+  this returns `None` and falls back to ordinary DIRECT handling, same as
+  CONFIRMATION's own fallback - and, unlike CONFIRMATION, NEVER widens
+  the search to other conversations if none matches this one (SECURITY_
+  EDIT/COMMIT are DANGEROUS-tier, so association must be exact, not
+  merely "the only one pending anywhere").
+
 `handle_chat`'s own public signature and behavior (a 3-tuple: reply,
 conversation_id, sources) are completely unchanged by any of this - every
 existing caller (this project's whole test suite, the voice client, ...)
@@ -129,7 +149,7 @@ from app.providers.base import AIProvider, ProviderError
 from app.providers.factory import create_default_ai_provider_manager
 from app.providers.manager import call_with_requirements
 from app.providers.requirements import classify_request
-from app.self_development.base import DevelopmentSession
+from app.self_development.base import DevelopmentSession, SessionStage
 from app.self_development.engine import SelfDevelopmentEngine
 from app.search.answer import (
     GeminiSearchAnswerGenerator,
@@ -525,7 +545,37 @@ class JarvisCore:
                     planning_directive,
                 )
             else:
-                reply, sources = self._handle_self_development(decision, message)
+                reply, sources = self._handle_self_development(
+                    decision, message, conversation_id
+                )
+        elif decision.capability is Capability.SELF_DEV_APPROVAL:
+            approval_result = (
+                self._handle_self_dev_approval(decision, conversation_id)
+                if self.self_development_engine is not None
+                else None
+            )
+            if approval_result is not None:
+                reply, sources = approval_result
+            else:
+                # Either no engine is configured, or no session in THIS
+                # conversation is actually awaiting the named gate right
+                # now - the same "hint, not a guarantee" fallback
+                # CONFIRMATION/SELF_DEVELOPMENT already use above.
+                reasoning_result = self._reason_about_context(
+                    message, request_context, context_snapshot
+                )
+                planning_directive = self._plan_about_context(
+                    message, request_context, context_snapshot, reasoning_result
+                )
+                reply, sources = self._handle_direct(
+                    message,
+                    history,
+                    facts,
+                    Capability.DIRECT,
+                    context_snapshot,
+                    reasoning_result,
+                    planning_directive,
+                )
         else:
             reasoning_result = self._reason_about_context(
                 message, request_context, context_snapshot
@@ -992,7 +1042,7 @@ class JarvisCore:
         return self._format_tool_result(confirm_result), []
 
     def _handle_self_development(
-        self, decision: CapabilityDecision, message: str
+        self, decision: CapabilityDecision, message: str, conversation_id: str
     ) -> tuple[str, list[SearchSource]]:
         """SELF_DEVELOPMENT path: dispatches to
         `self.self_development_engine.start(...)`, which proposes a
@@ -1001,17 +1051,23 @@ class JarvisCore:
         app/self_development/engine.py:SelfDevelopmentEngine.start's own
         docstring). `sources` is always `[]`.
 
-        V1's own chat integration goes exactly this far: proposing and
-        reporting a plan. Approving that plan, approving a commit, and
-        rolling back are all available through SelfDevelopmentEngine's
-        own directly-callable API (`approve_plan`/`approve_commit`/
-        `rollback`) - not yet through a second chat turn. This is a
-        deliberate, explicit V1 scope boundary (see this project's own
-        Self-Development Engine documentation) rather than a rushed,
-        under-tested multi-turn approval flow for a subsystem whose
-        entire point is that nothing happens without explicit approval."""
+        `conversation_id` is passed through as `start()`'s own
+        `conversation_id` argument purely so a LATER chat message in
+        THIS SAME conversation can be deterministically associated back
+        to the resulting session (see `_handle_self_dev_approval`) -
+        `start()`'s own decision of what plan to propose is completely
+        unaffected by it.
+
+        Continuing this session - approving the plan, a SECURITY_EDIT,
+        or a commit - now happens through `_handle_self_dev_approval`
+        (a later chat message naming the gate explicitly), not only
+        through SelfDevelopmentEngine's own directly-callable Python API
+        - see that method's own docstring for the exact association/
+        approval rules."""
         request_text = decision.goal or message
-        session = self.self_development_engine.start(request_text)
+        session = self.self_development_engine.start(
+            request_text, conversation_id=conversation_id
+        )
         return self._format_self_dev_session(session), []
 
     @staticmethod
@@ -1021,8 +1077,6 @@ class JarvisCore:
         file's contents (nothing here reads file content at all) and
         never claims an action happened that didn't (a plan is only
         ever described as "proposed," never as "done")."""
-        from app.self_development.base import SessionStage
-
         if session.stage is SessionStage.BLOCKED_DIRTY_TREE:
             return (
                 "I can't start a self-development session right now - the "
@@ -1057,9 +1111,157 @@ class JarvisCore:
             )
         lines.append(
             "\nI won't create a branch, edit anything, or commit anything until "
-            "this plan is explicitly approved."
+            "this plan is explicitly approved. Reply 'Approve the plan.' to "
+            "continue, or 'Reject the plan.' to cancel."
         )
         return "\n".join(lines)
+
+    #: Maps a SELF_DEV_APPROVAL gate name (app/capability.py:
+    #: _SELF_DEV_APPROVAL_PATTERN) to the exact SessionStage a session
+    #: must be in for that gate's approval to apply to it - the only
+    #: place this association is made, so "approve the commit" can never
+    #: accidentally resolve a session that's actually still awaiting
+    #: plan approval, or vice versa.
+    _SELF_DEV_GATE_STAGES = {
+        "plan": SessionStage.PLAN_PROPOSED,
+        "security_edit": SessionStage.AWAITING_SECURITY_APPROVAL,
+        "commit": SessionStage.AWAITING_COMMIT_APPROVAL,
+    }
+
+    def _handle_self_dev_approval(
+        self, decision: CapabilityDecision, conversation_id: str
+    ) -> tuple[str, list[SearchSource]] | None:
+        """SELF_DEV_APPROVAL path: resolves an explicit "approve/reject
+        the plan/security edit/commit" chat message against whichever of
+        THIS conversation's own self-development sessions is actually
+        sitting at the matching gate right now, then dispatches to the
+        existing, already-hardened SelfDevelopmentEngine.approve_plan/
+        approve_security_edit/approve_commit - never a new approval
+        mechanism.
+
+        `decision.approve`/`decision.self_dev_gate` come ONLY from
+        `_SELF_DEV_APPROVAL_PATTERN` matching the user's OWN raw message
+        (app/capability.py) - nothing here ever reads plan content, file
+        content, or any other LLM output to decide whether something is
+        approved, so approval can never be manufactured by the LLM or by
+        text living in a repository file.
+
+        Returns `None` (never a reply) when no session in THIS
+        conversation is actually awaiting that specific gate right now,
+        so `_dispatch` falls back to ordinary DIRECT handling - the same
+        "hint, not a guarantee" discipline `_handle_confirmation` already
+        uses.
+
+        Deliberately STRICTER than `_handle_confirmation`'s own
+        disambiguation: `_handle_confirmation` falls back to considering
+        every Job pending across ALL conversations if none match this
+        one; this method never widens the search - SECURITY_EDIT and
+        COMMIT are DANGEROUS-tier actions (app/tools/base.py), so a
+        session started in a DIFFERENT conversation is never even a
+        candidate. More than one matching session in THIS conversation
+        (only possible if the same person started more than one
+        self-development request from here without resolving the first)
+        is reported back for the user to disambiguate by session id -
+        never guessed."""
+        gate = decision.self_dev_gate
+        target_stage = self._SELF_DEV_GATE_STAGES.get(gate) if gate else None
+        if target_stage is None:
+            return None
+
+        candidates = [
+            session
+            for session in self.self_development_engine.sessions.values()
+            if session.stage is target_stage and session.conversation_id == conversation_id
+        ]
+        if not candidates:
+            return None
+
+        if len(candidates) > 1:
+            ids = ", ".join(session.id for session in candidates)
+            return (
+                "You have more than one self-development session awaiting "
+                f"{gate} approval: {ids}. Which one do you mean?",
+                [],
+            )
+
+        session = candidates[0]
+        approve = bool(decision.approve)
+
+        if gate == "plan":
+            session = self.self_development_engine.approve_plan(session, approved=approve)
+        elif gate == "security_edit":
+            session = self.self_development_engine.approve_security_edit(
+                session, confirmed=approve
+            )
+        else:  # "commit"
+            # A deterministic, already-reviewed commit message - the
+            # plan's own objective (already shown to the user in the
+            # original plan preview) or the finalize step's own summary
+            # of it, NEVER anything freshly generated at approval time,
+            # so approving a commit can never be tricked into running
+            # arbitrary attacker-influenced text as the commit message
+            # either.
+            commit_message = (
+                session.summary.change_summary
+                if session.summary is not None
+                else (session.plan.objective if session.plan is not None else "")
+            )
+            session = self.self_development_engine.approve_commit(
+                session, confirmed=approve, message=commit_message
+            )
+
+        return self._format_self_dev_approval_result(session, gate), []
+
+    @staticmethod
+    def _format_self_dev_approval_result(session: DevelopmentSession, gate: str) -> str:
+        """Pure serializer for the state `_handle_self_dev_approval`'s
+        engine call just produced - same "describe, never decide"
+        discipline as `_format_self_dev_session`."""
+        if session.stage is SessionStage.PLAN_REJECTED:
+            return "Plan rejected - no branch was created and no files were touched."
+
+        if session.stage is SessionStage.AWAITING_SECURITY_APPROVAL:
+            protected = ", ".join(sorted(session.plan.protected_file_paths()))
+            return (
+                f"Plan approved - development branch '{session.dev_branch}' created. "
+                f"This plan touches protected security-critical file(s): {protected}. "
+                "That requires a SEPARATE SECURITY_EDIT approval before those files "
+                "are edited. Reply 'Approve the security edit.' or 'Reject the "
+                "security edit.'"
+            )
+
+        if session.stage is SessionStage.SECURITY_EDIT_DECLINED:
+            return (
+                "SECURITY_EDIT declined - protected files were not edited. The "
+                "session's branch still exists for manual review or rollback."
+            )
+
+        if session.stage is SessionStage.CHECKS_FAILED:
+            return (
+                f"Checks failed after {session.repair_attempts} bounded repair "
+                "attempt(s) - stopping. No commit approval requested; the branch "
+                "still exists for manual review or rollback."
+            )
+
+        if session.stage is SessionStage.AWAITING_COMMIT_APPROVAL:
+            files = ", ".join(session.edited_files) or "(none)"
+            diff = session.summary.git_diff_summary if session.summary else ""
+            return (
+                f"Checks passed on branch '{session.dev_branch}'. Files changed: "
+                f"{files}.\n\nDiff:\n{diff[:2000]}\n\nReply 'Approve the commit.' "
+                "or 'Reject the commit.'"
+            )
+
+        if session.stage is SessionStage.COMMITTED:
+            return f"Committed on branch '{session.dev_branch}'. Nothing was pushed."
+
+        if session.stage is SessionStage.COMMIT_DECLINED:
+            return (
+                "Commit declined. The branch and its uncommitted changes still "
+                "exist for manual review or rollback."
+            )
+
+        return f"Session {session.id} is now in stage '{session.stage.value}'."
 
     @staticmethod
     def _format_tool_result(result: ToolResult) -> str:
