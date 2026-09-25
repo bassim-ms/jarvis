@@ -193,6 +193,10 @@ async def _lifespan(app: FastAPI):
 
 app = FastAPI(title=settings.app_name, lifespan=_lifespan)
 
+@app.get("/dev/ping")
+def dev_ping() -> str:
+    return "pong"
+
 
 @app.get("/dev/status")
 def dev_status() -> dict:
