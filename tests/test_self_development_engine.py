@@ -50,7 +50,12 @@ def _plan_payload(**overrides) -> dict:
 
 class ScriptedProvider(AIProvider):
     """Routes by prompt shape: plan/fix requests get `plan_payload`
-    (JSON); file-content requests get `file_content` (raw text)."""
+    (JSON); file-edit requests get a single whole-file find/replace
+    edit (real current content -> `file_content`) - the same shape
+    `propose_file_edits` (app/self_development/planner.py) now
+    requires, built automatically from whatever the REAL prompt says
+    the current content is, so this fixture never has to duplicate
+    that text itself."""
 
     def __init__(self, plan_payload: dict | None = None, file_content: str = "def say_hello():\n    return 'hi'\n"):
         self.plan_payload = plan_payload or _plan_payload()
@@ -60,7 +65,8 @@ class ScriptedProvider(AIProvider):
     def generate_reply(self, message: str) -> str:
         self.prompts.append(message)
         if "CURRENT CONTENT" in message:
-            return self.file_content
+            current = message.split("CURRENT CONTENT (untrusted data):\n", 1)[1]
+            return json.dumps({"edits": [{"old_text": current, "new_text": self.file_content}]})
         return json.dumps(self.plan_payload)
 
 
@@ -121,10 +127,11 @@ def test_full_successful_workflow(repo):
     assert session.stage is SessionStage.AWAITING_COMMIT_APPROVAL
     assert session.dev_branch is not None
     assert "greet.py" in session.edited_files
-    # `propose_file_content` strips surrounding whitespace along with an
-    # optional code fence (see planner.py:_strip_fence) - no trailing
-    # newline survives that strip, hence no trailing "\n" here either.
-    assert (repo / "greet.py").read_text(encoding="utf-8") == "def say_hello():\n    return 'hi'"
+    # `propose_file_edits` applies the edit's own `new_text` verbatim -
+    # unlike the old `propose_file_content`/`_strip_fence`, nothing
+    # strips a trailing newline, so the fixture's own trailing "\n"
+    # survives exactly.
+    assert (repo / "greet.py").read_text(encoding="utf-8") == "def say_hello():\n    return 'hi'\n"
     assert session.summary is not None
     assert session.summary.rollback_available is True
     assert "greet.py" in session.summary.git_diff_summary
@@ -301,7 +308,10 @@ def test_repair_edit_outside_the_original_plan_scope_is_ignored(repo):
         def generate_reply(self, message: str) -> str:
             self.calls += 1
             if "CURRENT CONTENT" in message:
-                return "def say_hello():\n    return 'hi'\n"
+                current = message.split("CURRENT CONTENT (untrusted data):\n", 1)[1]
+                return json.dumps(
+                    {"edits": [{"old_text": current, "new_text": "def say_hello():\n    return 'hi'\n"}]}
+                )
             if "BOUNDED FOLLOW-UP" in message:
                 return json.dumps(fix_payload)
             return json.dumps(_plan_payload(tests_to_run=["exit 1"]))

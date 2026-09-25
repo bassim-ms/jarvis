@@ -157,45 +157,67 @@ _GENERIC_IDENTIFIER_FRAGMENTS = frozenset({
 })
 
 # ---------------------------------------------------------------------------
-# Edit-stage bounding (hardening pass 3) - a live test showed an approved,
-# well-grounded plan still corrupting app/main.py at the EDIT stage: the
-# model's `propose_file_content` response dumped hundreds of lines of its
-# own reasoning into the file, made unrelated changes to `/chat`, and
-# changed `job_id` types nobody asked for - a full-file-rewrite response
-# that barely resembled the file it started from. Grounding (which files/
-# attributes a PLAN may name) and edit-bounding (whether a PROPOSED EDIT's
-# actual content is trustworthy) are separate concerns - this section is
-# the second one.
+# Edit-stage bounding (hardening pass 3, revised) - a live test showed an
+# approved, well-grounded plan still corrupting app/main.py at the EDIT
+# stage: the model's full-file-rewrite response dumped hundreds of lines
+# of its own reasoning into the file, made unrelated changes elsewhere,
+# and produced a much larger rewrite than requested. A first fix (syntax
+# validation + a similarity-ratio backstop, still below) caught THAT
+# shape of failure but not a subtler one a SECOND live test then showed:
+# a well-formed, syntactically-VALID rewrite that still deleted an
+# unrelated existing endpoint, reformatted unrelated code, and invented
+# unrequested models/exception handling - similar enough overall to stay
+# above the similarity threshold, while still touching code nobody asked
+# to change. Grounding (which files/attributes a PLAN may name) and
+# edit-bounding (whether a PROPOSED EDIT's actual content is trustworthy)
+# remain separate concerns - this section is the second one.
 #
-# Deliberately NOT a rewrite of the edit mechanism into a diff/patch
-# format (a bigger, riskier change, and V1's own explicit "keep it
-# simple, no new architecture" requirement) - instead, two independent,
-# stdlib-only checks in `_edit_one_file`, the ONE place this whole
-# package ever turns a model's proposed content into a real file write:
+# The actual fix: `propose_file_edits` (planner.py) no longer asks for
+# "the complete new file" at all - it asks for a small set of EXACT
+# find-and-replace edits against the real current content. `_apply_file_
+# edits` (below) applies them itself, against the REAL current content
+# this engine already has in hand - never the model's own claim of what
+# the "old" text was. An edit whose `old_text` doesn't match verbatim, or
+# matches more than once (ambiguous), is rejected outright; unrelated
+# code the model never quotes can never be touched AT ALL, structurally,
+# not merely by being asked nicely not to. This is what "structured and
+# bounded, not an unrestricted full-file rewrite" (V1's own explicit
+# requirement) actually means in practice.
 #
-# 1. Syntax validation (`_content_is_syntactically_valid`, using the
-#    same `ast` module the grounding checks already import) - reasoning
-#    text/prose dumped into a .py file is, for all practical purposes,
-#    never also valid Python, so this alone catches the reported
-#    failure directly. ALSO enforced independently, defense-in-depth,
-#    inside editor.py's own EditFileTool/SecurityEditFileTool - so this
-#    protection holds even for a future caller that bypasses engine.py.
-# 2. Change-proportionality (`_is_change_proportionate`, using the
-#    stdlib's own `difflib`) - a bounded edit still closely resembles
-#    the file it started from; it never replaces most of an existing
-#    file's content just to make one small, requested change. This is
-#    what "structured and bounded, not an unrestricted full-file
-#    rewrite" (V1's own explicit requirement) actually means in
-#    practice here: the PROMPT still asks for complete new content (so
-#    existing tests/prompts are unaffected), but the RESULT is now
-#    verified to be a proportionate, targeted change before it's ever
-#    written - never trusted merely because the model produced it.
+# `_content_is_syntactically_valid` and `_is_change_proportionate` remain
+# as a SECOND, independent layer, applied to the FINAL content after
+# edits are applied - still real, still useful (an edit set can still
+# reconstruct something syntactically broken, or - bounded per-edit size
+# aside - collectively add up to something disproportionate), just no
+# longer the primary defense.
 #
-# Neither check ever silently repairs or trims a bad response - both
-# REJECT it outright (no file write happens at all, the ORIGINAL file
-# is untouched) and log why, the same fail-closed discipline every
-# other structural check in this package already uses.
+# No check here ever silently repairs or trims a bad response - every one
+# REJECTS it outright (no file write happens at all, the ORIGINAL file is
+# untouched) and logs why, the same fail-closed discipline every other
+# structural check in this package already uses.
 # ---------------------------------------------------------------------------
+
+#: An individual edit's own old_text/new_text is bounded - never large
+#: enough, by itself, to plausibly BE "most of the file" dressed up as a
+#: single "exact match" quote. Generous enough for a real multi-line
+#: function (existing or new), firmly smaller than a substantial file
+#: like the real app/main.py (255 lines, ~7,000 characters).
+_MAX_EDIT_TEXT_CHARS = 4_000
+
+#: How many separate edits a single file-edit proposal may contain -
+#: bounded so "many small edits" can't be used to add up to a de facto
+#: full rewrite either.
+_MAX_EDITS_PER_FILE = 6
+
+#: The COMBINED old_text across every edit for one existing file must
+#: not exceed this fraction of the file's own current size (with a
+#: small floor for tiny files) - the per-edit cap above stops any ONE
+#: edit from being a disguised bulk rewrite, but several individually-
+#: small edits could otherwise still add up to touching most of a large
+#: file; this bounds the total, matching "surgical" in aggregate, not
+#: just per edit.
+_MAX_TOTAL_OLD_TEXT_RATIO = 0.3
+_MIN_TOTAL_OLD_TEXT_FLOOR = 300
 
 #: How much of a file's own original content a proposed edit must still
 #: resemble (0.0-1.0, via difflib.SequenceMatcher's own line-based
@@ -248,6 +270,63 @@ def _is_change_proportionate(old_content: str, new_content: str) -> bool:
     new_lines = new_content.splitlines()
     similarity = difflib.SequenceMatcher(None, old_lines, new_lines).ratio()
     return similarity >= _MIN_UNCHANGED_SIMILARITY
+
+
+def _apply_file_edits(current_content: str, edits: tuple[dict, ...]) -> str | None:
+    """Applies a small set of EXACT find-and-replace edits against the
+    REAL current content this engine already read - never the model's
+    own claim of what was there. Returns the resulting content, or
+    `None` (never a partial result, never a guess) if:
+    - any edit's `old_text` doesn't appear in the content AT ALL
+      (hallucinated - the model quoted text that isn't real), or
+      appears MORE THAN ONCE (ambiguous - which occurrence?);
+    - any edit's `old_text`/`new_text` exceeds `_MAX_EDIT_TEXT_CHARS`,
+      there are more than `_MAX_EDITS_PER_FILE` edits, or the edits'
+      COMBINED `old_text` exceeds `_MAX_TOTAL_OLD_TEXT_RATIO` of the
+      file's own current size (several small edits adding up to a de
+      facto bulk rewrite is rejected too, not just one large one);
+    - `current_content` is empty (a brand-new file) and the edits
+      AREN'T exactly the single documented "whole new file" form
+      (`old_text == ""`); or that form is used for a file that already
+      has real content (it must never silently blow away an existing
+      file this way).
+
+    Edits are applied in order, each against the content the PREVIOUS
+    edit already produced - so a later edit's `old_text` must match
+    what's there at that point, not the original file, the same way a
+    person editing a file one change at a time would experience it."""
+    if len(edits) > _MAX_EDITS_PER_FILE:
+        return None
+
+    if current_content == "":
+        if (
+            len(edits) == 1
+            and edits[0]["old_text"] == ""
+            and len(edits[0]["new_text"]) <= _MAX_EDIT_TEXT_CHARS
+        ):
+            return edits[0]["new_text"]
+        return None
+
+    max_total_old_text = max(
+        _MIN_TOTAL_OLD_TEXT_FLOOR, int(len(current_content) * _MAX_TOTAL_OLD_TEXT_RATIO)
+    )
+    total_old_text = sum(len(edit["old_text"]) for edit in edits)
+    if total_old_text > max_total_old_text:
+        return None  # touches too much of the file in aggregate, even if no single edit does
+
+    content = current_content
+    for edit in edits:
+        old_text = edit["old_text"]
+        new_text = edit["new_text"]
+        if not old_text:
+            return None  # empty old_text is only ever valid for a brand-new file
+        if len(old_text) > _MAX_EDIT_TEXT_CHARS or len(new_text) > _MAX_EDIT_TEXT_CHARS:
+            return None
+        if content.count(old_text) != 1:
+            return None  # not found, or matches more than once - never guess
+        content = content.replace(old_text, new_text, 1)
+    return content
+
 
 #: A fixed, general set of hedge/uncertainty/placeholder phrases - never
 #: specific to one request or feature. A plan genuinely grounded in real,
@@ -867,11 +946,21 @@ class SelfDevelopmentEngine:
             else ""
         )
         try:
-            new_content = self.planner.propose_file_content(
+            edits = self.planner.propose_file_edits(
                 objective, description, path, current_content
             )
         except DevelopmentPlanningError as exc:
-            session.log(f"Could not generate content for '{path}': {exc}")
+            session.log(f"Could not generate an edit for '{path}': {exc}")
+            return False
+
+        new_content = _apply_file_edits(current_content, edits)
+        if new_content is None:
+            session.log(
+                f"Edit rejected for '{path}': the proposed edit(s) didn't "
+                "match the file's real current content exactly (not "
+                "found, matched more than once, or too large/too many) "
+                "- refusing an ambiguous, hallucinated, or oversized edit."
+            )
             return False
 
         if not _content_is_syntactically_valid(path, new_content):

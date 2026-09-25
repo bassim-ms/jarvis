@@ -35,11 +35,11 @@ from app.providers.base import AIProvider, ProviderError
 from app.providers.manager import call_with_requirements
 from app.providers.requirements import RequestRequirements, TaskType
 
-#: Unlike every other strict-JSON caller in this codebase (which only
-#: ever strip a bare/```json fence), `propose_file_content` below asks
-#: for raw source code, not JSON - a model may reasonably wrap that in
-#: a language-tagged fence (```python, ```javascript, ...), so the tag
-#: here is any short identifier, not just "json".
+#: Every JSON-envelope response in this module (plans, fixes, file
+#: edits) may come back wrapped in a markdown code fence despite being
+#: told not to - the tag is accepted as any short identifier (not just
+#: "json"), since a model may reasonably still tag it ```python for a
+#: file-edit response even though the envelope itself is JSON.
 _CODE_FENCE_PATTERN = re.compile(r"^```[A-Za-z0-9_+-]*\s*|\s*```$", re.IGNORECASE)
 
 _VALID_TOP_LEVEL_KEYS = {
@@ -166,6 +166,84 @@ def _parse_plan_payload(raw: str) -> DevelopmentPlan:
         raise DevelopmentPlanningError(f"Plan failed validation: {exc}") from exc
 
 
+# ---------------------------------------------------------------------------
+# Edit-stage bounding - a live test showed `propose_file_content`'s old
+# "produce the file's COMPLETE new content" contract accepted a response
+# that deleted an unrelated existing endpoint, reformatted unrelated code,
+# and invented unrequested models, all in one plausible-looking rewrite.
+# `propose_file_edits` (below) asks for a small, EXACT find-and-replace
+# patch instead - the SAME strict-JSON-schema discipline `_parse_plan_
+# payload` above already uses, extended to file edits. The caller
+# (engine.py:SelfDevelopmentEngine._apply_file_edits) applies each edit
+# against the REAL current content it already has, so an `old_text` that
+# doesn't match verbatim - or matches more than once - is rejected before
+# anything is ever written; unrelated code the model never quotes can
+# never be touched at all, structurally, not by asking nicely.
+# ---------------------------------------------------------------------------
+
+_EDIT_INSTRUCTIONS = (
+    "You are proposing a SURGICAL, BOUNDED edit to exactly one file, as "
+    "part of an already-approved development plan. Do NOT rewrite the "
+    "file. Do NOT reformat, reorganize, or touch any code that isn't "
+    "directly required by the described change - unrelated existing "
+    "code must be left exactly as it is. Propose the change as a small "
+    "list of exact find-and-replace edits against the CURRENT CONTENT "
+    "shown below.\n\n"
+    "Respond with ONLY one JSON object, no prose, no markdown "
+    'formatting, in exactly this shape: {"edits": [{"old_text": '
+    '"<exact text copied verbatim from CURRENT CONTENT, appearing '
+    'EXACTLY ONCE in it>", "new_text": "<its replacement>"}]}.\n\n'
+    "Rules:\n"
+    "1. old_text must be copied character-for-character from CURRENT "
+    "CONTENT - never paraphrased, reformatted, or re-indented - and "
+    "must appear in it exactly once.\n"
+    "2. new_text is ONLY the replacement for that exact span - never "
+    "the whole file, never unrelated surrounding code.\n"
+    "3. To ADD new code without replacing anything, choose a short, "
+    "already-unique existing line as old_text and include that same "
+    "line, unchanged, at the start or end of new_text (so the edit "
+    "both keeps it and adds your new code next to it).\n"
+    "4. Keep the number of edits and their size small and proportionate "
+    "to the requested change - never one edit that reproduces a large "
+    "part of the file.\n"
+    "5. If CURRENT CONTENT is empty (this file doesn't exist yet), "
+    'respond with exactly one edit whose old_text is "" and whose '
+    "new_text is the complete new file - the only case a full file's "
+    "content is ever written at once."
+)
+
+
+def _parse_file_edits_payload(raw: str) -> tuple[dict, ...]:
+    cleaned = _strip_fence(raw)
+    try:
+        payload = json.loads(cleaned)
+    except json.JSONDecodeError as exc:
+        raise DevelopmentPlanningError(
+            f"Invalid JSON from file-edit proposal: {raw!r}"
+        ) from exc
+
+    if not isinstance(payload, dict) or set(payload) != {"edits"}:
+        raise DevelopmentPlanningError(
+            f"Expected a JSON object with only an 'edits' field: {raw!r}"
+        )
+
+    edits_raw = payload.get("edits")
+    if not isinstance(edits_raw, list) or not edits_raw:
+        raise DevelopmentPlanningError(f"'edits' must be a non-empty JSON array: {raw!r}")
+
+    edits: list[dict] = []
+    for entry in edits_raw:
+        if (
+            not isinstance(entry, dict)
+            or set(entry) != {"old_text", "new_text"}
+            or not isinstance(entry.get("old_text"), str)
+            or not isinstance(entry.get("new_text"), str)
+        ):
+            raise DevelopmentPlanningError(f"Invalid edit entry: {entry!r}")
+        edits.append({"old_text": entry["old_text"], "new_text": entry["new_text"]})
+    return tuple(edits)
+
+
 class DevelopmentPlanner:
     """LLM-backed plan/fix/file-content proposer. `provider` is
     required (no internal default/hardcoded vendor) - routed through
@@ -214,21 +292,23 @@ class DevelopmentPlanner:
         )
         return _parse_plan_payload(self._call(prompt))
 
-    def propose_file_content(
+    def propose_file_edits(
         self, objective: str, file_description: str, path: str, current_content: str
-    ) -> str:
-        """Produce the COMPLETE new content for `path`. Returns raw
-        text (not JSON) - arbitrary source code doesn't fit a JSON
-        string cleanly, so this is the one call in this module that
-        doesn't ask for a JSON envelope; the caller
-        (engine.py:SelfDevelopmentEngine) still passes it through
-        EditFileTool's own bounds/secret-path checks before it's ever
-        written."""
+    ) -> tuple[dict, ...]:
+        """Produce a SMALL, SURGICAL set of exact find-and-replace edits
+        against `current_content` - deliberately NEVER "the complete new
+        file" (V1's own explicit requirement: a live test showed a full-
+        file-rewrite response deleting an unrelated existing endpoint,
+        reformatting unrelated code, and inventing unrequested models,
+        all while still looking like a plausible response). Returns the
+        validated `({"old_text": ..., "new_text": ...}, ...)` tuple; the
+        caller (engine.py:SelfDevelopmentEngine) applies each edit
+        itself, against the REAL current content it already has in
+        hand - never trusting the model's own claim of what the "old"
+        text was - then still passes the result through EditFileTool's
+        own bounds/secret-path/syntax checks before it's ever written."""
         prompt = (
-            "You are editing exactly one file in a personal assistant's "
-            "codebase, as part of an already-approved development plan. "
-            "Produce the file's COMPLETE new content - respond with ONLY the "
-            "new file content, no explanation, no markdown code fence.\n\n"
+            f"{_EDIT_INSTRUCTIONS}\n\n"
             f"{_UNTRUSTED_DATA_NOTICE}\n\n"
             f"Plan objective: {objective}\n"
             f"This file's intended change: {file_description}\n"
@@ -236,4 +316,4 @@ class DevelopmentPlanner:
             f"CURRENT CONTENT (untrusted data):\n{current_content}"
         )
         raw = self._call(prompt)
-        return _strip_fence(raw)
+        return _parse_file_edits_payload(raw)

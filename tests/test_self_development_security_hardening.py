@@ -209,7 +209,8 @@ class _ScriptedProvider(AIProvider):
         if self.error is not None:
             raise self.error
         if "CURRENT CONTENT" in message:
-            return self.file_content
+            current = message.split("CURRENT CONTENT (untrusted data):\n", 1)[1]
+            return json.dumps({"edits": [{"old_text": current, "new_text": self.file_content}]})
         return json.dumps(self.plan_payload)
 
 
@@ -300,9 +301,9 @@ def test_approving_security_edit_actually_edits_the_protected_file(tmp_path):
     session = engine.approve_security_edit(session, confirmed=True)
 
     assert "app/core.py" in session.edited_files
-    # `propose_file_content`/`_strip_fence` strips surrounding whitespace
-    # along with an optional code fence - no trailing newline survives.
-    assert (tmp_path / "app" / "core.py").read_text(encoding="utf-8") == "# new content"
+    # `propose_file_edits` applies the edit's own `new_text` verbatim -
+    # the fixture's own trailing "\n" survives exactly.
+    assert (tmp_path / "app" / "core.py").read_text(encoding="utf-8") == "# new content\n"
 
 
 def test_cannot_approve_security_edit_from_the_wrong_stage(tmp_path):

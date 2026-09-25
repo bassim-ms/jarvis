@@ -53,8 +53,10 @@ def _plan_payload(**overrides) -> dict:
 
 class ScriptedProvider(AIProvider):
     """The Self-Development Engine's OWN provider - routes by prompt
-    shape: plan/fix requests get `plan_payload` (JSON); file-content
-    requests get `file_content` (raw text). Same convention
+    shape: plan/fix requests get `plan_payload` (JSON); file-edit
+    requests get a single whole-file find/replace edit (real current
+    content -> `file_content`) - the shape `propose_file_edits`
+    (app/self_development/planner.py) now requires. Same convention
     tests/test_self_development_engine.py already uses."""
 
     def __init__(self, plan_payload: dict | None = None, file_content: str = "def say_hello():\n    return 'hi'\n"):
@@ -65,7 +67,8 @@ class ScriptedProvider(AIProvider):
     def generate_reply(self, message: str) -> str:
         self.prompts.append(message)
         if "CURRENT CONTENT" in message:
-            return self.file_content
+            current = message.split("CURRENT CONTENT (untrusted data):\n", 1)[1]
+            return json.dumps({"edits": [{"old_text": current, "new_text": self.file_content}]})
         return json.dumps(self.plan_payload)
 
 
@@ -143,7 +146,7 @@ def test_plan_approval_through_chat_creates_branch_edits_and_tests(repo):
     assert session.dev_branch is not None
     assert "greet.py" in session.edited_files
     assert (repo / "greet.py").read_text(encoding="utf-8") == (
-        "def say_hello():\n    return 'hi'"
+        "def say_hello():\n    return 'hi'\n"
     )
     assert "approve the commit" in reply.lower()
     # Not committed yet - still sitting uncommitted on the dev branch.
@@ -220,7 +223,7 @@ def test_security_edit_approval_through_chat_edits_the_protected_file(repo):
     session = next(iter(engine.sessions.values()))
     assert session.stage is SessionStage.AWAITING_COMMIT_APPROVAL
     assert "app/core.py" in session.edited_files
-    assert (repo / "app" / "core.py").read_text(encoding="utf-8") == "# marker"
+    assert (repo / "app" / "core.py").read_text(encoding="utf-8") == "# marker\n"
     assert "approve the commit" in reply.lower()
 
 
