@@ -139,6 +139,22 @@ _KEYWORD_STOPWORDS = frozenset({
 #: the repository," while comfortably covering one real package/module.
 _MAX_CANDIDATE_FILES = 12
 
+#: Identifier word-fragments too generic, standing ALONE, to count as
+#: meaningful grounding evidence for a brand-new file in
+#: `_find_ungrounded_file_paths` - a live test showed a real, UNRELATED
+#: method (GitClient's own `status_porcelain`, plain git-status
+#: plumbing) "grounding" an invented, unrelated `/dev/status` endpoint
+#: file purely because both happened to share the bare word "status."
+#: This is the SYMBOL side of the same problem `_KEYWORD_STOPWORDS`
+#: (the REQUEST side) already guards against - deliberately small,
+#: fixed, and reviewable, never a semantic/fuzzy judgment.
+_GENERIC_IDENTIFIER_FRAGMENTS = frozenset({
+    "status", "engine", "test", "self", "development", "sync", "run",
+    "data", "value", "manager", "handler", "service", "system",
+    "module", "helper", "utility", "base", "core", "main", "file",
+    "path", "name", "type", "result", "error", "event", "log",
+})
+
 #: A fixed, general set of hedge/uncertainty/placeholder phrases - never
 #: specific to one request or feature. A plan genuinely grounded in real,
 #: inspected code never needs to say any of this about something it's
@@ -451,7 +467,20 @@ class SelfDevelopmentEngine:
                 continue
             if not resolved.exists() and discovered_symbols:
                 description_words = _extract_words(change.description)
-                if not (description_words & discovered_symbols):
+                matched = description_words & discovered_symbols
+                # A match on a word that's ALSO one of the overly-generic
+                # fragments above never counts by itself - a live test
+                # showed exactly this (GitClient.status_porcelain's own
+                # bare "status" "grounding" an invented, unrelated
+                # /dev/status endpoint file). Only a SPECIFIC match - a
+                # whole compound identifier, or a real word that isn't
+                # one of the common CS/English fragments - counts as
+                # evidence. Never widened by simply combining several
+                # generic matches either: the live plan matched FIVE
+                # generic words at once ("status," "engine,"
+                # "development," "self," "test") and would still have
+                # been wrongly accepted under a "2+ matches" rule.
+                if not (matched - _GENERIC_IDENTIFIER_FRAGMENTS):
                     ungrounded.append(change.path)
         return tuple(ungrounded)
 

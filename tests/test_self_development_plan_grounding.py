@@ -27,6 +27,17 @@ name one of those real, discovered capabilities. A general hedge/
 placeholder-language check remains as a SEPARATE backstop, not the
 primary mechanism.
 
+Revised AGAIN after a third live test: a real, but wholly UNRELATED,
+discovered symbol (GitClient's own `status_porcelain` - plain git-
+status plumbing) "grounded" an invented `/dev/status` endpoint file
+purely because both happened to share the bare, overly-common word
+"status" - the description's OTHER matched words ("engine,"
+"development," "self," "test") were every bit as generic. `_find_
+ungrounded_file_paths` now refuses to count a match against
+`_GENERIC_IDENTIFIER_FRAGMENTS` (a small, fixed, reviewable list) as
+sufficient evidence BY ITSELF - a genuinely SPECIFIC word (e.g.
+"porcelain," or a real attribute like "stage") is still required.
+
 Every test runs against a throwaway temporary git repository (never
 the actual Jarvis repository).
 """
@@ -73,6 +84,45 @@ def _init_repo_with_calendar_sync(path) -> None:
     subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=path, check=True)
 
 
+def _init_repo_with_status_porcelain(path) -> None:
+    """Mirrors the REAL app/self_development/git.py: a method literally
+    named `status_porcelain` that has nothing to do with a "/dev/status"
+    endpoint - used to prove a bare, overly-common fragment of a real
+    but UNRELATED symbol never counts as grounding by itself."""
+    subprocess.run(["git", "init", "-q"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.name", "Tester"], cwd=path, check=True)
+    (path / "app").mkdir()
+    (path / "app" / "repo_status_tools.py").write_text(
+        "class RepoStatusTools:\n"
+        "    def status_porcelain(self):\n"
+        "        '''Return machine-readable git status output.'''\n"
+        "        return ''\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", "-A"], cwd=path, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=path, check=True)
+
+
+def _init_repo_with_development_session(path) -> None:
+    """A DevelopmentSession-shaped fixture with a real `stage` field -
+    the positive-evidence example the report specifically named."""
+    subprocess.run(["git", "init", "-q"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.name", "Tester"], cwd=path, check=True)
+    (path / "app").mkdir()
+    (path / "app" / "dev_session.py").write_text(
+        "from dataclasses import dataclass\n\n"
+        "@dataclass\n"
+        "class DevelopmentSession:\n"
+        "    stage: str\n"
+        "    request: str\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", "-A"], cwd=path, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=path, check=True)
+
+
 def _plan_payload(**overrides) -> dict:
     payload = {
         "objective": "Add a greeting function",
@@ -113,6 +163,18 @@ def repo(tmp_path):
 @pytest.fixture
 def calendar_repo(tmp_path):
     _init_repo_with_calendar_sync(tmp_path)
+    return tmp_path
+
+
+@pytest.fixture
+def status_repo(tmp_path):
+    _init_repo_with_status_porcelain(tmp_path)
+    return tmp_path
+
+
+@pytest.fixture
+def dev_session_repo(tmp_path):
+    _init_repo_with_development_session(tmp_path)
     return tmp_path
 
 
@@ -429,3 +491,130 @@ def test_a_protected_system_path_is_exempt_from_grounding(repo):
     session = engine.start("add a marker to app/core.py")
 
     assert session.stage is SessionStage.PLAN_PROPOSED  # not rejected as ungrounded
+
+
+# -- a generic fragment of an UNRELATED real symbol is never sufficient ----
+
+
+def test_an_unrelated_symbols_generic_fragment_does_not_ground_a_status_endpoint(status_repo):
+    """The exact live failure, reproduced generally: a real symbol
+    (`status_porcelain`, plain git-status plumbing) IS discovered, and
+    its bare "status" fragment DOES textually overlap with a plausible
+    description of a "/dev/status" endpoint - but that overlap alone
+    must never be treated as grounding, because "status" is one of the
+    overly-common fragments `_GENERIC_IDENTIFIER_FRAGMENTS` excludes."""
+    engine = _make_engine(
+        status_repo,
+        ScriptedProvider(
+            _plan_payload(
+                objective="Add a harmless /dev/status endpoint",
+                files_affected=[
+                    {
+                        "path": "app/dev_status.py",
+                        "description": "expose the current status via a new endpoint",
+                    }
+                ],
+            )
+        ),
+    )
+
+    # Confirm status_porcelain really was discovered - the test only
+    # means something if the evidence was genuinely found and still
+    # correctly judged insufficient, not merely absent.
+    _, discovered = engine._inspect_relevant_existing_code(
+        "self-develop: add a /dev/status endpoint using repo status tools"
+    )
+    assert "status" in discovered
+
+    session = engine.start(
+        "self-develop: add a /dev/status endpoint using repo status tools"
+    )
+
+    assert session.stage is SessionStage.PLAN_REJECTED
+    assert "app/dev_status.py" in session.messages[-1]
+    assert session.plan is None
+
+
+def test_an_unrelated_symbols_generic_fragment_still_blocks_even_with_several_matches(
+    status_repo,
+):
+    """The live plan matched FIVE generic words at once ("status,"
+    "engine," "development," "self," "test") - proving "multiple
+    matches" alone was never a safe bar; every one of them being
+    generic must still reject the plan."""
+    engine = _make_engine(
+        status_repo,
+        ScriptedProvider(
+            _plan_payload(
+                objective="Add a harmless /dev/status endpoint",
+                files_affected=[
+                    {
+                        "path": "app/dev_status.py",
+                        "description": (
+                            "add a test endpoint using the self-development "
+                            "engine to report status"
+                        ),
+                    }
+                ],
+            )
+        ),
+    )
+
+    session = engine.start(
+        "self-develop: add a /dev/status endpoint using repo status tools"
+    )
+
+    assert session.stage is SessionStage.PLAN_REJECTED
+    assert session.plan is None
+
+
+# -- a specific, real symbol/attribute grounds the plan (positive case) ----
+
+
+def test_a_specific_real_attribute_reference_grounds_the_plan(dev_session_repo):
+    """DevelopmentSession.stage - a real, specific attribute, not one
+    of the generic fragments - is sufficient grounding on its own."""
+    engine = _make_engine(
+        dev_session_repo,
+        ScriptedProvider(
+            _plan_payload(
+                objective="Expose the development session's current stage",
+                files_affected=[
+                    {
+                        "path": "app/status_endpoint.py",
+                        "description": "expose the development session's current stage",
+                    }
+                ],
+            )
+        ),
+    )
+
+    session = engine.start(
+        "self-develop: expose the development session stage via a new endpoint"
+    )
+
+    assert session.stage is SessionStage.PLAN_PROPOSED
+    assert session.plan is not None
+
+
+def test_the_unrelated_status_fragment_does_not_leak_grounding_across_repos(status_repo):
+    """Sanity check on the mechanism itself, not the whole engine flow:
+    a bare generic match is rejected by the acceptance rule directly,
+    independent of any other check."""
+    from app.self_development.base import DevelopmentCapability, DevelopmentPlan, PlannedFileChange
+
+    engine = _make_engine(status_repo, ScriptedProvider(_plan_payload()))
+    _, discovered = engine._inspect_relevant_existing_code(
+        "self-develop: add a /dev/status endpoint using repo status tools"
+    )
+    plan = DevelopmentPlan(
+        objective="x",
+        files_affected=(
+            PlannedFileChange(path="app/dev_status.py", description="expose current status"),
+        ),
+        required_permissions=(DevelopmentCapability.CODE_EDIT,),
+    )
+
+    ungrounded = engine._find_ungrounded_file_paths(plan, discovered)
+
+    assert ungrounded == ("app/dev_status.py",)
