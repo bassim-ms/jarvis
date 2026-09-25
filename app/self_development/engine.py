@@ -45,7 +45,9 @@ app/core.py's own self-development wiring).
 
 from __future__ import annotations
 
+import ast
 import json
+import re
 import uuid
 from pathlib import Path
 
@@ -73,6 +75,136 @@ from app.tools.registry import ToolRegistry
 #: Failure output bounded before it's ever handed to the planner for a
 #: repair attempt or included in a summary - never an unbounded dump.
 _MAX_FAILURE_TEXT_CHARS = 8_000
+
+# ---------------------------------------------------------------------------
+# Plan grounding (hardening pass 2, revised) - a live test showed the real
+# planner proposing a plan that invented a whole new file (app/status.py)
+# AND hedged with "if the engine has no status attribute, return a generic
+# placeholder" for a request whose real answer already existed in the
+# repository (DevelopmentSession.stage). The FIRST grounding pass
+# (`_find_ungrounded_file_paths`'s own "a new file's parent directory must
+# exist" check) doesn't catch this - `app/` genuinely exists.
+#
+# Deliberately NOT a full-repository text scan (an earlier version of this
+# fix read every non-secret file's content on every `start()` call - slow,
+# imprecise, and still easily fooled by generic English words appearing
+# unrelated to what's actually there). Instead, a cheap two-stage funnel:
+#
+# 1. `_find_candidate_files` - a PATH-only filter (no file content read at
+#    all) over the SAME file listing `_build_repo_digest` already uses,
+#    narrowing to the small set of .py files whose own path already
+#    relates to the request's own words - e.g. "...self-development
+#    engine status..." naturally narrows to app/self_development/*.py,
+#    the same way "add a voice command" would narrow to app/voice/*.py.
+#    Bounded by `_MAX_CANDIDATE_FILES`; reads NOTHING when no path
+#    matches at all.
+# 2. `_discover_symbols_in_file` - for ONLY that narrow candidate set,
+#    parses real Python source with `ast` (never a raw-text substring
+#    search) and extracts the REAL classes/functions/methods/attributes
+#    actually defined there - e.g. DevelopmentSession's own `stage`
+#    field. This is the "relevant existing symbols/classes/methods"
+#    evidence handed to the planner, and the same evidence
+#    `_find_ungrounded_file_paths` uses afterward to verify a proposed
+#    new file's own description names something REAL, never merely
+#    restates the request in isolation.
+#
+# `_find_hedged_language` remains as a SEPARATE, general backstop (not the
+# primary mechanism) - a plan can still fail this even when it happens to
+# reuse a real symbol name, if it also admits to guessing about it.
+# ---------------------------------------------------------------------------
+
+#: A repo-relative path/file-content keyword must be at least this long
+#: to count - short, generic fragments ("dev", "get", "app") match far
+#: too much to mean anything.
+_MIN_KEYWORD_LENGTH = 4
+
+#: Words about the ACT of asking (verbs/pronouns/framing), never
+#: domain-specific - excluded so the keyword set stays focused on what
+#: the request is actually ABOUT. Deliberately small and reviewable, the
+#: same "narrow, explicit, no fuzzy matching" discipline every other
+#: pattern in this package already uses. Domain nouns ("self,"
+#: "development," "engine," ...) are deliberately NOT stopworded here -
+#: they're exactly what makes e.g. "...self-development engine
+#: status..." path-match app/self_development/*.py in the first place.
+_KEYWORD_STOPWORDS = frozenset({
+    "your", "code", "codebase", "this", "that", "with", "from", "into",
+    "file", "files", "please", "harmless", "current", "returns",
+    "return", "endpoint", "about", "what", "does", "have", "should",
+    "would", "could", "make", "need", "want", "then", "when", "where",
+    "will", "task", "request",
+})
+
+#: How many keyword-matched candidate files are actually read/parsed -
+#: bounded so a very generic keyword can't blow this up into "most of
+#: the repository," while comfortably covering one real package/module.
+_MAX_CANDIDATE_FILES = 12
+
+#: A fixed, general set of hedge/uncertainty/placeholder phrases - never
+#: specific to one request or feature. A plan genuinely grounded in real,
+#: inspected code never needs to say any of this about something it's
+#: proposing to touch or expose; a plan that does is describing what it
+#: WOULD do if reality turned out a certain way, i.e. guessing.
+_HEDGE_PHRASES = (
+    "placeholder",
+    "fallback value",
+    "fallback implementation",
+    "generic fallback",
+    "dummy value",
+    "dummy implementation",
+    "stub implementation",
+    "best guess",
+    "hypothetical",
+    "made up",
+    "made-up",
+    "not sure if",
+    "may not exist",
+    "might not exist",
+    "doesn't exist yet",
+    "does not exist yet",
+    "assume it exists",
+    "assuming it exists",
+)
+
+#: The other common shape the same hedging takes - a conditional on
+#: something not actually being there ("if the engine has no status
+#: attribute...", "if it doesn't have a config value...").
+_HEDGE_CONDITIONAL_PATTERN = re.compile(
+    r"\bif\s+(?:the\s+\w+|it|this|there)\s+(?:has|have|had|is|are)\s+no\b",
+    re.IGNORECASE,
+)
+
+
+def _extract_keywords(text: str) -> frozenset[str]:
+    """Pure, deterministic, no-LLM keyword extraction - lowercase
+    alphabetic runs of `_MIN_KEYWORD_LENGTH`+ characters, minus the
+    small fixed stopword list above. Used identically to build the
+    search terms for `_inspect_relevant_existing_code` and to check a
+    proposed new file's own description against what that search
+    actually found - the SAME function, so the two can never drift
+    apart into inconsistent notions of "keyword."."""
+    words = re.findall(r"[a-z]{%d,}" % _MIN_KEYWORD_LENGTH, text.lower())
+    return frozenset(w for w in words if w not in _KEYWORD_STOPWORDS)
+
+
+def _extract_words(text: str) -> frozenset[str]:
+    """Same tokenization as `_extract_keywords`, WITHOUT the stopword
+    filter - used as the search TARGET (a proposed file's own
+    description), never as the query side, so a stopword that happens
+    to also be a real discovered symbol name is never unfairly
+    excluded."""
+    return frozenset(re.findall(r"[a-z]{%d,}" % _MIN_KEYWORD_LENGTH, text.lower()))
+
+
+def _split_identifier(name: str) -> frozenset[str]:
+    """Splits a CamelCase or snake_case identifier into its real word
+    parts (`DevelopmentSession` -> {"development", "session"},
+    `approve_commit` -> {"approve", "commit"}), in addition to the
+    whole name itself - so a plain-English description ("expose the
+    session's stage") can match a real symbol (`DevelopmentSession`,
+    `stage`) without needing the exact, squished identifier spelling."""
+    parts = {p.lower() for p in re.findall(r"[A-Z][a-z0-9]*|[a-z0-9]+", name)}
+    parts.add(name.lower())
+    return frozenset(p for p in parts if len(p) >= _MIN_KEYWORD_LENGTH)
 
 
 def _new_session_id() -> str:
@@ -224,15 +356,37 @@ class SelfDevelopmentEngine:
         )
         self.sessions[session.id] = session
 
+        # BEFORE proposing anything - a real, deterministic inspection of
+        # the repository's own file names AND contents relevant to this
+        # request, never a guess from a bare list of paths. See this
+        # module's own "Plan grounding (hardening pass 2)" section. One
+        # listing call, reused for both the digest and candidate search.
+        file_list = self._list_repo_files()
+        inspected_text, discovered_symbols = self._inspect_relevant_existing_code(
+            request, file_list
+        )
+
         try:
-            digest = self._build_repo_digest()
-            plan = self.planner.propose_plan(request, digest)
+            digest = self._build_repo_digest(file_list)
+            plan = self.planner.propose_plan(request, f"{digest}\n\n{inspected_text}")
         except DevelopmentPlanningError as exc:
             session.stage = SessionStage.PLAN_REJECTED
             session.log(f"Could not produce a development plan: {exc}")
             return session
 
-        ungrounded = self._find_ungrounded_file_paths(plan)
+        hedges = self._find_hedged_language(plan)
+        if hedges:
+            session.stage = SessionStage.PLAN_REJECTED
+            session.log(
+                "Rejected a plan that hedges on missing information "
+                "instead of grounding the request in real, inspected "
+                f"code (found: {', '.join(hedges)}). Inspect the code "
+                "yourself and ask again once what's actually needed is "
+                "confirmed to exist."
+            )
+            return session
+
+        ungrounded = self._find_ungrounded_file_paths(plan, discovered_symbols)
         if ungrounded:
             session.stage = SessionStage.PLAN_REJECTED
             session.log(
@@ -258,29 +412,34 @@ class SelfDevelopmentEngine:
             )
         return session
 
-    def _find_ungrounded_file_paths(self, plan: DevelopmentPlan) -> tuple[str, ...]:
+    def _find_ungrounded_file_paths(
+        self, plan: DevelopmentPlan, discovered_symbols: frozenset[str]
+    ) -> tuple[str, ...]:
         """A proposed EDIT to a real, already-existing file is always
-        grounded. A proposed BRAND-NEW file is grounded only if it
-        belongs inside a directory that already exists in this
-        repository - self-development may add a new file, but never
-        invents an entirely new directory/subsystem out of thin air
-        just because the planner's own LLM call happened to mention one
-        (a live test surfaced exactly this: a plan naming files under a
-        made-up "schemas/"-style location that doesn't exist anywhere
-        in the real repository). Returns every offending path, so the
-        caller rejects the WHOLE plan - never silently drops just the
-        offending file(s), the same fail-closed discipline every other
-        structural check in this package already uses (unexpected JSON
-        fields, unknown permissions, protected/secret paths, ...)."""
+        grounded. A proposed BRAND-NEW file must clear TWO bars: its
+        parent directory must already exist in this repository (self-
+        development may add a new file, but never invents an entirely
+        new directory/subsystem out of thin air just because the
+        planner's own LLM call happened to mention one), AND - when
+        `_discover_relevant_symbols` actually found real symbols related
+        to this request - its own description must name one of them,
+        never merely restate the request in isolation (a live test
+        surfaced a plan inventing a whole new file, `app/status.py`,
+        with no such connection to anything real at all). Returns every
+        offending path, so the caller rejects the WHOLE plan - never
+        silently drops just the offending file(s), the same fail-closed
+        discipline every other structural check in this package already
+        uses (unexpected JSON fields, unknown permissions, protected/
+        secret paths, ...)."""
         ungrounded: list[str] = []
         for change in plan.files_affected:
             if is_protected_system_path(change.path):
                 # A SEPARATE, already fully-enumerated fixed allowlist
                 # (PROTECTED_SYSTEM_PATH_PREFIXES) - never a free-form
                 # path the LLM could hallucinate into existing, so
-                # directory-existence grounding doesn't apply to it;
-                # SECURITY_EDIT's own separate approval gate is what
-                # actually protects these paths.
+                # neither grounding check applies to it; SECURITY_EDIT's
+                # own separate approval gate is what actually protects
+                # these paths.
                 continue
             try:
                 resolved = resolve_within_root(self.project_root, change.path)
@@ -289,15 +448,188 @@ class SelfDevelopmentEngine:
                 continue
             if not resolved.parent.is_dir():
                 ungrounded.append(change.path)
+                continue
+            if not resolved.exists() and discovered_symbols:
+                description_words = _extract_words(change.description)
+                if not (description_words & discovered_symbols):
+                    ungrounded.append(change.path)
         return tuple(ungrounded)
 
-    def _build_repo_digest(self) -> str:
+    def _find_candidate_files(
+        self, keywords: frozenset[str], file_list: list[dict] | None = None
+    ) -> list[str]:
+        """PATH-ONLY filter (never reads a single byte of file content) -
+        the real repository file listing `_build_repo_digest` already
+        computes, narrowed to real `.py` files whose own path already
+        relates to one of the request's own keywords. Deliberately
+        cheap: reads nothing at all when nothing matches, so a request
+        with no distinctive domain word never touches the filesystem
+        beyond the one listing call every `start()` already makes.
+
+        Ranked by HOW MANY distinct keywords a path matches, most first,
+        before the `_MAX_CANDIDATE_FILES` cap is applied - a generic
+        single-word match (e.g. "engine," which many unrelated
+        subsystems each have their own engine.py for) must never crowd
+        out a path matching several of the request's own words at once
+        (e.g. "self_development" matching "self"+"development"+
+        "engine" together)."""
+        if not keywords:
+            return []
+        if file_list is None:
+            file_list = self._list_repo_files()
+        if not file_list:
+            return []
+
+        scored: list[tuple[int, str]] = []
+        for entry in file_list:
+            path = entry["path"]
+            if entry["secret"] or not path.endswith(".py") or path.startswith("tests/"):
+                # Test files verify capabilities, they aren't capabilities
+                # themselves - never useful "evidence" for what a plan
+                # should build on.
+                continue
+            hits = sum(1 for k in keywords if k in path.lower())
+            if hits:
+                scored.append((hits, path))
+
+        scored.sort(key=lambda pair: (-pair[0], pair[1]))
+        return [path for _hits, path in scored[:_MAX_CANDIDATE_FILES]]
+
+    @staticmethod
+    def _discover_symbols_in_file(source: str) -> frozenset[str]:
+        """Real static inspection, never a raw-text substring search:
+        parses `source` with `ast` and collects the names of every
+        class, function/method, and attribute (dataclass field,
+        annotated or plain assignment, or `self.x = ...` store)
+        ACTUALLY defined in it - e.g. DevelopmentSession's own `stage`
+        field. Malformed/unparseable source yields no symbols, never
+        raises - this is evidence-gathering, not a correctness check on
+        the file itself."""
+        try:
+            tree = ast.parse(source)
+        except (SyntaxError, ValueError):
+            return frozenset()
+
+        names: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef):
+                names.add(node.name)
+                for item in node.body:
+                    if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        names.add(item.name)
+                    elif isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name):
+                        names.add(item.target.id)
+                    elif isinstance(item, ast.Assign):
+                        for target in item.targets:
+                            if isinstance(target, ast.Name):
+                                names.add(target.id)
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                names.add(node.name)
+            elif isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Store):
+                names.add(node.attr)  # e.g. `self.stage = ...`
+        return frozenset(names)
+
+    def _inspect_relevant_existing_code(
+        self, request: str, file_list: list[dict] | None = None
+    ) -> tuple[str, frozenset[str]]:
+        """Discovers relevant existing CAPABILITIES for `request` -
+        general-purpose, driven entirely by words already in the
+        request itself, never hardcoded to any specific feature, file,
+        class, or attribute. Two cheap stages: `_find_candidate_files`
+        (path-only, no content read) narrows to a small set of real
+        `.py` files, then `_discover_symbols_in_file` (real `ast`
+        parsing) extracts the classes/functions/methods/attributes
+        ACTUALLY defined in just that narrow set - never every file in
+        the repository, and never a raw-text keyword scan of file
+        content.
+
+        Returns (a text block to append to the planner's own prompt,
+        and) the set of discovered symbol names - used afterward by
+        `_find_ungrounded_file_paths`/`start()` to structurally verify
+        the resulting plan names something that ACTUALLY exists, never
+        merely what the LLM claims. Never reads a secret-named file."""
+        keywords = _extract_keywords(request)
+        candidates = self._find_candidate_files(keywords, file_list)
+        if not candidates:
+            return (
+                "(no existing file's path relates to any of this "
+                f"request's own keywords: {', '.join(sorted(keywords)) or '(none)'} - "
+                "nothing was read)"
+            ), frozenset()
+
+        symbols_by_file: dict[str, frozenset[str]] = {}
+        for path in candidates:
+            read_result = self.tools.execute("self_dev_read_file", params={"path": path})
+            if read_result.status is not ToolResultStatus.SUCCESS or not read_result.data:
+                continue
+            symbols = self._discover_symbols_in_file(read_result.data.get("content", ""))
+            if symbols:
+                symbols_by_file[path] = symbols
+
+        if not symbols_by_file:
+            return (
+                "(the matched file(s) defined no discoverable classes, "
+                "functions, or attributes)"
+            ), frozenset()
+
+        lines = [
+            "RELEVANT EXISTING CAPABILITIES (discovered just now via real "
+            "static inspection of the matched file(s) below - classes, "
+            "functions/methods, and attributes ACTUALLY defined there) - "
+            "ground your plan in these REAL names; never invent a class, "
+            "method, attribute, or file that isn't one of them."
+        ]
+        matchable_tokens: set[str] = set()
+        for path in sorted(symbols_by_file):
+            names = symbols_by_file[path]
+            lines.append(f"### {path}\nnames: {', '.join(sorted(names))}")
+            for name in names:
+                matchable_tokens |= _split_identifier(name)
+        return "\n\n".join(lines), frozenset(matchable_tokens)
+
+    def _find_hedged_language(self, plan: DevelopmentPlan) -> tuple[str, ...]:
+        """A plan genuinely grounded in real, inspected code never needs
+        to hedge about whether something it's proposing to touch or
+        expose actually exists (a live test surfaced exactly this: "if
+        the engine has no status attribute, return a generic
+        placeholder" - proof the planner never actually confirmed that
+        against real code). Checked against the plan's own objective,
+        every file's description, and every risk - a fixed, general set
+        of phrases, never anything specific to one request, so this
+        generalizes to any future hallucinated plan with the same tell.
+        Returns every matched phrase (for the rejection message), never
+        silently ignored."""
+        texts = [plan.objective, *(c.description for c in plan.files_affected), *plan.risks]
+        found: list[str] = []
+        for text in texts:
+            lowered = text.lower()
+            for phrase in _HEDGE_PHRASES:
+                if phrase in lowered:
+                    found.append(phrase)
+            conditional_match = _HEDGE_CONDITIONAL_PATTERN.search(text)
+            if conditional_match:
+                found.append(conditional_match.group(0))
+        return tuple(dict.fromkeys(found))
+
+    def _list_repo_files(self) -> list[dict] | None:
+        """The ONE place this module calls `self_dev_list_files` -
+        `_build_repo_digest` and `_find_candidate_files` both accept an
+        already-fetched listing so `start()` can fetch it exactly once
+        and reuse it for both, never two separate listing calls for one
+        session."""
         result = self.tools.execute("self_dev_list_files")
         if result.status is not ToolResultStatus.SUCCESS or not result.data:
+            return None
+        return result.data
+
+    def _build_repo_digest(self, file_list: list[dict] | None = None) -> str:
+        if file_list is None:
+            file_list = self._list_repo_files()
+        if not file_list:
             return "(no files listed)"
         return "\n".join(
             f"{entry['path']}" + (" [secret - contents never shown]" if entry["secret"] else "")
-            for entry in result.data
+            for entry in file_list
         )
 
     # -- 4-6: ask user for approval -> create branch -> edit files ----------
@@ -481,6 +813,15 @@ class SelfDevelopmentEngine:
             )
         except DevelopmentPlanningError as exc:
             session.log(f"Could not produce a repair fix: {exc}")
+            return
+
+        hedges = self._find_hedged_language(fix_plan)
+        if hedges:
+            session.log(
+                "Ignoring a repair fix that hedges on missing "
+                f"information instead of grounding itself in real code "
+                f"(found: {', '.join(hedges)})."
+            )
             return
 
         allowed_paths = session.plan.file_paths()

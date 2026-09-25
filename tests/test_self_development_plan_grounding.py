@@ -1,15 +1,31 @@
 """
-Tests for SelfDevelopmentEngine._find_ungrounded_file_paths / start()'s
-own grounding check: the planner's LLM call can propose EDITING any
-real, existing file, and can propose a brand-new file inside a
-directory that already exists - but it can never invent an entirely
-new directory/subsystem that doesn't exist in the real repository and
-have that accepted as a valid plan.
+Tests for SelfDevelopmentEngine's plan-grounding checks
+(app/self_development/engine.py: `_find_candidate_files`,
+`_discover_symbols_in_file`, `_inspect_relevant_existing_code`,
+`_find_hedged_language`, `_find_ungrounded_file_paths`): the planner's
+LLM call can propose editing any real, existing file, and can propose
+a brand-new file when its own description names a real, statically-
+discovered capability - but it can never invent an unrelated file or
+attribute.
 
-Added after a live test showed the real planner producing a plan with
-invented artifacts (a made-up schema file, a made-up deployment
-directory, "staging" steps) for a request whose repo digest contained
-none of that - i.e. an ungrounded, hallucinated plan.
+Added after a live test on commit b279949 showed the real planner
+proposing exactly this for "add a harmless /dev/status endpoint that
+returns the current self-development engine status":
+- Files: app/status.py (invented), app/main.py (real)
+- Risk: "if the engine has no status attribute, return a generic
+  placeholder"
+Revised after a second review: the FIRST version of this fix read
+every non-secret file's content on every `start()` call - correct but
+slow and imprecise. This version instead: (1) narrows to a small set
+of real `.py` files via a cheap, content-free PATH match against the
+request's own keywords, ranked by how many keywords each path matches;
+(2) parses ONLY that narrow set with `ast` to discover the REAL
+classes/functions/attributes actually defined there (e.g.
+DevelopmentSession's own `stage` field, generally - never hardcoded to
+that one name); (3) requires a brand-new file's own description to
+name one of those real, discovered capabilities. A general hedge/
+placeholder-language check remains as a SEPARATE backstop, not the
+primary mechanism.
 
 Every test runs against a throwaway temporary git repository (never
 the actual Jarvis repository).
@@ -32,6 +48,27 @@ def _init_repo(path) -> None:
     (path / "app").mkdir()
     (path / "app" / "main.py").write_text("# app\n", encoding="utf-8")
     (path / "greet.py").write_text("# empty\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=path, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=path, check=True)
+
+
+def _init_repo_with_calendar_sync(path) -> None:
+    """A repo with one REAL, distinctive module - used to prove real
+    symbol discovery/grounding (only meaningful once something real has
+    actually been found via static inspection)."""
+    subprocess.run(["git", "init", "-q"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.name", "Tester"], cwd=path, check=True)
+    (path / "app").mkdir()
+    (path / "app" / "calendar_sync.py").write_text(
+        "class CalendarSync:\n"
+        "    def __init__(self):\n"
+        "        self.last_synced_at = None\n\n"
+        "    def sync_events(self):\n"
+        "        '''Sync calendar events.'''\n"
+        "        return self.last_synced_at\n",
+        encoding="utf-8",
+    )
     subprocess.run(["git", "add", "-A"], cwd=path, check=True)
     subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=path, check=True)
 
@@ -73,6 +110,84 @@ def repo(tmp_path):
     return tmp_path
 
 
+@pytest.fixture
+def calendar_repo(tmp_path):
+    _init_repo_with_calendar_sync(tmp_path)
+    return tmp_path
+
+
+# -- discovery itself: cheap, targeted, never a full-repo scan -------------
+
+
+def test_an_unrelated_request_reads_nothing_at_all(calendar_repo):
+    """No path in the repo relates to any keyword in this request - the
+    engine must not read a single file's content, only the one listing
+    call it already needs for the ordinary digest."""
+    engine = _make_engine(calendar_repo, ScriptedProvider(_plan_payload()))
+    read_calls: list[str] = []
+    original_execute = engine.tools.execute
+
+    def _spy(name, *args, **kwargs):
+        if name == "self_dev_read_file":
+            read_calls.append(kwargs.get("params", {}).get("path"))
+        return original_execute(name, *args, **kwargs)
+
+    engine.tools.execute = _spy  # type: ignore[method-assign]
+
+    text, symbols = engine._inspect_relevant_existing_code("what is the weather like today")
+
+    assert read_calls == []
+    assert symbols == frozenset()
+    assert "nothing was read" in text
+
+
+def test_a_matching_request_only_reads_the_narrow_candidate_set(calendar_repo):
+    """Only the path-matched file(s) are ever read - never every file in
+    the repository."""
+    engine = _make_engine(calendar_repo, ScriptedProvider(_plan_payload()))
+    read_calls: list[str] = []
+    original_execute = engine.tools.execute
+
+    def _spy(name, *args, **kwargs):
+        if name == "self_dev_read_file":
+            read_calls.append(kwargs.get("params", {}).get("path"))
+        return original_execute(name, *args, **kwargs)
+
+    engine.tools.execute = _spy  # type: ignore[method-assign]
+
+    text, symbols = engine._inspect_relevant_existing_code(
+        "self-develop: sync calendar events more reliably"
+    )
+
+    assert read_calls == ["app/calendar_sync.py"]  # not app/main.py, not greet.py-equivalents
+    assert "events" in symbols  # discovered from the real sync_events method
+    assert "calendarsync" in symbols or "calendar" in symbols
+
+
+def test_candidate_files_are_ranked_by_keyword_overlap_not_listing_order(calendar_repo):
+    """A path matching SEVERAL of the request's own keywords must rank
+    above one matching only a single, generic word shared by many
+    unrelated files - added after a real run against this repository
+    showed a generic word ("engine") crowding out the actually-relevant
+    package before the ranking fix."""
+    (calendar_repo / "app" / "generic_engine.py").write_text(
+        "class GenericEngine:\n    pass\n", encoding="utf-8"
+    )
+    subprocess.run(
+        ["git", "add", "-A"], cwd=calendar_repo, check=True
+    )
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "add unrelated engine"], cwd=calendar_repo, check=True
+    )
+    engine = _make_engine(calendar_repo, ScriptedProvider(_plan_payload()))
+
+    candidates = engine._find_candidate_files(
+        frozenset({"calendar", "sync", "events", "engine"})
+    )
+
+    assert candidates[0] == "app/calendar_sync.py"  # 3 keyword hits: calendar, sync, events
+
+
 # -- legitimate, grounded plans are unaffected -----------------------------
 
 
@@ -83,6 +198,9 @@ def test_editing_a_real_existing_file_is_grounded(repo):
 
 
 def test_a_new_file_inside_an_existing_directory_is_grounded(repo):
+    """Nothing in this sparse repo relates to "widget" at all - with no
+    discovered symbols either way, the ORIGINAL, simpler bar (parent
+    directory exists) still applies and this is accepted."""
     engine = _make_engine(
         repo,
         ScriptedProvider(
@@ -106,65 +224,93 @@ def test_a_new_file_at_the_repo_root_is_grounded(repo):
     assert session.stage is SessionStage.PLAN_PROPOSED
 
 
-# -- hallucinated / ungrounded plans are rejected --------------------------
+def test_a_new_file_properly_grounded_in_a_discovered_symbol_is_accepted(calendar_repo):
+    """Real capabilities WERE discovered (CalendarSync.sync_events) - a
+    new file whose own description names one of them is accepted."""
+    engine = _make_engine(
+        calendar_repo,
+        ScriptedProvider(
+            _plan_payload(
+                objective="Add better calendar sync retry handling",
+                files_affected=[
+                    {
+                        "path": "app/calendar_retry.py",
+                        "description": "retry helper for sync_events failures",
+                    }
+                ],
+            )
+        ),
+    )
+    session = engine.start("self-develop: sync calendar events more reliably")
+    assert session.stage is SessionStage.PLAN_PROPOSED
+
+
+# -- invented files/attributes are rejected --------------------------------
 
 
 @pytest.mark.parametrize(
     "invented_path",
-    [
-        "schemas/engine-status.schema.json",
-        "deploy/status_endpoint.py",
-        "docs/status-inventory.md",
-        "staging/rollout.yaml",
-    ],
+    ["schemas/engine-status.schema.json", "deploy/status_endpoint.py"],
 )
 def test_a_file_under_a_nonexistent_directory_is_rejected(repo, invented_path):
+    """Pass 1: a brand-new file's parent directory must exist at all."""
     engine = _make_engine(
         repo,
         ScriptedProvider(
             _plan_payload(files_affected=[{"path": invented_path, "description": "invented"}])
         ),
     )
-    session = engine.start("add a /dev/status endpoint")
+    session = engine.start("add something")
 
     assert session.stage is SessionStage.PLAN_REJECTED
     assert invented_path in session.messages[-1]
     assert session.plan is None
 
 
-def test_reproduces_the_exact_reported_hallucination_and_rejects_it(repo):
-    """The exact shape of files a live test's real planner call
-    actually produced for "add a /dev/status endpoint" - none of
-    these directories exist in this repo (or the real one)."""
+def test_an_invented_root_level_file_unrelated_to_anything_discovered_is_rejected(calendar_repo):
+    """Real capabilities WERE discovered (calendar/sync/events), but
+    this new file's own description has nothing to do with any of
+    them - a bare "parent directory exists" check alone (repo root
+    always exists) would have let this through; the stronger,
+    symbol-based bar catches it."""
     engine = _make_engine(
-        repo,
+        calendar_repo,
         ScriptedProvider(
             _plan_payload(
-                objective="Add a /dev/status endpoint with a full status schema",
+                objective="Sync calendar events more reliably",
                 files_affected=[
-                    {"path": "schemas/engine-status.schema.json", "description": "schema"},
-                    {"path": "status_endpoint.py", "description": "endpoint"},
-                    {"path": "deploy/rollout_steps.md", "description": "deployment steps"},
+                    {"path": "notes.md", "description": "unrelated scratch notes about lunch"}
                 ],
-                risks=["requires a staging deployment"],
             )
         ),
     )
-
-    session = engine.start(
-        "self-develop: add a harmless /dev/status endpoint that returns the "
-        "current self-development engine status"
-    )
+    session = engine.start("self-develop: sync calendar events more reliably")
 
     assert session.stage is SessionStage.PLAN_REJECTED
+    assert "notes.md" in session.messages[-1]
     assert session.plan is None
-    assert "not grounded" in session.messages[-1].lower()
-    # Nothing was branched, edited, or committed for an ungrounded plan.
-    assert session.dev_branch is None
-    branches = subprocess.run(
-        ["git", "branch"], cwd=repo, capture_output=True, text=True
-    ).stdout
-    assert "jarvis-selfdev" not in branches
+
+
+def test_an_invented_nested_file_unrelated_to_anything_discovered_is_rejected(calendar_repo):
+    """Same as above but nested under a directory (app/) that DOES
+    exist - proving this is a genuinely stronger bar than "the parent
+    directory happens to exist," not just a rename of pass 1."""
+    engine = _make_engine(
+        calendar_repo,
+        ScriptedProvider(
+            _plan_payload(
+                objective="Sync calendar events more reliably",
+                files_affected=[
+                    {"path": "app/ghost_notes.txt", "description": "totally unrelated scratchpad"}
+                ],
+            )
+        ),
+    )
+    session = engine.start("self-develop: sync calendar events more reliably")
+
+    assert session.stage is SessionStage.PLAN_REJECTED
+    assert "app/ghost_notes.txt" in session.messages[-1]
+    assert session.plan is None
 
 
 def test_one_ungrounded_file_rejects_the_whole_plan_not_just_that_file(repo):
@@ -187,6 +333,79 @@ def test_one_ungrounded_file_rejects_the_whole_plan_not_just_that_file(repo):
 
     assert session.stage is SessionStage.PLAN_REJECTED
     assert session.plan is None
+
+
+# -- nonexistent attributes / placeholders are rejected (hedge backstop) ---
+
+
+def test_reproduces_the_exact_reported_hallucination_and_rejects_it(repo):
+    """The exact reported shape: an invented file PLUS the literal
+    hedge text a live test's real planner call actually produced for
+    "add a /dev/status endpoint"."""
+    engine = _make_engine(
+        repo,
+        ScriptedProvider(
+            _plan_payload(
+                objective="Add a harmless /dev/status endpoint",
+                files_affected=[
+                    {"path": "app/status.py", "description": "expose engine status"},
+                    {"path": "app/main.py", "description": "wire up the new endpoint"},
+                ],
+                risks=[
+                    "if the engine has no status attribute, return a generic placeholder"
+                ],
+            )
+        ),
+    )
+
+    session = engine.start(
+        "self-develop: add a harmless /dev/status endpoint that returns the "
+        "current self-development engine status"
+    )
+
+    assert session.stage is SessionStage.PLAN_REJECTED
+    assert session.plan is None
+    assert "hedge" in session.messages[-1].lower()
+    assert session.dev_branch is None
+    branches = subprocess.run(
+        ["git", "branch"], cwd=repo, capture_output=True, text=True
+    ).stdout
+    assert "jarvis-selfdev" not in branches
+
+
+@pytest.mark.parametrize(
+    "hedge_text",
+    [
+        "if the engine has no status attribute, return a generic placeholder",
+        "use a fallback value since the config field may not exist",
+        "this is a stub implementation for a hypothetical setting",
+        "best guess at the schema since it doesn't exist yet",
+        "assuming it exists, read the dummy value",
+    ],
+)
+def test_hedged_or_placeholder_language_in_risks_is_rejected(repo, hedge_text):
+    engine = _make_engine(repo, ScriptedProvider(_plan_payload(risks=[hedge_text])))
+    session = engine.start("add a greeting function")
+
+    assert session.stage is SessionStage.PLAN_REJECTED
+    assert session.plan is None
+
+
+def test_ordinary_confident_language_is_never_flagged_as_hedging(repo):
+    """Sanity check: an ordinary, confident, grounded plan - no hedge
+    phrase anywhere - is never mistakenly rejected."""
+    engine = _make_engine(
+        repo,
+        ScriptedProvider(
+            _plan_payload(
+                objective="Add a say_hello function to greet.py",
+                risks=["none - purely additive"],
+            )
+        ),
+    )
+    session = engine.start("add a greeting function")
+
+    assert session.stage is SessionStage.PLAN_PROPOSED
 
 
 # -- protected system paths are exempt (a separate, fixed allowlist) -------
