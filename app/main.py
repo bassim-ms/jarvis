@@ -194,6 +194,27 @@ async def _lifespan(app: FastAPI):
 app = FastAPI(title=settings.app_name, lifespan=_lifespan)
 
 
+@app.get("/dev/status")
+def dev_status() -> dict:
+    """Read-only status of the REAL, already-wired Self-Development
+    Engine (`core.self_development_engine`, set up above at startup) -
+    never a fresh engine instantiated per request, and never invented
+    data. Reports exactly the sessions that engine is already tracking
+    in its own `sessions` dict (the same attribute app/core.py's own
+    `_active_self_dev_sessions` already reads directly) - empty if
+    none exist yet."""
+    engine = core.self_development_engine
+    if engine is None:
+        return {"configured": False, "sessions": []}
+    return {
+        "configured": True,
+        "sessions": [
+            {"id": session.id, "stage": session.stage.value, "dev_branch": session.dev_branch}
+            for session in engine.sessions.values()
+        ],
+    }
+
+
 @app.get("/health")
 def health_check() -> dict:
     """Simple proof that the server is alive and configured correctly."""
