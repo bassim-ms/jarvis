@@ -510,10 +510,10 @@ def test_edit_file_write_succeeds_normally_and_content_is_exact(tmp_path):
     target.write_text("old\n", encoding="utf-8")
 
     tool = EditFileTool(str(tmp_path))
-    result = tool.execute(path="app/widget.py", content="brand new content\n")
+    result = tool.execute(path="app/widget.py", content="brand_new_content = True\n")
 
     assert result.status is ToolResultStatus.SUCCESS
-    assert target.read_text(encoding="utf-8") == "brand new content\n"
+    assert target.read_text(encoding="utf-8") == "brand_new_content = True\n"
     leftovers = [p for p in (tmp_path / "app").iterdir() if p.name.startswith(".jarvis_selfdev_tmp_")]
     assert leftovers == []
 

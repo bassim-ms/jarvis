@@ -23,6 +23,7 @@ ORIGINAL file completely untouched; the temporary file is cleaned up.
 
 from __future__ import annotations
 
+import ast
 import os
 import shutil
 import tempfile
@@ -38,6 +39,29 @@ from app.self_development.safety import (
 from app.tools.base import PermissionLevel, Tool, ToolParameter, ToolResult
 
 _MAX_CONTENT_CHARS = 500_000
+
+
+def _check_syntax(path: str, content: str) -> str | None:
+    """Returns an error message if `path` is a `.py` file and `content`
+    doesn't actually parse as Python - `None` (nothing wrong) for any
+    non-Python path, or for content that parses fine. Defense in depth:
+    app/self_development/engine.py's own edit-stage checks already
+    reject syntactically-invalid content before ever calling these
+    tools, but this is the ONE place this whole subsystem actually
+    writes a file, so it never trusts a caller to have checked first -
+    a live test showed a full-file-rewrite response dumping hundreds of
+    lines of the model's own reasoning into a real source file; that
+    text is, for all practical purposes, never also valid Python."""
+    if not path.endswith(".py"):
+        return None
+    try:
+        ast.parse(content)
+    except SyntaxError as exc:
+        return (
+            f"'{path}' would not be valid Python after this write ({exc}) - "
+            "refusing to write malformed or non-code content to a source file."
+        )
+    return None
 
 
 def _atomic_write(resolved: Path, content: str) -> None:
@@ -120,6 +144,9 @@ class EditFileTool(Tool):
                 f"Refusing to write '{path}': content exceeds the "
                 f"{_MAX_CONTENT_CHARS}-character bound."
             )
+        syntax_error = _check_syntax(path, content)
+        if syntax_error is not None:
+            return ToolResult.error(syntax_error)
         resolved, error = _resolve_for_write(self.project_root, path)
         if error is not None:
             return error
@@ -175,6 +202,9 @@ class SecurityEditFileTool(Tool):
                 f"Refusing to write '{path}': content exceeds the "
                 f"{_MAX_CONTENT_CHARS}-character bound."
             )
+        syntax_error = _check_syntax(path, content)
+        if syntax_error is not None:
+            return ToolResult.error(syntax_error)
         resolved, error = _resolve_for_write(self.project_root, path)
         if error is not None:
             return error

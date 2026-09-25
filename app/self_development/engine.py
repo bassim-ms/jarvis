@@ -46,6 +46,7 @@ app/core.py's own self-development wiring).
 from __future__ import annotations
 
 import ast
+import difflib
 import json
 import re
 import uuid
@@ -154,6 +155,99 @@ _GENERIC_IDENTIFIER_FRAGMENTS = frozenset({
     "module", "helper", "utility", "base", "core", "main", "file",
     "path", "name", "type", "result", "error", "event", "log",
 })
+
+# ---------------------------------------------------------------------------
+# Edit-stage bounding (hardening pass 3) - a live test showed an approved,
+# well-grounded plan still corrupting app/main.py at the EDIT stage: the
+# model's `propose_file_content` response dumped hundreds of lines of its
+# own reasoning into the file, made unrelated changes to `/chat`, and
+# changed `job_id` types nobody asked for - a full-file-rewrite response
+# that barely resembled the file it started from. Grounding (which files/
+# attributes a PLAN may name) and edit-bounding (whether a PROPOSED EDIT's
+# actual content is trustworthy) are separate concerns - this section is
+# the second one.
+#
+# Deliberately NOT a rewrite of the edit mechanism into a diff/patch
+# format (a bigger, riskier change, and V1's own explicit "keep it
+# simple, no new architecture" requirement) - instead, two independent,
+# stdlib-only checks in `_edit_one_file`, the ONE place this whole
+# package ever turns a model's proposed content into a real file write:
+#
+# 1. Syntax validation (`_content_is_syntactically_valid`, using the
+#    same `ast` module the grounding checks already import) - reasoning
+#    text/prose dumped into a .py file is, for all practical purposes,
+#    never also valid Python, so this alone catches the reported
+#    failure directly. ALSO enforced independently, defense-in-depth,
+#    inside editor.py's own EditFileTool/SecurityEditFileTool - so this
+#    protection holds even for a future caller that bypasses engine.py.
+# 2. Change-proportionality (`_is_change_proportionate`, using the
+#    stdlib's own `difflib`) - a bounded edit still closely resembles
+#    the file it started from; it never replaces most of an existing
+#    file's content just to make one small, requested change. This is
+#    what "structured and bounded, not an unrestricted full-file
+#    rewrite" (V1's own explicit requirement) actually means in
+#    practice here: the PROMPT still asks for complete new content (so
+#    existing tests/prompts are unaffected), but the RESULT is now
+#    verified to be a proportionate, targeted change before it's ever
+#    written - never trusted merely because the model produced it.
+#
+# Neither check ever silently repairs or trims a bad response - both
+# REJECT it outright (no file write happens at all, the ORIGINAL file
+# is untouched) and log why, the same fail-closed discipline every
+# other structural check in this package already uses.
+# ---------------------------------------------------------------------------
+
+#: How much of a file's own original content a proposed edit must still
+#: resemble (0.0-1.0, via difflib.SequenceMatcher's own line-based
+#: similarity ratio) - never applied to a genuinely NEW file (nothing to
+#: stay proportionate to). Deliberately generous (a real, legitimate
+#: multi-part edit can still change a meaningful fraction of a file) -
+#: this exists to catch a full, unrelated rewrite, not to police normal
+#: editing.
+_MIN_UNCHANGED_SIMILARITY = 0.5
+
+#: A file this small is normally a deliberate stub/placeholder - fully
+#: replacing it (e.g. a 1-line "# empty" file becoming a real function)
+#: is the ORDINARY, expected shape of a first edit, not a runaway
+#: rewrite, so the similarity check below only applies once a file is
+#: already substantial enough that "barely resembles the original"
+#: actually means something.
+_MIN_LINES_FOR_PROPORTIONALITY_CHECK = 15
+
+
+def _content_is_syntactically_valid(path: str, content: str) -> bool:
+    """True for any non-Python path (nothing here to check), or for
+    Python source that actually parses. False - never an exception -
+    for anything else, including reasoning/prose text a model wrote
+    instead of code."""
+    if not path.endswith(".py"):
+        return True
+    try:
+        ast.parse(content)
+    except SyntaxError:
+        return False
+    return True
+
+
+def _is_change_proportionate(old_content: str, new_content: str) -> bool:
+    """A bounded, structured edit still closely resembles the file it
+    started from - it does NOT replace most of the file just to make
+    one small, requested change (a live test showed exactly this: a
+    proposed edit that kept almost none of app/main.py's own original
+    content, instead dumping hundreds of unrelated lines - including
+    the model's own reasoning text - into it). Measured with the
+    stdlib's own difflib, never a new dependency.
+
+    Skipped (always True) for a file smaller than `_MIN_LINES_FOR_
+    PROPORTIONALITY_CHECK` - fully replacing a small stub/placeholder
+    file is the ORDINARY, expected shape of a first edit, not a
+    runaway rewrite."""
+    old_lines = old_content.splitlines()
+    if len(old_lines) < _MIN_LINES_FOR_PROPORTIONALITY_CHECK:
+        return True
+    new_lines = new_content.splitlines()
+    similarity = difflib.SequenceMatcher(None, old_lines, new_lines).ratio()
+    return similarity >= _MIN_UNCHANGED_SIMILARITY
 
 #: A fixed, general set of hedge/uncertainty/placeholder phrases - never
 #: specific to one request or feature. A plan genuinely grounded in real,
@@ -778,6 +872,23 @@ class SelfDevelopmentEngine:
             )
         except DevelopmentPlanningError as exc:
             session.log(f"Could not generate content for '{path}': {exc}")
+            return False
+
+        if not _content_is_syntactically_valid(path, new_content):
+            session.log(
+                f"Edit rejected for '{path}': the proposed content is not "
+                "syntactically valid - the self-development engine never "
+                "writes malformed or non-code output (e.g. reasoning text) "
+                "to a source file."
+            )
+            return False
+
+        if current_content and not _is_change_proportionate(current_content, new_content):
+            session.log(
+                f"Edit rejected for '{path}': the proposed change replaces "
+                "far more of the file than the requested edit needed - "
+                "refusing an unbounded rewrite of an existing file."
+            )
             return False
 
         tool_name = (
