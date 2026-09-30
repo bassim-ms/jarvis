@@ -670,8 +670,13 @@ def test_the_real_app_is_wired_with_the_shared_notifier_interface_and_a_setting_
     # Since the notification router (interaction Slice 4) the app announces Job
     # outcomes through it: its desktop channel wraps the shared Notifier, and
     # the engine's older single-toast `notifier` is off so nothing is shown twice.
+    # Since the attention layer the engine is handed the attention-gated router (same methods),
+    # whose underlying NotificationRouter still delivers through the desktop channel.
+    from app.notifications.attention_gate import GatedNotificationRouter
+
     router = live_app.job_engine.notification_router
-    assert isinstance(router, NotificationRouter)
+    assert isinstance(router, GatedNotificationRouter)
+    assert isinstance(router.gate.router, NotificationRouter)
     toast = next(c for c in router.channels if isinstance(c, DesktopToastChannel))
     assert isinstance(toast.notifier, Notifier)
     assert live_app.job_engine.notifier is None

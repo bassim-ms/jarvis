@@ -246,6 +246,11 @@ class JarvisCore:
         computer_tools: ToolRegistry | None = None,
         interaction_resolver=None,
         handle_this=None,
+        memory_writer=None,
+        activity_context=None,
+        escalation_surface=None,
+        morning_brief=None,
+        device_operations=None,
     ):
         self.provider = provider or create_default_ai_provider_manager()
         self.memory = memory or SQLiteMemoryStore(settings.memory_db_path)
@@ -297,6 +302,38 @@ class JarvisCore:
         # needs clarification, is unsupported or could not be understood
         # creates no Job and calls no tool.
         self.handle_this = handle_this
+        # Persists what the USER plainly says or asks to be remembered ("I
+        # prefer dark mode", "remember that ...", "set my goal to ..."), under a
+        # deterministic write policy (see app/memory_policy/): a duck-typed
+        # object with `command_reply(message, conversation_id)`, `observe(message,
+        # conversation_id)` and
+        # `redact(message)` (the form of a message that may be kept in the
+        # conversation history). It reads
+        # only the user's own message, only on the ordinary conversation path
+        # (DIRECT), and never calls a model. `None` (every existing caller/test)
+        # means nothing is ever written from a chat message, exactly as before.
+        self.memory_writer = memory_writer
+        # The user's own statement of what they are doing right now ("I'm in class", "I'm free now") - a
+        # duck-typed object with `command_reply(message, conversation_id)` (see
+        # app/notifications/activity_context.py). It records a TEMPORARY context for the attention
+        # policy: never memory, never inferred. Only on the ordinary conversation path (DIRECT), and
+        # only when the whole message is such a statement. `None` (every existing caller/test): off.
+        self.activity_context = activity_context
+        # Duck-typed: `take_escalations()` -> items with `.event.text` (see AttentionGate). URGENT events
+        # that no permitted channel could carry are shown in the next chat reply - the one surface the
+        # user is looking at - instead of being lost. `None` (the default): nothing is shown.
+        self.escalation_surface = escalation_surface
+        # The read-only Morning Brief (app/morning_brief/): a duck-typed object with
+        # `command_reply(message, conversation_id)` that answers a message which is, in its
+        # entirety, a request for the brief ("morning brief", "what do I need to know today?").
+        # It only READS existing systems and never runs a tool, makes a Job or changes any state.
+        # `None` (every existing caller/test): a message like that is ordinary conversation.
+        self.morning_brief = morning_brief
+        # The user-facing device operations (app/devices/operations.py): a duck-typed object with
+        # `command_reply(message, conversation_id)` that answers a few whole-message device phrasings
+        # ("what devices do you have?", "is my phone connected?", "revoke my phone" - the last one only
+        # ASKS, through the existing confirmation). `None` (every existing caller/test): ordinary chat.
+        self.device_operations = device_operations
         self.router = router or SearchRouter()
         # Reuses self.provider by default, so injecting a fake AIProvider
         # into Core (as tests do) covers the SEARCH path's answer
@@ -437,7 +474,7 @@ class JarvisCore:
         return reply, conversation_id, sources
 
     def handle_chat_with_job_id(
-        self, message: str, conversation_id: str | None = None
+        self, message: str, conversation_id: str | None = None, *, device_context=None
     ) -> tuple[str, str, list[SearchSource], str | None]:
         """Identical to `handle_chat` in every respect, plus a 4th return
         value: the id of the Job `_handle_task` just created, if this
@@ -450,12 +487,12 @@ class JarvisCore:
         structured `job_id` field rather than one embedded in reply text.
         """
         reply, conversation_id, sources, job_id, _snapshot, _reasoning, _plan = self._dispatch(
-            message, conversation_id
+            message, conversation_id, device_context
         )
         return reply, conversation_id, sources, job_id
 
     def handle_chat_with_context(
-        self, message: str, conversation_id: str | None = None
+        self, message: str, conversation_id: str | None = None, *, device_context=None
     ) -> tuple[str, str, list[SearchSource], str | None, ContextSnapshot | None]:
         """Identical to `handle_chat_with_job_id`, plus a 5th return value:
         the ContextSnapshot `_dispatch` built for this message (M16.2), or
@@ -473,7 +510,7 @@ class JarvisCore:
         existing - see `handle_chat_with_reasoning`/`handle_chat_with_planning`
         for the wider tuples that also expose those."""
         reply, conversation_id, sources, job_id, snapshot, _reasoning, _plan = self._dispatch(
-            message, conversation_id
+            message, conversation_id, device_context
         )
         return reply, conversation_id, sources, job_id, snapshot
 
@@ -528,7 +565,7 @@ class JarvisCore:
         return self._dispatch(message, conversation_id)
 
     def _dispatch(
-        self, message: str, conversation_id: str | None
+        self, message: str, conversation_id: str | None, device_context=None
     ) -> tuple[
         str,
         str,
@@ -583,6 +620,69 @@ class JarvisCore:
             except Exception:  # noqa: BLE001 - see above
                 interaction_reply = None
 
+        # An explicit memory command ("remember that I prefer X", "set my goal
+        # to X") is answered by the write policy itself - it is not a question
+        # for the model. Only the user's own message, only on the ordinary
+        # conversation path; a fault here is "not a memory command".
+        memory_reply: str | None = None
+        # An activity statement is a narrow whole-message grammar, so it may also come in as SEARCH
+        # when the router classified it only on a freshness word ("I'm free now") - but never an
+        # explicit search request. Anything else (tool, task, status, self-development) always wins.
+        if (
+            self.activity_context is not None
+            and interaction_reply is None
+            and (
+                decision.capability is Capability.DIRECT
+                or (decision.capability is Capability.SEARCH and not is_explicit_search_request(message))
+            )
+        ):
+            try:
+                memory_reply = self.activity_context.command_reply(message, conversation_id)
+            except Exception:  # noqa: BLE001 - a fault here is "not an activity statement"
+                memory_reply = None
+        # The Morning Brief is read the same way: a whole-message request only, on the ordinary
+        # conversation path (DIRECT, or SEARCH when only a freshness word like "today" put it
+        # there - never an explicit search, tool, task, status or self-development request).
+        if (
+            memory_reply is None
+            and self.morning_brief is not None
+            and interaction_reply is None
+            and (
+                decision.capability is Capability.DIRECT
+                or (decision.capability is Capability.SEARCH and not is_explicit_search_request(message))
+            )
+        ):
+            try:
+                memory_reply = self.morning_brief.command_reply(message, conversation_id)
+            except Exception:  # noqa: BLE001 - a fault here is "not a brief request"
+                memory_reply = None
+        # Device operations are read the same way: a whole-message phrasing only, on the ordinary
+        # conversation path. Reads answer from the registry; "revoke my phone" only ASKS (existing
+        # confirmation). Registering and trusting a device have no chat path at all.
+        if (
+            memory_reply is None
+            and self.device_operations is not None
+            and interaction_reply is None
+            and (
+                decision.capability is Capability.DIRECT
+                or (decision.capability is Capability.SEARCH and not is_explicit_search_request(message))
+            )
+        ):
+            try:
+                memory_reply = self.device_operations.command_reply(message, conversation_id)
+            except Exception:  # noqa: BLE001 - a fault here is "not a device request"
+                memory_reply = None
+        if (
+            memory_reply is None
+            and self.memory_writer is not None
+            and interaction_reply is None
+            and decision.capability is Capability.DIRECT
+        ):
+            try:
+                memory_reply = self.memory_writer.command_reply(message, conversation_id)
+            except Exception:  # noqa: BLE001
+                memory_reply = None
+
         # M16.2: purely additive - computed only when a context_engine was
         # actually configured (never for the default `core` singleton or
         # any existing test, none of which pass one), and never consumed
@@ -596,7 +696,13 @@ class JarvisCore:
         request_context = None
         if self.context_engine is not None:
             request_context = build_request_context(message, capability=decision.capability)
-            context_snapshot = self.context_engine.build_snapshot(request_context)
+            # `device_context` is who the Device Gateway AUTHENTICATED as the sender (None for the
+            # ordinary, unauthenticated /chat): information for the snapshot, never permission, never saved.
+            context_snapshot = (
+                self.context_engine.build_snapshot(request_context, device_context=device_context)
+                if device_context is not None
+                else self.context_engine.build_snapshot(request_context)
+            )
 
         # M16.3: `reasoning_result` starts `None` and is only ever
         # computed inside the two branches below that actually pass it
@@ -622,6 +728,8 @@ class JarvisCore:
 
         if interaction_reply is not None:
             reply, sources = interaction_reply, []
+        elif memory_reply is not None:
+            reply, sources = memory_reply, []
         elif decision.capability is Capability.SEARCH:
             reply, sources = self._handle_search(message, history, facts)
         elif decision.capability is Capability.TOOL:
@@ -728,6 +836,35 @@ class JarvisCore:
                 message, history, facts, request_context, context_snapshot
             )
 
+        # A plain first-person statement in an ordinary message ("I prefer dark
+        # mode.") may be remembered under the write policy; the user is told
+        # briefly when something was saved, asked about or refused (never for a
+        # candidate or a passing remark). Best-effort: never breaks chat.
+        if (
+            self.memory_writer is not None
+            and interaction_reply is None
+            and memory_reply is None
+            and decision.capability is Capability.DIRECT
+        ):
+            try:
+                note = self.memory_writer.observe(message, conversation_id)
+            except Exception:  # noqa: BLE001
+                note = None
+            if note:
+                reply = f"{reply}\n\n{note}"
+
+        # An URGENT event that no permitted channel could carry is not lost: it is told to the user here,
+        # in the reply to their own message. Nothing is delivered through any channel and no channel
+        # restriction is lifted; each such event is shown once. Best-effort: never breaks chat.
+        if self.escalation_surface is not None:
+            try:
+                urgent_items = self.escalation_surface.take_escalations()
+            except Exception:  # noqa: BLE001
+                urgent_items = []
+            if urgent_items:
+                lines = " ".join(item.event.text for item in urgent_items)
+                reply = f"{reply}\n\nThis was urgent and I had no way to reach you: {lines}"
+
         # Surface anything now waiting on the user in this conversation (its
         # own Jobs' and background Jobs' questions/confirmations), which is
         # also what arms a plain reply to it. Best-effort: never breaks chat.
@@ -739,7 +876,15 @@ class JarvisCore:
             if notice:
                 reply = f"{reply}\n\n{notice}"
 
-        self.memory.add_message(conversation_id, "user", message)
+        stored_message = message
+        if self.memory_writer is not None:
+            # A message that looks like it holds a credential is not kept verbatim
+            # in the conversation history (see MemoryWriteService.redact).
+            try:
+                stored_message = self.memory_writer.redact(message)
+            except Exception:  # noqa: BLE001
+                stored_message = message
+        self.memory.add_message(conversation_id, "user", stored_message)
         self.memory.add_message(conversation_id, "assistant", reply)
 
         return (
@@ -1847,6 +1992,16 @@ class JarvisCore:
             if not items:
                 continue
             lines.append(f"- {label}: " + ", ".join(describe(item) for item in items))
+
+        candidates = getattr(snapshot, "unconfirmed_candidates", None) or []
+        if candidates:
+            # Not a fact category (and never part of `_WORLD_MODEL_CATEGORIES`, so never
+            # handed to a Job's planner): hypotheses, each marked unconfirmed.
+            lines.append(
+                "- Unconfirmed hunches (NOT facts - the user has not confirmed these; treat only as "
+                "possible clues and never state them as true): "
+                + ", ".join(f"{c.key}={c.value} (confidence {c.confidence:.2f})" for c in candidates)
+            )
 
         if not lines:
             return ""

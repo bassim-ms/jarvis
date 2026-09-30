@@ -677,6 +677,33 @@ class ResourceLink:
 # ---------------------------------------------------------------------------
 
 
+#: How an unconfirmed candidate is labelled wherever it is shown to reasoning, and
+#: the prefix of the provenance id it may be cited by ("candidate:<id>").
+CANDIDATE_LABEL = "UNCONFIRMED_CANDIDATE"
+CANDIDATE_PROVENANCE_PREFIX = "candidate"
+
+
+@dataclass(frozen=True)
+class UnconfirmedCandidate:
+    """Something Jarvis was told uncertainly, or inferred, that has NOT been
+    confirmed as a fact (see app/memory_policy/). It travels in a ContextSnapshot
+    only in `unconfirmed_candidates` - never in `relevant_preferences` or
+    `relevant_memory` - so it can never be mistaken for a fact by anything that
+    reads those. `status` is always "unconfirmed"; `confidence` and `origin`
+    ("user_statement" | "inference" | ...) are the provenance it was staged with.
+    Reasoning may use it as a hint or hypothesis, never as authority."""
+
+    id: str
+    kind: str
+    key: str
+    value: str
+    confidence: float
+    origin: str
+    created_at: str
+    updated_at: str
+    status: str = "unconfirmed"
+
+
 @dataclass
 class ContextSnapshot:
     """The shape a Context Engine (M16.2, app/context_engine/) populates
@@ -716,6 +743,13 @@ class ContextSnapshot:
     relevant_resources: list[Resource] = field(default_factory=list)
     relevant_preferences: list[Preference] = field(default_factory=list)
     relevant_memory: list[str] = field(default_factory=list)
+    #: Staged, UNCONFIRMED candidates (see UnconfirmedCandidate) - hypotheses,
+    #: deliberately a separate field from every category of established fact.
+    unconfirmed_candidates: list[UnconfirmedCandidate] = field(default_factory=list)
+    #: app.devices.base.DeviceContext | None - the authenticated device this request came from
+    #: (forward reference, like the two below). Request-scoped: never persisted to Memory or the
+    #: World Model; the Device Registry is the source of truth for devices.
+    device_context: "DeviceContext | None" = None
     #: app.context_engine.base.ContextWindow | None - forward reference,
     #: see this class's own docstring for why no import exists here.
     context_window: "ContextWindow | None" = None

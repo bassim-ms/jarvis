@@ -86,7 +86,16 @@ class ObjectiveAwareCapabilityRouter(CapabilityRouter):
         if decision.capability in _EXPLICIT:
             return decision
 
-        is_objective = self.detector(message).route is ObjectiveRoute.HANDLE_THIS
+        verdict = self.detector(message)
+        if verdict.route is ObjectiveRoute.MORNING_BRIEF:
+            # A read-only review, not a delegated objective: never a Job. The goal-verb rule would turn
+            # "prepare my morning brief" into TASK; it goes to the ordinary conversation path instead,
+            # where JarvisCore hands it to the read-only Morning Brief. DIRECT / SEARCH are left as they are.
+            if decision.capability is Capability.TASK:
+                return CapabilityDecision(capability=Capability.DIRECT)
+            return decision
+
+        is_objective = verdict.route is ObjectiveRoute.HANDLE_THIS
 
         if decision.capability in (Capability.DIRECT, Capability.SEARCH):
             if is_objective:

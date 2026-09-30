@@ -55,9 +55,15 @@ class ReminderScheduler:
         store: ReminderStore,
         notifier: Notifier,
         poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
+        router=None,
     ):
         self.store = store
         self.notifier = notifier
+        # Optional (duck-typed like a NotificationRouter: `notify(user, event)`). When given, a due
+        # reminder is emitted as a structured NotificationEvent and handed to it - in the app, the
+        # attention-gated router, which decides whether the user is interrupted or the reminder waits.
+        # None (the default, every existing caller/test): the notifier is called directly, as always.
+        self.router = router
         self.poll_interval_seconds = poll_interval_seconds
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
@@ -93,6 +99,20 @@ class ReminderScheduler:
                 pass
             self._stop_event.wait(self.poll_interval_seconds)
 
+    def _emit(self, reminder: Reminder) -> tuple[bool, str]:
+        """Hand the reminder to the router as an event. "Success" means the router took responsibility for
+        it (delivered it or held it for a better moment) - it is not lost either way."""
+        from app.notifications.base import DEFAULT_USER
+        from app.reminders.events import reminder_event
+
+        try:
+            result = self.router.notify(DEFAULT_USER, reminder_event(reminder))
+        except Exception as exc:  # noqa: BLE001 - notifying never breaks the scheduler
+            return False, str(exc)
+        if result.accepted or result.duplicate:
+            return True, ""
+        return False, "the notification could not be accepted"
+
     def tick(self) -> int:
         """Trigger every currently-due reminder once and return how many
         were successfully processed (regardless of whether notifying each
@@ -116,11 +136,14 @@ class ReminderScheduler:
         return processed
 
     def _trigger(self, reminder: Reminder) -> None:
-        try:
-            self.notifier.notify(title="Rhasspy Reminder", message=reminder.text)
-            success, detail = True, ""
-        except NotifierError as exc:
-            success, detail = False, str(exc)
+        if self.router is not None:
+            success, detail = self._emit(reminder)
+        else:
+            try:
+                self.notifier.notify(title="Rhasspy Reminder", message=reminder.text)
+                success, detail = True, ""
+            except NotifierError as exc:
+                success, detail = False, str(exc)
 
         next_due_at = (
             advance_by_recurrence(reminder.due_at, reminder.recurrence)

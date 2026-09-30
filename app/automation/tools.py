@@ -220,6 +220,11 @@ class CreateAutomationTool(Tool):
                 f"Tool '{action_tool_name}' answers a confirmation on your behalf "
                 "and can't be used as an automation's action."
             )
+        if not action_tool.automatable:
+            return ToolResult.error(
+                f"Tool '{action_tool_name}' can't be run by an automation - it needs the user's "
+                "own request each time."
+            )
         if action_tool_name in _AUTOMATION_TOOL_NAMES:
             return ToolResult.error(
                 f"Tool '{action_tool_name}' manages automations itself and "

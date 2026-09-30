@@ -27,7 +27,7 @@ hardware control beyond that yet - those come in later milestones.
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
 from app.automation.factory import create_default_automation_store
@@ -39,6 +39,9 @@ from app.context_planning.factory import create_default_context_planner
 from app.context_reasoning.factory import create_default_context_reasoner
 from app.handle_this.continuation import ObjectiveContinuer, plausible_input_answer
 from app.handle_this.dialogue import ClarificationDialogue
+from app.memory_policy.confirmation import SensitiveWriteConfirmer
+from app.memory_policy.factory import create_default_memory_write_service
+from app.memory_policy.tools import register_memory_tools
 from app.handle_this.factory import create_default_intake
 from app.handle_this.routing import ObjectiveAwareCapabilityRouter
 from app.handle_this.service import HandleThisService
@@ -51,8 +54,26 @@ from app.orchestration.factory import (
     create_default_job_store,
 )
 from app.orchestration.interaction_lifecycle import InteractionLifecycle
+from app.orchestration.notification_events import still_relevant
 from app.orchestration.interaction_resolver import InteractionResolver
+from datetime import datetime
+
+from app.devices.base import DeviceAuthenticationError, DeviceContext
+from app.devices.gateway import DeviceGateway
+from app.devices.operations import CommitDeviceRevocationTool, DeviceOperations, DeviceRevocationConfirmer
+from app.devices.registry import DeviceRegistry
+from app.devices.store import SQLiteDeviceStore
+from app.morning_brief.providers import SearchNewsProvider
+from app.morning_brief.service import BriefSources, MorningBriefService
+from app.morning_brief.synthesis import BriefSynthesizer
+from app.morning_brief.tools import MorningBriefTool
+from app.notifications.activity_context import ActivityContextService, SQLiteActivityContextStore
+from app.notifications.attention import AttentionPolicy
+from app.notifications.attention_config import attention_config_from_settings
+from app.notifications.attention_gate import AttentionGate, GatedNotificationRouter
+from app.notifications.attention_queue import SQLiteAttentionQueue
 from app.notifications.base import (
+    DEFAULT_USER,
     NotificationPriority,
     NotificationRouter,
     SQLiteNotificationLedger,
@@ -65,6 +86,7 @@ from app.reminders.factory import (
     create_default_reminder_store,
     create_default_scheduler,
 )
+from app.search.factory import create_default_search_provider
 from app.tasks.factory import create_default_task_store
 from app.tools.defaults import register_default_tools
 from app.world_model.factory import (
@@ -113,6 +135,29 @@ def _build_notification_router() -> NotificationRouter:
 
 
 _notification_router = _build_notification_router()
+
+# The attention policy in front of the notification router (app/notifications/attention*.py):
+# decides whether an event interrupts now, waits in a queue, or stays silent, and on which
+# of the router's channels. The producers (Job engine, interaction lifecycle, reminder
+# scheduler) are handed `_gated_router` - the same three methods as the router - so they
+# still just emit structured events and learn nothing about attention.
+#
+# The user's current activity is an explicit, TEMPORARY context ("I'm in class", "I'm free
+# now"; app/notifications/activity_context.py), never memory and never inferred. When it
+# changes - and on every engine tick (below) - held-back notifications are reconsidered.
+_activity_context = ActivityContextService(
+    SQLiteActivityContextStore.for_job_store(_job_store),
+    clock=lambda: datetime.now().astimezone(),
+)
+attention_gate = AttentionGate(
+    _notification_router,
+    AttentionPolicy(attention_config_from_settings()),
+    SQLiteAttentionQueue.for_job_store(_job_store),
+    context_provider=_activity_context.current_name,
+    relevance_check=lambda event: still_relevant(event, _interaction_store),
+)
+_gated_router = GatedNotificationRouter(attention_gate)
+_activity_context.on_change = lambda: len(attention_gate.release_queued(DEFAULT_USER))
 automation_engine = register_default_tools(
     core.tools,
     reminder_store=_reminder_store,
@@ -127,7 +172,7 @@ automation_engine = register_default_tools(
 )
 
 reminder_scheduler = create_default_scheduler(
-    _reminder_store, settings.reminder_poll_interval_seconds
+    _reminder_store, settings.reminder_poll_interval_seconds, router=_gated_router
 )
 
 # JobEngine (M15) isn't built by register_default_tools itself (see that
@@ -164,7 +209,7 @@ job_engine = create_default_job_engine(
     # failure (only once it can't be recovered) at HIGH priority, a
     # background Job's completion at LOW. Best-effort and off the critical
     # path: the persisted Job is authoritative whether or not anything shows.
-    notification_router=_notification_router,
+    notification_router=_gated_router,
     notify_on_completion=settings.orchestration_notify_on_completion,
     # Continues a Handle This objective that waited on a question once it is
     # answered: folds the answer into the ORIGINAL objective and re-checks it,
@@ -177,8 +222,14 @@ job_engine = create_default_job_engine(
 # Runs at the end of every engine tick; it also opens the confirmation for a
 # Job the engine parked in AWAITING_CONFIRMATION.
 interaction_lifecycle = InteractionLifecycle(
-    _interaction_store, _job_store, job_engine, _notification_router
+    _interaction_store, _job_store, job_engine, _gated_router
 ).attach()
+
+# Held-back notifications are reconsidered on the engine's own tick - no new background loop. It
+# re-decides only what is waiting, under the context and time of that moment: a context that has
+# ended, quiet hours that are over, or a channel that has become available lets an item through;
+# an item that is still suppressed stays put; one that expired or is no longer relevant is expired.
+job_engine.add_tick_hook(lambda: attention_gate.release_queued(DEFAULT_USER))
 
 # Routes a user's chat reply to a waiting interaction (`answer <code>: ...`,
 # or a yes/no / free-text answer to something surfaced to that conversation)
@@ -188,6 +239,8 @@ interaction_lifecycle = InteractionLifecycle(
 # `dialogue`: the conversation around a question - cancelling, changing an
 # answer, coming back to a stale question, the next question - all
 # deterministic, all through the engine's own version-guarded transitions.
+core.activity_context = _activity_context
+core.escalation_surface = attention_gate
 core.interaction_resolver = InteractionResolver(
     _interaction_store,
     _job_store,
@@ -216,6 +269,74 @@ core.interaction_resolver = InteractionResolver(
 _world_model_store = create_default_world_model_store(DEFAULT_WORLD_MODEL_DB_PATH)
 _world_model_service = create_default_world_model_service(_world_model_store)
 core.context_engine = create_default_context_engine(_world_model_service, memory=core.memory)
+
+# The write policy for persistent memory (see app/memory_policy/): what the user
+# plainly says or asks to be remembered is persisted through the EXISTING World
+# Model service and MemoryStore, under a deterministic policy (secrets never,
+# sensitive/contradictory only with the user's say-so, inference and uncertainty
+# only as staged candidates). A model can only PROPOSE, through tools registered
+# on the ToolRegistry - non-plannable, so no Job plan (or web content a Job read)
+# can name them.
+core.memory_writer = create_default_memory_write_service(
+    _world_model_service,
+    core.memory,
+    DEFAULT_WORLD_MODEL_DB_PATH,
+    # A sensitive request is confirmed through the EXISTING Job / interaction /
+    # ToolRegistry machinery (never a mechanism of its own): its confirmation is
+    # put to the user in the conversation it came from.
+    confirmer=SensitiveWriteConfirmer(
+        _interaction_store, mark_surfaced=core.interaction_resolver.mark_surfaced
+    ),
+)
+register_memory_tools(core.tools, core.memory_writer)
+
+# Devices (see app/devices/): the registry lives in the application's existing database, the Gateway
+# authenticates a device's credential and hands back a DeviceContext (identity only - it grants nothing),
+# and the few user-facing device operations ride the ordinary chat path. Revoking a device from chat is
+# ASKED through the existing confirmation machinery (a CONFIRM-level, non-plannable tool, like the memory
+# policy's); registering and trusting a device happen only in the admin command (python -m app.devices.admin).
+_device_registry = DeviceRegistry(SQLiteDeviceStore.for_job_store(_job_store))
+device_gateway = DeviceGateway(_device_registry)
+device_operations = DeviceOperations(
+    _device_registry,
+    DeviceRevocationConfirmer(_interaction_store, mark_surfaced=core.interaction_resolver.mark_surfaced),
+)
+core.device_operations = device_operations
+core.tools.register(CommitDeviceRevocationTool(device_operations))
+# The Context Engine may show reasoning a confident staged candidate - labelled
+# UNCONFIRMED, in its own field, never as a fact.
+core.context_engine.candidate_source = core.memory_writer.candidates_for_context
+
+# The Morning Brief (app/morning_brief/): READS the existing calendar, task and reminder stores, the
+# Context Engine (World Model, memory, unconfirmed candidates), the Attention queue, Jobs and pending
+# interactions, and the user's stated activity - and words the result deterministically. It writes,
+# sends, approves and executes nothing. No weather or business integration exists yet, so none is wired;
+# news (through the existing search provider) is off unless configured. The brief is worded
+# deterministically and then, by default, reworded by the existing AI provider (no tools, output
+# validated, deterministic fallback on any failure).
+_brief_sources = BriefSources(
+    calendar=_calendar_provider,
+    tasks=_task_store,
+    reminders=_reminder_store,
+    context_engine=core.context_engine,
+    attention_queue=attention_gate.queue,
+    jobs=_job_store,
+    interactions=_interaction_store,
+    activity=_activity_context,
+    news=(
+        SearchNewsProvider(create_default_search_provider(), settings.morning_brief_news_query)
+        if settings.morning_brief_news_enabled
+        else None
+    ),
+    relevance_check=lambda event: still_relevant(event, _interaction_store),
+)
+morning_brief_service = MorningBriefService(
+    _brief_sources,
+    clock=lambda: datetime.now().astimezone(),
+    synthesizer=BriefSynthesizer(core.provider) if settings.morning_brief_use_llm else None,
+)
+core.morning_brief = morning_brief_service
+core.tools.register(MorningBriefTool(morning_brief_service))
 
 # Context-Aware Reasoning (M16.3) - wired onto `core` the same way M16.2
 # just was, immediately above: `core.context_reasoner` defaults to `None`
@@ -394,16 +515,75 @@ class ChatResponse(BaseModel):
     job_id: str | None = None
 
 
+# ---------------------------------------------------------------------------------------------------
+# TWO ENTRY POINTS, NOT EQUIVALENT (see app/devices/__init__.py):
+#
+#   /chat          the existing LEGACY / LOCAL interface. Anonymous: it never carries a DeviceContext
+#                  and is never proof of a device's identity. A request from localhost is NOT "the
+#                  trusted PC"; nothing in its body, text or headers can make it one. Unchanged in
+#                  Slice 1 because existing clients (including the PC voice client) use it.
+#   /device/chat   the AUTHENTICATED device interface: the ONLY route that hands Core a DeviceContext,
+#                  and only after the Device Gateway verified a device_id + credential for a TRUSTED
+#                  device. (The voice client does not send a credential yet, so it still uses /chat -
+#                  an intentional Slice 1 limitation.)
+# Do not route /chat through the gateway, and do not attach a device to it.
+# ---------------------------------------------------------------------------------------------------
 @app.post("/chat", response_model=ChatResponse)
 def chat(request: ChatRequest) -> ChatResponse:
     """Send a user message to Jarvis Core and return its reply.
 
     Omit conversation_id to start a new conversation; pass back the
     conversation_id from a previous response to continue it with history.
+
+    This is the existing LEGACY / LOCAL interface: anonymous, and never a
+    trusted device - it is always called with no device (see /device/chat for
+    the authenticated interface).
     """
+    return _chat(request, None)
+
+
+def _authenticated_device(
+    x_jarvis_device_id: str | None = Header(default=None),
+    x_jarvis_device_token: str | None = Header(default=None),
+) -> DeviceContext:
+    """Who is calling, from the credential they PROVE - never from the request body or message. Any failure
+    (missing, unknown, pending, revoked, wrong credential) is the same 401."""
     try:
+        return device_gateway.authenticate(x_jarvis_device_id, x_jarvis_device_token)
+    except DeviceAuthenticationError:
+        raise HTTPException(status_code=401, detail="device authentication failed")
+
+
+@app.post("/device/chat", response_model=ChatResponse)
+def device_chat(request: ChatRequest, device: DeviceContext = Depends(_authenticated_device)) -> ChatResponse:
+    """The same chat, entered through the Device Gateway: the request carries the DeviceContext of the
+    authenticated device. Everything after this is the ordinary Jarvis flow and its ordinary limits."""
+    return _chat(request, device)
+
+
+@app.post("/device/check-in")
+def device_check_in(
+    x_jarvis_device_id: str | None = Header(default=None),
+    x_jarvis_device_token: str | None = Header(default=None),
+) -> dict:
+    """An authenticated "I am alive": marks the device ONLINE and records when. No background service."""
+    try:
+        device = device_gateway.check_in(x_jarvis_device_id, x_jarvis_device_token)
+    except DeviceAuthenticationError:
+        raise HTTPException(status_code=401, detail="device authentication failed")
+    return {"device_id": device.device_id, "status": device.status.value, "last_seen": device.last_seen.isoformat()}
+
+
+def _chat(request: ChatRequest, device: DeviceContext | None) -> ChatResponse:
+    # Only the Gateway makes an authenticated DeviceContext; refuse anything else rather than pass it on.
+    if device is not None and not device.is_authenticated:
+        raise HTTPException(status_code=401, detail="device authentication failed")
+    try:
+        # The unauthenticated /chat calls Core exactly as it always has; only an authenticated device
+        # adds its DeviceContext.
+        extra = {"device_context": device} if device is not None else {}
         reply, conversation_id, sources, job_id = core.handle_chat_with_job_id(
-            request.message, request.conversation_id
+            request.message, request.conversation_id, **extra
         )
     except ConversationNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))

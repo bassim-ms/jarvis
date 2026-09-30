@@ -86,8 +86,15 @@ class NotificationEvent:
     conversation_id: str | None = None
     job_id: str | None = None
     interaction_code: str | None = None
+    #: Structured metadata set ONLY by trusted code that KNOWS the event is time-critical
+    #: (never derived from `text`, which is display only). It is the one thing that lets the
+    #: attention layer consider an event URGENT (and then only together with HIGH importance
+    #: and a trusted source - see app/notifications/attention.py). No existing producer sets it.
+    time_critical: bool = False
 
     def __post_init__(self) -> None:
+        if not isinstance(self.time_critical, bool):
+            raise ValueError("time_critical must be a bool.")
         if not isinstance(self.key, str) or not self.key or len(self.key) > MAX_KEY_CHARS:
             raise ValueError(f"key must be a non-empty string of at most {MAX_KEY_CHARS} characters.")
         if not isinstance(self.kind, NotificationKind):
@@ -334,11 +341,22 @@ class NotificationRouter:
         except Exception:  # noqa: BLE001
             return 0
 
-    def notify(self, user: str, event: NotificationEvent) -> DeliveryResult:
+    def notify(
+        self, user: str, event: NotificationEvent, *, only: Iterable[str] | None = None
+    ) -> DeliveryResult:
         """Claim `event.key`, then hand the event to each accepting channel.
         NEVER raises: a broken ledger, dispatcher or channel just means this
         notification is not (fully) delivered - the caller (a Job) is
-        unaffected."""
+        unaffected.
+
+        `only` (default None: every accepting channel, exactly as always) restricts
+        delivery to the channels of those names - how the attention policy keeps an
+        event off a channel it must not use. An empty `only` delivers nowhere and, like
+        any call that could reach no channel, claims nothing."""
+        if only is not None:
+            allowed = set(only)
+            if not allowed:
+                return DeliveryResult(accepted=False)
         try:
             if not isinstance(user, str) or not user or not isinstance(event, NotificationEvent):
                 return DeliveryResult(accepted=False)
@@ -350,6 +368,8 @@ class NotificationRouter:
         chosen: list[str] = []
         for channel in list(self._channels):
             try:
+                if only is not None and channel.name not in allowed:
+                    continue
                 if not channel.accepts(event):
                     continue
                 self._dispatch(self._delivery(channel, user, event))

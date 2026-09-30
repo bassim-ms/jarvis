@@ -12,7 +12,7 @@ them clearly rather than crashing partway through construction.
 
 from app.config import settings
 from app.voice.base import Microphone, SpeechToTextProvider, TextToSpeechProvider, WakeWordProvider
-from app.voice.chat_client import ChatClient
+from app.voice.chat_client import ChatClient, load_device_credentials
 from app.voice.microphone import SoundDeviceMicrophone
 from app.voice.session import VOICE_SAMPLE_RATE
 from app.voice.stt import VoskSTTProvider
@@ -44,6 +44,12 @@ def create_default_tts_provider() -> TextToSpeechProvider:
 
 
 def create_default_chat_client() -> ChatClient:
+    """The PC voice client's chat client: the registered, trusted PC, talking to the authenticated
+    `/device/chat`. The credential comes from the file `python -m app.devices.admin register-pc` wrote
+    (JARVIS_VOICE_DEVICE_CREDENTIAL_FILE, default jarvis_pc_device.json). A missing or unreadable credential
+    raises DeviceCredentialError - it NEVER falls back to an anonymous client on the legacy `/chat`."""
     return ChatClient(
-        base_url=settings.voice_chat_url, timeout=settings.voice_chat_timeout_seconds
+        base_url=settings.voice_chat_url,
+        timeout=settings.voice_chat_timeout_seconds,
+        credentials=load_device_credentials(settings.voice_device_credential_file),
     )

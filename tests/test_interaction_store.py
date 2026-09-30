@@ -914,7 +914,7 @@ def test_only_the_expected_modules_use_the_interaction_modules():
         text = path.read_text(encoding="utf-8")
         if re.search(r"^\s*(from|import) app\.orchestration\.(sqlite_)?interaction", text, re.MULTILINE):
             users.append(str(path.relative_to(root)).replace("\\", "/"))
-    assert sorted(users) == [
+    assert sorted(users) == sorted([
         "main.py",
         "orchestration/engine.py",
         "orchestration/factory.py",
@@ -923,4 +923,14 @@ def test_only_the_expected_modules_use_the_interaction_modules():
         "orchestration/notification_events.py",
         "orchestration/tools.py",
         "tools/defaults.py",
-    ]
+        # the memory write policy asks the user before keeping anything sensitive, through
+        # this same confirmation machinery (app/memory_policy/confirmation.py) - a consumer
+        # of it, not a mechanism of its own
+        "memory_policy/confirmation.py",
+        # the Morning Brief only READS what is waiting on the user (list_pending) - it never
+        # presents, resolves, declines or expires an interaction
+        "morning_brief/gather.py",
+        # asking the user before a device is revoked, through this same confirmation machinery
+        # (like the memory policy): a consumer of it, not a mechanism of its own
+        "devices/operations.py",
+    ])

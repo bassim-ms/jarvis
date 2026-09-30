@@ -566,6 +566,63 @@ class SQLiteInteractionStore(InteractionStore):
                 raise
             return job, self._read_locked(interaction_id)
 
+    def create_job_awaiting_confirmation(
+        self,
+        job: Job,
+        *,
+        prompt: str,
+        step_ids: list[str],
+        detail: dict[str, Any] | None = None,
+        ttl_seconds: float | None = None,
+        now: datetime | None = None,
+    ) -> tuple[Job, InteractionRequest]:
+        """Insert a Job that is ALREADY waiting on a confirmation - built by the caller
+        (`SQLiteJobStore.build_job(status=AWAITING_CONFIRMATION)` with its plan and
+        `pending_step_ids` set) - together with its ONE pending CONFIRMATION
+        interaction, in ONE transaction: both exist or neither does, and the engine
+        can never see the Job without the question that gates its step. The
+        confirmation-side twin of `create_job_awaiting_input`; used by trusted
+        code (the memory write policy) that builds a one-step plan itself, so no
+        planner is ever involved. Returns (Job, interaction)."""
+        if (
+            job.status is not JobStatus.AWAITING_CONFIRMATION
+            or job.plan is None
+            or not step_ids
+            or any(sid not in job.pending_step_ids or job.plan.get(sid) is None for sid in step_ids)
+        ):
+            raise ValueError("The Job must be awaiting confirmation, with a plan naming every gated step.")
+        clean_detail = validate_new_interaction(InteractionType.CONFIRMATION, prompt, step_ids, detail, ttl_seconds)
+        moment = now or utc_now()
+        with self._lock:
+            try:
+                SQLiteJobStore.insert_job_locked(self._conn, job)
+                interaction_id = uuid.uuid4().hex
+                self._conn.execute(
+                    """
+                    INSERT INTO interactions (
+                        id, job_id, type, status, prompt, code, step_ids,
+                        detail, created_at, expires_at, version
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                    """,
+                    (
+                        interaction_id,
+                        job.id,
+                        InteractionType.CONFIRMATION.value,
+                        InteractionStatus.PENDING.value,
+                        prompt,
+                        self._allocate_code_locked(),
+                        json.dumps(list(step_ids)),
+                        json.dumps(clean_detail),
+                        moment.isoformat(),
+                        expires_at_for(moment, ttl_seconds),
+                    ),
+                )
+                self._conn.commit()  # the single commit: the Job and its question, together
+            except BaseException:
+                self._conn.rollback()
+                raise
+            return job, self._read_locked(interaction_id)
+
     def park_job_for_input(
         self,
         job_id: str,

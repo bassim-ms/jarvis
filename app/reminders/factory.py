@@ -26,10 +26,11 @@ def create_default_reminder_store(db_path: str) -> ReminderStore:
 
 
 def create_default_scheduler(
-    store: ReminderStore, poll_interval_seconds: float
+    store: ReminderStore, poll_interval_seconds: float, router=None
 ) -> ReminderScheduler:
     return ReminderScheduler(
         store=store,
         notifier=create_default_notifier(),
         poll_interval_seconds=poll_interval_seconds,
+        router=router,
     )

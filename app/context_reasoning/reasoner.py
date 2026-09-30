@@ -48,7 +48,7 @@ from app.context_reasoning.prompt import build_reasoning_prompt, collect_allowed
 from app.providers.base import AIProvider, ProviderError
 from app.providers.manager import call_with_requirements
 from app.providers.requirements import RequestRequirements, TaskType
-from app.world_model.base import ContextSnapshot
+from app.world_model.base import CANDIDATE_PROVENANCE_PREFIX, ContextSnapshot
 
 
 class ContextReasonerError(RuntimeError):
@@ -133,6 +133,9 @@ _VALID_TOP_LEVEL_KEYS = {
     "clarification_question",
 }
 
+#: The fields that assert something as established: nothing unconfirmed may back them.
+_FACT_LIKE_FIELDS = frozenset({"relevant_facts", "constraints", "conflicts"})
+
 _LIST_FIELD_TYPES: dict[str, type] = {
     "relevant_facts": RelevantFact,
     "constraints": Constraint,
@@ -190,6 +193,15 @@ def _parse_item_list(
             raise ContextReasonerError(
                 f"'{field_name}' entry cites provenance not present in the supplied "
                 f"context (possible hallucination): {unsupported!r}. Full response: {raw!r}"
+            )
+        if field_name in _FACT_LIKE_FIELDS and any(
+            p.startswith(f"{CANDIDATE_PROVENANCE_PREFIX}:") for p in provenance
+        ):
+            # An UNCONFIRMED candidate is a hypothesis: it may inform a conclusion or an
+            # opportunity, but it can never be what a "fact", a constraint or a conflict
+            # rests on - whatever the model wrote.
+            raise ContextReasonerError(
+                f"'{field_name}' entry cites an unconfirmed candidate as if it were established: {provenance!r}"
             )
         parsed.append(item_cls(text=text, provenance=tuple(provenance)))
     return tuple(parsed)

@@ -200,7 +200,14 @@ class AutomationEngine:
         )
         conditions_met = all(c.evaluate(context) for c in automation.conditions)
 
-        if automation.action.tool_name in FORBIDDEN_ACTION_TOOL_NAMES:
+        action_tool = self.tools.get(automation.action.tool_name)
+        if action_tool is not None and not action_tool.automatable:
+            # Defence in depth, read from the registry's own tool (creation already
+            # refuses these): nothing that needs the user's own request each time
+            # is ever run unattended. Recorded as a failure; nothing runs.
+            outcome = ExecutionOutcome.FAILURE
+            detail = "this action can't be run by an automation"
+        elif automation.action.tool_name in FORBIDDEN_ACTION_TOOL_NAMES:
             # Defence in depth (creation already refuses these): an automation
             # must never answer a confirmation for the user, even one that got
             # into the store some other way. Recorded as a failure; nothing runs.

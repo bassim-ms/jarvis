@@ -186,6 +186,21 @@ class Settings(BaseSettings):
     notifications_desktop_enabled: bool = True
     notifications_desktop_min_priority: str = "low"
 
+    # Attention policy (app/notifications/attention*.py): when may Jarvis interrupt?
+    attention_quiet_hours: str = ""  # "22:00-07:00"; empty = none
+    attention_suppressing_contexts: str = "class,studying,meeting,sleeping,focused_work"
+    attention_urgent_window_minutes: float = 15.0
+    attention_enabled_channels: str = "desktop"
+    attention_urgent_channels: str = "desktop"  # earbuds / watch / glasses are never urgent channels unless listed
+
+    # Morning Brief (app/morning_brief/): an on-demand, read-only summary of today. News is off by
+    # default (it needs the network and shows third-party headlines). The deterministic brief is always
+    # built first and is complete; the existing AI provider then rewords it, and any failure or
+    # validation problem falls back to the deterministic text (set false to never call a model).
+    morning_brief_news_enabled: bool = False
+    morning_brief_news_query: str = "top news headlines today"
+    morning_brief_use_llm: bool = True
+
     # Voice (hands-free wake-word + STT + TTS, see app/voice/) - $0/local
     # only: openWakeWord for wake-word detection, Vosk for STT, Windows
     # SAPI for TTS. Model paths have no default - they point at files the
@@ -194,6 +209,9 @@ class Settings(BaseSettings):
     # never Core directly.
     voice_chat_url: str = "http://127.0.0.1:8000"
     voice_chat_timeout_seconds: float = 60.0
+    # The PC's device credential file (written by `python -m app.devices.admin register-pc`; gitignored).
+    # The voice client authenticates with it and talks to /device/chat (see app/voice/chat_client.py).
+    voice_device_credential_file: str = "jarvis_pc_device.json"
     voice_wakeword_model_path: str = ""
     voice_wakeword_threshold: float = 0.5
     voice_vosk_model_path: str = ""

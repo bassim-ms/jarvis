@@ -23,6 +23,7 @@ Behaviour deliberately pinned, and why:
   * Uncertain means "existing behaviour", never "autonomous Job".
 """
 
+import pathlib
 import re
 
 import pytest
@@ -212,7 +213,10 @@ def test_the_detector_is_a_pure_module():
     source = open(objective_module.__file__, encoding="utf-8").read()
     imports = "\n".join(l for l in source.splitlines() if l.startswith(("import ", "from ")))
     modules = set(re.findall(r"^(?:import|from) ([\w.]+)", imports, re.MULTILINE))
-    assert modules <= {"__future__", "re", "dataclasses", "enum", "app.handle_this.signals"}  # pure + one sibling
+    # pure + one sibling + the (equally pure, regex-only) Morning Brief request recogniser
+    assert modules <= {"__future__", "re", "dataclasses", "enum", "app.handle_this.signals", "app.morning_brief.recognition"}
+    recogniser = open(pathlib.Path(objective_module.__file__).parents[1] / "morning_brief" / "recognition.py", encoding="utf-8").read()
+    assert set(re.findall(r"^(?:import|from) ([\w.]+)", recogniser, re.MULTILINE)) <= {"__future__", "re"}
 
 
 # --- the router adapter ------------------------------------------------------------------------------------------------------

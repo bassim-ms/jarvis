@@ -50,6 +50,11 @@ this for me" - `_DELEGATE_START`). Questions ("What is a 3D printer?"), lookups
 unchanged. Routing into Handle This is still not permission: its own intake
 still checks the boundary and fails closed.
 
+One read-only request is recognised here as well, and deliberately NOT sent into Handle This: the Morning
+Brief ("morning brief", "what do I need to know today?", "catch me up for today"). It is a supported
+information/review objective - it gathers what the existing systems already know and reports it - so it
+never becomes a Job, a Plan or a Planner run (route MORNING_BRIEF; see app/morning_brief/).
+
 Conservative by construction: a question, a request to explain, or anything
 short of that structure is EXISTING - the existing routing, unchanged. The
 decision is fully deterministic, adds no AI call and no I/O, and carries only
@@ -63,6 +68,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from app.handle_this.signals import is_informational, is_purchase_oriented, mentions_product
+from app.morning_brief.recognition import is_morning_brief_request
 
 MAX_MESSAGE_CHARS = 4000
 
@@ -70,6 +76,10 @@ MAX_MESSAGE_CHARS = 4000
 class ObjectiveRoute(Enum):
     HANDLE_THIS = "handle_this"  # a delegated high-level objective: enters Handle This
     EXISTING = "existing"  # anything else: the existing routing, untouched
+    #: A supported READ-ONLY review request (the Morning Brief). It is recognised here so it is never mistaken
+    #: for a delegated objective, but it is NOT one: no Job, no Plan, no Planner - it goes straight to the
+    #: existing read-only Morning Brief capability.
+    MORNING_BRIEF = "morning_brief"
 
 
 class ObjectiveReason(Enum):
@@ -81,6 +91,7 @@ class ObjectiveReason(Enum):
     PRODUCT_SEARCH = "product_search"
     NO_SUBSTANTIVE_ACTION = "no_substantive_action"
     NOT_A_REQUEST = "not_a_request"
+    READ_ONLY_REVIEW = "read_only_review"
 
 
 @dataclass(frozen=True)
@@ -218,6 +229,9 @@ def detect_objective(message: object) -> ObjectiveRoutingDecision:
     anything that is not clearly one is EXISTING."""
     if not isinstance(message, str) or not message.strip() or len(message) > MAX_MESSAGE_CHARS:
         return _decision(ObjectiveRoute.EXISTING, ObjectiveReason.NOT_A_REQUEST, message if isinstance(message, str) else "")
+
+    if is_morning_brief_request(message):  # "morning brief", "what do I need to know today?", ... (whole message)
+        return _decision(ObjectiveRoute.MORNING_BRIEF, ObjectiveReason.READ_ONLY_REVIEW, message, ("morning_brief",))
 
     text = message
     polite = _POLITE_PREFIX.match(text)

@@ -3,12 +3,14 @@ Voice Session (M10): the hands-free
 `wake word -> listen -> STT -> /chat -> TTS -> back to wake word` loop.
 
 Deliberately talks to Jarvis Core only through `ChatClient`
-(app/voice/chat_client.py), which itself only ever calls the existing,
-unmodified `/chat` HTTP endpoint (app/main.py) - `VoiceSession` never
-imports `app.core.core`. Voice is just another client of an already-
-running Rhasspy server, the same way curl or a future UI would be; this
-milestone needed (and made) zero changes to Core, `/chat`, ToolRegistry,
-or any Tool.
+(app/voice/chat_client.py), which only ever calls the server's HTTP
+endpoints (app/main.py) - `VoiceSession` never imports `app.core.core`.
+Voice is just another client of an already-running Rhasspy server, the
+same way curl or a future UI would be; this milestone needed (and made)
+zero changes to Core, ToolRegistry, or any Tool. As run by
+`python -m app.voice.run` the ChatClient is the registered, authenticated
+PC (Device Gateway, `/device/chat`); VoiceSession itself neither knows nor
+handles any credential - it just passes the transcribed text through.
 
 Raw microphone audio only ever exists as an in-memory `bytes` buffer
 between `_capture_utterance` and `_transcribe` (via

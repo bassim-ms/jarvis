@@ -153,6 +153,15 @@ class Tool(ABC):
     #: spawn Jobs with a higher autonomy, or schedule further automation.
     plannable: bool = True
 
+    #: False for a tool an AUTOMATION may never be configured to run, nor run
+    #: unattended, even though it is registered and even if it is READ or
+    #: SAFE_ACTION: `plannable` keeps a goal-driven plan away from a tool;
+    #: this keeps a schedule or trigger away from it. Both are read from the tool
+    #: itself, so the registry stays the one place that says what a tool is. Used
+    #: for the memory-write tools: persistent memory is written on the user's own
+    #: authority (through the write policy), never by something running on its own.
+    automatable: bool = True
+
     #: True for a tool that records where its output came from. JobEngine
     #: then adds `source_job_id`/`source_step_id` to the arguments it
     #: executes the tool with - values only the engine knows and a plan

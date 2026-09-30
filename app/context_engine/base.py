@@ -209,6 +209,13 @@ class ContextBudget:
 #: explicitly overrides it - see ContextBudget's own docstring.
 DEFAULT_CONTEXT_BUDGET = ContextBudget()
 
+#: A staged candidate (app/memory_policy/) reaches a ContextSnapshot only once it has
+#: been corroborated to at least this confidence (a single uncertain statement or
+#: inference starts at 0.5), and at most this many are included. They are always
+#: labelled unconfirmed and never placed in a fact category.
+CANDIDATE_CONTEXT_MIN_CONFIDENCE = 0.6
+MAX_CONTEXT_CANDIDATES = 5
+
 #: The default RequiredContextCategory set for each ContextIntent -
 #: centralizes "don't retrieve categories unnecessarily" in one place
 #: (app/context_engine/request_builder.py:default_required_context)

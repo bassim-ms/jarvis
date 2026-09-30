@@ -114,6 +114,21 @@ def _event(
     )
 
 
+def still_relevant(event: NotificationEvent, interactions) -> bool:
+    """Whether a HELD notification is still worth telling the user. An announcement that a question or
+    confirmation is waiting (or a reminder / warning about it) is only relevant while that interaction is
+    still PENDING; once it was answered, declined, expired or withdrawn it is stale and must not be
+    delivered late. Everything else - a Job's outcome, a reminder, an expiry notice - stays relevant.
+    `interactions` needs `get(id)`. Read-only."""
+    if not event.key.startswith("interaction:") or event.key.endswith(":expired"):
+        return True
+    parts = event.key.split(":")
+    if len(parts) < 3:
+        return True
+    interaction = interactions.get(parts[1])
+    return interaction is not None and interaction.is_pending
+
+
 # --- interaction events -----------------------------------------------------------------------------------
 
 

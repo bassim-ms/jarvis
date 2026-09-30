@@ -108,16 +108,23 @@ class ContextEngine:
         *,
         weights: RelevanceWeights = DEFAULT_WEIGHTS,
         task_label_provider: Callable[[TaskLink], str | None] | None = None,
+        candidate_source: Callable[[], list] | None = None,
     ):
         self.world_model = world_model
         self.memory = memory
+        # Zero-arg callable returning the staged, unconfirmed candidates
+        # (`UnconfirmedCandidate`s - see app/memory_policy/). `None` (the default,
+        # every existing caller/test): no candidate ever reaches a snapshot. The
+        # engine only READS them, filters by confidence, and hands them on labelled
+        # unconfirmed in their own field; it never promotes one.
+        self.candidate_source = candidate_source
         self.weights = weights
         self.task_label_provider = task_label_provider
 
     # -- public entry point ------------------------------------------------
 
     def build_snapshot(
-        self, request_context: RequestContext, *, now: str | None = None
+        self, request_context: RequestContext, *, now: str | None = None, device_context=None
     ) -> ContextSnapshot:
         current_time = now or _now_iso()
         required = request_context.required_context
@@ -200,6 +207,10 @@ class ContextEngine:
         if RequiredContextCategory.MEMORY in required and self.memory is not None:
             relevant_memory = self._select_memory(budget)
 
+        unconfirmed_candidates: list = []
+        if RequiredContextCategory.MEMORY in required and self.candidate_source is not None:
+            unconfirmed_candidates = self._select_candidates()
+
         return ContextSnapshot(
             current_time=current_time,
             active_projects=active_projects,
@@ -211,6 +222,9 @@ class ContextEngine:
             relevant_resources=relevant_resources,
             relevant_preferences=relevant_preferences,
             relevant_memory=relevant_memory,
+            unconfirmed_candidates=unconfirmed_candidates,
+            # Who sent this request (from the Device Gateway), when known. Carried, never stored.
+            device_context=device_context,
             context_window=ContextWindow(
                 start=request_context.time_scope.start, end=request_context.time_scope.end
             ),
@@ -581,6 +595,27 @@ class ContextEngine:
         facts = self.memory.get_facts() if self.memory else {}
         lines = [f"{key}: {value}" for key, value in sorted(facts.items())]
         return lines[: budget.memory]
+
+    # -- Unconfirmed candidates (a hypothesis source, never a fact category) ------
+
+    def _select_candidates(self) -> list:
+        """The staged candidates confident enough to be worth showing, strongest
+        first, bounded. They are returned exactly as staged (status
+        "unconfirmed", their confidence and origin intact): nothing here writes,
+        promotes or relabels one. A fault in the source means "none"."""
+        from app.context_engine.base import CANDIDATE_CONTEXT_MIN_CONFIDENCE, MAX_CONTEXT_CANDIDATES
+
+        try:
+            found = list(self.candidate_source())
+        except Exception:  # noqa: BLE001 - a missing hint is never worth failing a request
+            return []
+        eligible = [
+            c
+            for c in found
+            if getattr(c, "status", None) == "unconfirmed" and c.confidence >= CANDIDATE_CONTEXT_MIN_CONFIDENCE
+        ]
+        eligible.sort(key=lambda c: (-c.confidence, c.updated_at, c.id))
+        return eligible[:MAX_CONTEXT_CANDIDATES]
 
     # -- shared selection/scoring helpers -----------------------------------
 

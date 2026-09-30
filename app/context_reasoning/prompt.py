@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from app.context_engine.base import RequestContext
 from app.context_reasoning.deterministic import DeterministicAnalysis
-from app.world_model.base import ContextSnapshot
+from app.world_model.base import CANDIDATE_LABEL, CANDIDATE_PROVENANCE_PREFIX, ContextSnapshot
 
 #: Every ContextSnapshot category this prompt builder knows how to
 #: serialize, together with the provenance prefix used for its items -
@@ -59,6 +59,8 @@ def collect_allowed_provenance(
             allowed.add(f"{prefix}:{item.id}")
     if snapshot.relevant_memory:
         allowed.add("memory")
+    for candidate in snapshot.unconfirmed_candidates:
+        allowed.add(f"{CANDIDATE_PROVENANCE_PREFIX}:{candidate.id}")
     for fact in analysis.facts:
         allowed.update(fact.provenance)
     for conflict in analysis.conflicts:
@@ -77,6 +79,11 @@ def _serialize_snapshot(snapshot: ContextSnapshot) -> str:
     if snapshot.relevant_memory:
         for line in snapshot.relevant_memory:
             lines.append(f"  [memory] {line}")
+    for c in snapshot.unconfirmed_candidates:
+        lines.append(
+            f"  [{CANDIDATE_PROVENANCE_PREFIX}:{c.id}] {CANDIDATE_LABEL} (confidence {c.confidence:.2f}, "
+            f"from {c.origin}; NOT confirmed by the user): {c.key}={c.value}"
+        )
     if not lines:
         return "(nothing was selected as relevant)"
     return "\n".join(lines)
@@ -136,7 +143,11 @@ _INSTRUCTIONS = (
     "3. confidence must be a number from 0.0 to 1.0 reflecting your "
     "confidence in the conclusion, never a claim of certainty.\n"
     "4. If there isn't enough information for a field, leave its list "
-    "empty or its value null - never fabricate content to fill it.\n\n"
+    "empty or its value null - never fabricate content to fill it.\n"
+    "5. An item labelled UNCONFIRMED_CANDIDATE is a hypothesis, NOT an "
+    "established fact. You may treat it as a clue or a possibility (in "
+    "opportunities or conclusions, worded as uncertain), but never put it in "
+    "relevant_facts, constraints or conflicts, and never state it as true.\n\n"
     "Respond with ONLY one JSON object, no prose, no markdown formatting, "
     "in exactly this shape:\n"
     '{"interpretation": "<string>", '
