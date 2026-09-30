@@ -13,3 +13,10 @@ vosk==0.3.45
 sounddevice==0.5.6
 numpy==2.5.3
 openwakeword==0.6.0
+
+# Computer Control (M17.1-A) - local Windows desktop observation/input
+# foundation, see app/computer/. PyAutoGUI drives mouse/keyboard/screen;
+# pywin32 reads active-window info. Both are free, local-only, and never
+# used with shell=True - see app/computer/windows_backend.py.
+pyautogui==0.9.54
+pywin32==312

@@ -88,10 +88,19 @@ class ToolParameter:
     """
 
     name: str
-    type: str  # e.g. "string", "number", "boolean", "object"
+    type: str  # e.g. "string", "number", "boolean", "object", "structured" (object or list)
     description: str = ""
     required: bool = True
     default: Any = None
+    #: Only meaningful for `type == "string"`. False (the default, fail-
+    #: closed): in an explicit tool command (app/tools/command.py) an
+    #: UNQUOTED value is exactly one whitespace-delimited token - anything
+    #: longer must be quoted, so trailing words/clauses can never be
+    #: silently absorbed into the value (an `open_url` URL must never
+    #: swallow ", wait for 5 seconds"). True: the value is prose (a task's
+    #: text, a search query), so an unquoted value may span every
+    #: remaining word of its step, up to the next step separator.
+    free_text: bool = False
 
 
 @dataclass
@@ -109,6 +118,13 @@ class ToolRequirements:
     network: bool = False
 
 
+class ToolArgumentError(ValueError):
+    """Raised by `Tool.validate_arguments` when an argument VALUE is
+    unacceptable (disallowed URL scheme, off-screen coordinate, ...) -
+    distinct from a schema/type problem, which the explicit-command layer
+    (app/tools/command.py) already checks against `Tool.parameters`."""
+
+
 class Tool(ABC):
     """A single capability Rhasspy can invoke.
 
@@ -119,6 +135,37 @@ class Tool(ABC):
 
     #: Tools with no external dependencies can leave this at the default.
     requirements: ToolRequirements = ToolRequirements()
+
+    #: True only for a tool whose arguments are genuinely prose that an AI
+    #: ToolCallProvider is allowed to extract (e.g. "remind me to stretch
+    #: in 10 minutes" -> text + due_in_minutes). Default False, fail-
+    #: closed: an explicit command (app/tools/command.py) resolves this
+    #: tool's arguments deterministically from `parameters` alone, and
+    #: anything it can't resolve is rejected - never handed to an LLM.
+    natural_language_arguments: bool = False
+
+    #: False for a tool that manages Jarvis's own autonomy machinery - Job
+    #: control (create/confirm/pause/resume/cancel) and automation
+    #: management. Such a tool stays fully usable from chat and by an
+    #: AutomationEngine the user configured, but M15's planner is never
+    #: offered it and `validate_plan` rejects a step naming it: a goal-
+    #: driven plan must not be able to approve its own confirmations,
+    #: spawn Jobs with a higher autonomy, or schedule further automation.
+    plannable: bool = True
+
+    #: True for a tool that records where its output came from. JobEngine
+    #: then adds `source_job_id`/`source_step_id` to the arguments it
+    #: executes the tool with - values only the engine knows and a plan
+    #: can never supply (they are not among the tool's declared
+    #: `parameters`, so plan validation rejects them). Outside a Job
+    #: (chat, an automation) they're simply absent.
+    wants_job_provenance: bool = False
+
+    #: True for a tool whose output is itself a user-facing answer (e.g.
+    #: `analyze`'s synthesis). When such a step succeeds in a Job, its output
+    #: leads the Job's final report even if later steps (save a note, set a
+    #: reminder) came after it - see app/orchestration/report.py.
+    produces_report: bool = False
 
     @property
     @abstractmethod
@@ -142,6 +189,14 @@ class Tool(ABC):
         Defaults to none; tools that take input override this.
         """
         return []
+
+    def validate_arguments(self, **kwargs: Any) -> None:
+        """Side-effect-free check of argument VALUES, called for every
+        step of an explicit tool sequence BEFORE any step executes (see
+        app/tools/command.py). Raise ToolArgumentError to reject. Must
+        never act on the world - at most read (e.g. a screen size).
+        Default: accept; `execute` remains free to validate again.
+        """
 
     @abstractmethod
     def execute(self, **kwargs: Any) -> ToolResult:

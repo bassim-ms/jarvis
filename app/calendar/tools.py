@@ -95,6 +95,10 @@ class CreateEventTool(Tool):
     name = "create_event"
     description = "Create a calendar event with a title and start/end time."
     permission = PermissionLevel.CONFIRM
+    #: Prose arguments ("remind me to stretch in 10 minutes"): the one kind
+    #: of tool an explicit command may hand to the AI ToolCallProvider (see
+    #: app/tools/command.py). Every other tool is resolved deterministically.
+    natural_language_arguments = True
 
     def __init__(self, provider: CalendarProvider):
         self.provider = provider
@@ -150,6 +154,10 @@ class UpdateEventTool(Tool):
     name = "update_event"
     description = "Update a calendar event's title/time/description/location, by its ID."
     permission = PermissionLevel.CONFIRM
+    #: Prose arguments ("remind me to stretch in 10 minutes"): the one kind
+    #: of tool an explicit command may hand to the AI ToolCallProvider (see
+    #: app/tools/command.py). Every other tool is resolved deterministically.
+    natural_language_arguments = True
 
     def __init__(self, provider: CalendarProvider):
         self.provider = provider

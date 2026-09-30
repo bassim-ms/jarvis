@@ -339,6 +339,76 @@ def test_original_invocation_pattern_still_takes_priority():
     assert decision == CapabilityDecision(capability=Capability.TOOL, tool_name="echo")
 
 
+# --- Explicit multi-step commands: the router only decides TOOL ------------------
+#
+# Which steps a "..., then ..." command contains, what their arguments are and
+# whether they are valid all depend on the tool registry, so that understanding
+# lives in app/tools/command.py (tests/test_tool_command.py), run by
+# JarvisCore._handle_tool. The registry-free router only says "TOOL" and names
+# the first tool.
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "use tool click_mouse 100 100, then use tool scroll 20",
+        "use tool click_mouse 100 100 and then use tool scroll 20",
+        "use tool click_mouse 100 100 followed by scroll 20",
+        "use tool click_mouse 100 100, then scroll 20",
+    ],
+)
+def test_a_multi_step_command_is_one_tool_decision_naming_the_first_tool(message):
+    decision = DeterministicCapabilityRouter().route(message)
+
+    assert decision == CapabilityDecision(capability=Capability.TOOL, tool_name="click_mouse")
+
+
+def test_the_router_no_longer_carries_a_pre_split_sequence():
+    """The regex sequence splitter (ToolInvocation / tool_invocations) is
+    gone: the ToolSequence built by the registry-aware planner is the only
+    source of truth for a multi-step command."""
+    import app.capability as capability_module
+
+    assert not hasattr(capability_module, "ToolInvocation")
+    assert not hasattr(capability_module, "_detect_tool_sequence")
+    assert not hasattr(CapabilityDecision(capability=Capability.TOOL), "tool_invocations")
+
+
+def test_a_comma_directly_after_the_tool_name_is_not_part_of_the_name():
+    """Regression: the old capture took the whole next word, so "use tool echo, then ..."
+    named a tool "echo," (comma included)."""
+    router = DeterministicCapabilityRouter()
+
+    assert router.route("use tool echo, then use tool ping").tool_name == "echo"
+    assert router.route("use tool echo, please").tool_name == "echo"
+    assert router.route("use the echo tool, then use the ping tool").tool_name == "echo"
+
+
+def test_a_first_step_that_names_nothing_is_tool_with_no_tool_name():
+    decision = DeterministicCapabilityRouter().route("use tool, then use tool ping")
+
+    assert decision == CapabilityDecision(capability=Capability.TOOL, tool_name=None)
+
+
+def test_prose_that_merely_contains_tool_and_then_is_not_routed_to_tool():
+    router = DeterministicCapabilityRouter()
+
+    assert router.route("my tool is great").capability is not Capability.TOOL
+    assert router.route("first use the drill, then the saw").capability is not Capability.TOOL
+
+
+def test_hybrid_router_does_not_call_the_ai_for_a_named_multi_step_command():
+    class FailingDecisionProvider(CapabilityDecisionProvider):
+        def decide(self, message: str) -> CapabilityDecision:
+            raise AssertionError("decision_provider should not have been called")
+
+    router = HybridCapabilityRouter(decision_provider=FailingDecisionProvider())
+
+    decision = router.route("use tool open_url https://luniti.app, then use tool scroll -600")
+
+    assert decision == CapabilityDecision(capability=Capability.TOOL, tool_name="open_url")
+
+
 # --- M6.14: TOOL false-positive protection --------------------------------------
 
 

@@ -137,6 +137,50 @@ def parse_autonomous_permissions(values: list[str] | None) -> frozenset[str]:
     return parsed
 
 
+#: Reserved `Job.context` key holding the Context Engine's relevant
+#: World Model context for the request that created the Job (a
+#: `dict[str, list[str]]`, see JarvisCore._snapshot_to_job_context). Kept
+#: under one distinctive key so it can't collide with a user fact and so
+#: JobEngine._refresh_context can carry it across a facts refresh.
+REQUEST_CONTEXT_KEY = "__request_context__"
+
+
+#: Reserved `Job.context` key holding the STRUCTURED OBJECTIVE Handle This
+#: (app/handle_this/) understood for the request that created the Job: the
+#: user's original words, an interpreted goal, the broad family of work, the
+#: constraints, success criteria and safe assumptions. It is DATA about what
+#: the user wants, handed to the planner so it can plan well - it names no
+#: tools and carries no permissions, and the planner's output is still
+#: validated exactly as before. Validated strictly when the Job is created
+#: (see CreateJobTool) and carried across a facts refresh like the request
+#: context above.
+OBJECTIVE_KEY = "__objective__"
+
+#: Reserved `Job.context` key recording which of a parked Job's resolved
+#: Handle This questions have already been folded into its objective:
+#: {"applied": [interaction ids]}. It makes the continuation that runs before
+#: planning idempotent across ticks and restarts. Internal bookkeeping - never
+#: shown to the planner.
+CLARIFICATION_STATE_KEY = "__clarification_state__"
+
+#: The error a gated step carries when the user said no / never answered.
+#: Shared so that "this Job failed because of the user's own decision" can be
+#: recognised (and not announced as a failure).
+DECLINED_STEP_ERROR = "Confirmation declined by user."
+EXPIRED_STEP_ERROR = "Confirmation expired - the step was not run."
+
+#: Key under which JobEngine hands the planner the user's answers to
+#: questions Jarvis asked about this Job (its resolved INPUT interactions,
+#: see app/orchestration/interactions.py) - a list of {"question", "answer"}.
+#: It exists only in the context dict passed to `Planner.plan`; it is never
+#: written into `Job.context`.
+CLARIFICATIONS_KEY = "__clarifications__"
+
+#: At most this many clarification answers are given to the planner, most
+#: recent kept (a Job may ask at most 2 questions; this is a hard ceiling).
+MAX_CLARIFICATIONS = 3
+
+
 class JobPriority(Enum):
     """A simple, fixed three-level priority - display/ordering only,
     mirrors app.tasks.base.TaskPriority's three values but is its own
@@ -194,6 +238,13 @@ class JobStatus(Enum):
     PENDING = "pending"
     PLANNING = "planning"
     AWAITING_CONFIRMATION = "awaiting_confirmation"
+    #: Waiting for the user to answer a question (an INPUT interaction, see
+    #: app/orchestration/interactions.py). Like AWAITING_CONFIRMATION it is a
+    #: derived VIEW of the Job's pending interactions, not a second state
+    #: machine. Defined now so the derived view has a name; nothing sets it
+    #: yet, and JobEngine (which only advances PENDING/PLANNING/RUNNING Jobs)
+    #: ignores a Job in this state.
+    AWAITING_INPUT = "awaiting_input"
     RUNNING = "running"
     PAUSED = "paused"
     FAILED = "failed"
@@ -225,6 +276,27 @@ class StepStatus(Enum):
 TERMINAL_STEP_STATUSES = frozenset(
     {StepStatus.SUCCEEDED, StepStatus.FAILED, StepStatus.SKIPPED}
 )
+
+
+#: Upper bound on a step's `expectation` text.
+MAX_EXPECTATION_CHARS = 300
+
+#: Bounds on a COMPLETED Job's user-facing `final_result` (see
+#: app/orchestration/report.py): the whole report, and each single-line
+#: "tool: output" outcome line within it.
+MAX_FINAL_RESULT_CHARS = 8000
+MAX_OUTCOME_LINE_CHARS = 300
+
+#: The only values a persisted step evaluation's "verdict" takes.
+#: SUFFICIENT - the result met the step's expectation; dependents may run.
+#: INSUFFICIENT - the evaluator (or the deterministic "nothing returned"
+#:   check) judged it did not; the step is treated as failed.
+#: UNAVAILABLE - no verdict could be obtained (provider outage, malformed
+#:   answer, no evaluator configured). Never treated as sufficient: the step
+#:   is treated as failed, exactly like INSUFFICIENT.
+EVALUATION_SUFFICIENT = "sufficient"
+EVALUATION_INSUFFICIENT = "insufficient"
+EVALUATION_UNAVAILABLE = "unavailable"
 
 
 @dataclass
@@ -266,6 +338,14 @@ class PlanStep:
     `result` is a small JSON-safe summary of the ToolResult the step
     produced (status/message/data), never the live ToolResult object -
     see app/orchestration/engine.py:_serialize_tool_result.
+
+    `expectation` is set only when the plan explicitly asks for this step's
+    result to be evaluated (validator: READ-permission tools only): a short
+    statement of what the result must contain. A step without one is never
+    evaluated. `evaluation` is the persisted verdict once one exists -
+    `{"verdict": "sufficient"|"insufficient"|"unavailable", "reason": str,
+    ...}` - so a restart never repeats an evaluation, and never runs a
+    dependent of a step whose verdict isn't "sufficient".
     """
 
     id: str
@@ -279,6 +359,8 @@ class PlanStep:
     confirmed: bool = False
     result: dict[str, Any] | None = None
     error: str | None = None
+    expectation: str | None = None
+    evaluation: dict[str, Any] | None = None
 
 
 @dataclass
@@ -352,6 +434,14 @@ class Job:
     `None` for a Job created without one (e.g. directly via a test, or a
     future non-chat entry point).
 
+    `version` is the optimistic-concurrency counter: the number of times this
+    Job's row has been saved, as of the moment the caller read it. It is
+    set by the store, never by callers - `JobStore.save` only applies a
+    write if the row still carries exactly this version, and bumps it on
+    success (also updating this object, so a holder that keeps saving the
+    same object keeps working). A holder whose copy is stale gets
+    `StaleJobError` instead of silently overwriting newer state.
+
     `autonomous_permissions` is the configurable boundary
     AutonomyLevel.AUTONOMOUS actually checks (see
     `parse_autonomous_permissions` above) - a genuine per-Job setting,
@@ -379,6 +469,16 @@ class Job:
     autonomous_permissions: frozenset[str] = field(
         default_factory=lambda: DEFAULT_AUTONOMOUS_PERMISSIONS
     )
+    version: int = 0
+
+
+class StaleJobError(RuntimeError):
+    """A Job could not be saved because its persisted state changed after
+    the caller read it (or it no longer exists) - the write was NOT
+    applied. Always a safe failure: nothing was overwritten. The caller's
+    copy is out of date; the right response is to abandon what it was
+    doing with that copy and re-read the Job, never to retry the same
+    write blindly."""
 
 
 class JobStore(ABC):
@@ -425,4 +525,12 @@ class JobStore(ABC):
         """Persist every mutable field of `job` (see class docstring).
         `job.updated_at` is set by the caller before calling this - the
         store never invents a timestamp on save, so JobEngine's own
-        event timestamps and `updated_at` always agree."""
+        event timestamps and `updated_at` always agree.
+
+        Versioned (compare-and-set): the write is applied only if the
+        persisted row's `version` still equals `job.version`, atomically;
+        on success the persisted version and `job.version` both advance by
+        one. Otherwise nothing is written and `StaleJobError` is raised -
+        including when the Job no longer exists. A stale writer therefore
+        can never overwrite newer state, whichever thread or process
+        produced it."""

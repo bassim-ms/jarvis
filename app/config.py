@@ -131,6 +131,11 @@ class Settings(BaseSettings):
     # of Reminders; no scheduling, no notifications, no external sync.
     tasks_db_path: str = "jarvis_tasks.db"
 
+    # Notes (findings Jarvis saves for the user, see app/notes/) - their own
+    # local SQLite file, deliberately separate from memory/facts and the
+    # World Model.
+    notes_db_path: str = "jarvis_notes.db"
+
     # Orchestration (M15 - goal-driven Jobs: plan -> validate -> execute
     # through the existing tool system, see app/orchestration/) - local
     # SQLite file, how often the background JobEngine polls active Jobs,
@@ -147,6 +152,39 @@ class Settings(BaseSettings):
     orchestration_retry_delay_seconds: float = 1.0
     orchestration_max_replans: int = 2
     orchestration_default_autonomy: str = "assisted"
+    # How long an interaction (a question or confirmation waiting on the
+    # user, see app/orchestration/interactions.py) stays open: 24 hours for a
+    # CONFIRMATION, 7 days for an INPUT. Seconds; configurable per
+    # deployment via JARVIS_ORCHESTRATION_*_TTL_SECONDS.
+    orchestration_confirmation_ttl_seconds: float = 86400.0
+    orchestration_input_ttl_seconds: float = 604800.0
+    # How recently an interaction must have been SURFACED to a conversation
+    # for a bare yes/no or a free-text answer there to resolve it (default 30
+    # minutes). Older ones need the explicit `answer <code>: ...` form.
+    orchestration_interaction_surface_window_seconds: float = 1800.0
+    # Show a desktop notification when a Job finishes (completed or failed).
+    # Optional and best-effort: it never affects the Job (see JobEngine).
+    orchestration_notify_on_completion: bool = True
+
+    # Notifications about waiting interactions (see app/notifications/ and
+    # app/orchestration/interaction_lifecycle.py). The first notification is
+    # immediate; reminders come `..._reminder_offsets_seconds` after the
+    # interaction was opened (comma-separated), then ONE final warning
+    # `..._final_warning_lead_seconds` before it expires, then a single
+    # expiry notice. Defaults: a confirmation (24h) at once, +2h, +6h, a
+    # warning ~20h in, expiry; an input (7d) at once, +1d, +3d, a warning
+    # ~6d in, expiry. `notifications_max_reminders_per_interaction` is a hard
+    # cap on reminders + the final warning, so nobody is notified forever.
+    orchestration_confirmation_reminder_offsets_seconds: str = "7200,21600"
+    orchestration_confirmation_final_warning_lead_seconds: float = 14400.0
+    orchestration_input_reminder_offsets_seconds: str = "86400,259200"
+    orchestration_input_final_warning_lead_seconds: float = 86400.0
+    notifications_max_reminders_per_interaction: int = 4
+    # Desktop toast channel: on/off, and the lowest priority it will show
+    # ("low", "normal" or "high"). Failures are HIGH, waiting/reminders NORMAL,
+    # a background Job finishing LOW.
+    notifications_desktop_enabled: bool = True
+    notifications_desktop_min_priority: str = "low"
 
     # Voice (hands-free wake-word + STT + TTS, see app/voice/) - $0/local
     # only: openWakeWord for wake-word detection, Vosk for STT, Windows

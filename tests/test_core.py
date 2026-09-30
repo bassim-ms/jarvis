@@ -982,7 +982,7 @@ class MessageEchoTool(Tool):
 
     @property
     def parameters(self) -> list[ToolParameter]:
-        return [ToolParameter(name="message", type="string")]
+        return [ToolParameter(name="message", type="string", free_text=True)]
 
     def execute(self, message: str = "") -> ToolResult:
         return ToolResult.success(data=message)
@@ -995,6 +995,9 @@ class AddNumbersTool(Tool):
     name = "add"
     description = "Adds two numbers."
     permission = PermissionLevel.READ
+    # Prose arguments ("add 2 and 3"): the one kind of tool an explicit
+    # command may hand to the AI ToolCallProvider.
+    natural_language_arguments = True
 
     @property
     def parameters(self) -> list[ToolParameter]:
@@ -1135,6 +1138,7 @@ def test_core_tool_dispatch_still_respects_permission_with_ai_constructed_parame
         name = "confirm_add"
         description = "Adds two numbers, but requires confirmation."
         permission = PermissionLevel.CONFIRM
+        natural_language_arguments = True
 
         @property
         def parameters(self):
@@ -1318,9 +1322,551 @@ def test_tool_path_never_builds_or_routes_requirements():
 
     assert reply == "hi"
     assert call_provider.call_count == 1
-    # TOOL never reaches self.provider at all (see app/core.py's module
-    # docstring) - no routing decision is ever recorded on the manager.
+    # An explicitly injected tool_call_builder (as here) never touches
+    # `manager` at all, so no routing decision is ever recorded on it.
+    # Since M17.1-E, Core's DEFAULT tool_call_builder does call through
+    # `manager` when one is injected as `provider` (see the fallback tests
+    # below) - but never with `requirements=`, so `last_routing_decision`
+    # stays None either way (see AIProviderManager.generate_reply).
     assert manager.last_routing_decision is None
+
+
+class FailableFakeProvider(AIProvider):
+    """Like the module's own FakeProvider, but scriptable with a queue of
+    errors to raise before it starts succeeding (mirrors
+    tests/test_ai_provider_manager.py's FakeProvider) - needed here to
+    simulate "gemini 429s, groq answers" sequences. Kept local to this
+    section rather than changing FakeProvider itself, which many other
+    tests in this file rely on for its exact simple (reply-only, no
+    errors) signature."""
+
+    def __init__(self, reply: str = "ok", errors: list[Exception] | None = None):
+        self.reply = reply
+        self._errors = list(errors) if errors is not None else []
+        self.calls = 0
+
+    def generate_reply(self, message: str) -> str:
+        self.calls += 1
+        if self._errors:
+            raise self._errors.pop(0)
+        return self.reply
+
+
+# --- M17.1-E: multi-provider fallback for tool-call construction ---------------
+#
+# Root cause of the M17.1-D live smoke-test bug: Core's default
+# tool_call_builder built its GeminiToolCallProvider around a fresh,
+# hardcoded GeminiProvider() - never `self.provider` - so a Gemini 429
+# during tool-call construction (any tool needing more than one required
+# parameter, e.g. a computer-control tool like `move_mouse`) had no
+# fallback at all, unlike DIRECT (which already routes through
+# AIProviderManager - see the M14 tests above). These tests exercise
+# Core's DEFAULT wiring (no `tool_call_builder=` override) with a real
+# AIProviderManager as `provider`, proving the fallback chain now covers
+# TOOL too, without weakening permission enforcement or retrying an
+# invalid tool call indefinitely.
+
+
+class AddNumbersToolRequiringConfirmation(Tool):
+    """Two required number parameters (forces AI-backed construction, like
+    AddNumbersTool above) AND a non-automatic permission - lets one test
+    exercise both the fallback path and permission enforcement at once."""
+
+    name = "add"
+    description = "Adds two numbers, but requires confirmation."
+    permission = PermissionLevel.CONFIRM
+    natural_language_arguments = True
+
+    @property
+    def parameters(self):
+        return [
+            ToolParameter(name="a", type="number"),
+            ToolParameter(name="b", type="number"),
+        ]
+
+    def execute(self, a: float = 0, b: float = 0) -> ToolResult:
+        return ToolResult.success(message="ran for real")
+
+
+def test_tool_path_falls_back_across_providers_on_gemini_429():
+    """The exact shape of the live bug: the first provider (gemini) 429s
+    constructing the tool call; Core's default tool_call_builder must fall
+    back to the next configured provider and still succeed, instead of
+    surfacing a ProviderError to the user."""
+    gemini = FailableFakeProvider(errors=[ProviderError("Gemini returned 429: quota exceeded")])
+    groq = FailableFakeProvider(reply='{"tool_name": "add", "parameters": {"a": 2, "b": 3}}')
+    manager = AIProviderManager(
+        [AIProviderEntry("gemini", gemini), AIProviderEntry("groq", groq)]
+    )
+    registry = ToolRegistry()
+    registry.register(AddNumbersTool())
+    jarvis = JarvisCore(
+        provider=manager,
+        memory=SQLiteMemoryStore(":memory:"),
+        tools=registry,
+        capability_router=FakeCapabilityRouter(Capability.TOOL, tool_name="add"),
+    )
+
+    reply, _, _ = jarvis.handle_chat("use tool add 2 and 3")
+
+    assert reply == "5"  # AddNumbersTool: a=2, b=3 -> 5, via the FALLBACK provider
+    assert gemini.calls == 1
+    assert groq.calls == 1
+
+
+def test_tool_path_all_providers_failing_raises_a_clear_error():
+    """No provider left to try must still be one clear, typed failure -
+    never an unbounded retry/fallback loop, and never a silent success."""
+    gemini = FailableFakeProvider(errors=[ProviderError("Gemini returned 429: quota exceeded")])
+    groq = FailableFakeProvider(errors=[ProviderError("Groq returned 503: overloaded")])
+    manager = AIProviderManager(
+        [AIProviderEntry("gemini", gemini), AIProviderEntry("groq", groq)],
+        retry_count=0,
+    )
+    registry = ToolRegistry()
+    registry.register(AddNumbersTool())
+    jarvis = JarvisCore(
+        provider=manager,
+        memory=SQLiteMemoryStore(":memory:"),
+        tools=registry,
+        capability_router=FakeCapabilityRouter(Capability.TOOL, tool_name="add"),
+    )
+
+    with pytest.raises(ProviderError, match="gemini"):
+        jarvis.handle_chat("use tool add 2 and 3")
+
+
+def test_tool_path_malformed_fallback_reply_is_a_clean_error_not_a_retry_loop():
+    """A fallback provider that answers but with garbage must fail the
+    request cleanly (ToolCallError -> ProviderError) - AIProviderManager
+    already returned successfully, so this is a validation failure, not a
+    provider failure, and must NEVER be retried against a third
+    provider."""
+    gemini = FailableFakeProvider(errors=[ProviderError("Gemini returned 429: quota exceeded")])
+    groq = FailableFakeProvider(reply="not json at all")
+    third = FailableFakeProvider(reply='{"tool_name": "add", "parameters": {"a": 1, "b": 1}}')
+    manager = AIProviderManager(
+        [
+            AIProviderEntry("gemini", gemini),
+            AIProviderEntry("groq", groq),
+            AIProviderEntry("third", third),
+        ]
+    )
+    registry = ToolRegistry()
+    registry.register(AddNumbersTool())
+    jarvis = JarvisCore(
+        provider=manager,
+        memory=SQLiteMemoryStore(":memory:"),
+        tools=registry,
+        capability_router=FakeCapabilityRouter(Capability.TOOL, tool_name="add"),
+    )
+
+    with pytest.raises(ProviderError, match="Invalid JSON"):
+        jarvis.handle_chat("use tool add 2 and 3")
+
+    assert gemini.calls == 1
+    assert groq.calls == 1
+    assert third.calls == 0  # never reached - no retry past validation failure
+
+
+def test_tool_path_permission_enforcement_is_authoritative_after_fallback():
+    """A CONFIRM-level tool still requires confirmation and is never
+    actually run, even when its parameters were constructed by the
+    FALLBACK provider (not the first-choice one) - fallback never grants
+    a tool extra permissions or bypasses ToolRegistry's own check."""
+    gemini = FailableFakeProvider(errors=[ProviderError("Gemini returned 429: quota exceeded")])
+    groq = FailableFakeProvider(reply='{"tool_name": "add", "parameters": {"a": 2, "b": 3}}')
+    manager = AIProviderManager(
+        [AIProviderEntry("gemini", gemini), AIProviderEntry("groq", groq)]
+    )
+    registry = ToolRegistry()
+    registry.register(AddNumbersToolRequiringConfirmation())
+    jarvis = JarvisCore(
+        provider=manager,
+        memory=SQLiteMemoryStore(":memory:"),
+        tools=registry,
+        capability_router=FakeCapabilityRouter(Capability.TOOL, tool_name="add"),
+    )
+
+    reply, _, _ = jarvis.handle_chat("use tool add 2 and 3")
+
+    assert "confirm" in reply.lower()
+    assert reply != "ran for real"  # the tool itself never actually ran
+    assert groq.calls == 1  # fallback did construct the call...
+    # ...but ToolRegistry.execute still gated it on confirmation, exactly
+    # as it does for the first-choice provider (see the pre-existing
+    # test_core_tool_dispatch_still_respects_permission_with_ai_constructed_parameters).
+
+
+def test_direct_path_still_falls_back_the_same_way_tool_now_does():
+    """Regression guard: DIRECT's pre-existing fallback behavior (M12/M14)
+    is completely unaffected by M17.1-E - it never went through
+    GeminiToolCallProvider and still doesn't."""
+    gemini = FailableFakeProvider(errors=[ProviderError("Gemini returned 429: quota exceeded")])
+    groq = FailableFakeProvider(reply="direct fallback reply")
+    manager = AIProviderManager(
+        [AIProviderEntry("gemini", gemini), AIProviderEntry("groq", groq)]
+    )
+    jarvis = JarvisCore(provider=manager, memory=SQLiteMemoryStore(":memory:"))
+
+    reply, _, _ = jarvis.handle_chat("hello there")
+
+    assert reply == "direct fallback reply"
+    assert gemini.calls == 1
+    assert groq.calls == 1
+
+
+# --- Explicit multi-tool sequence execution ------------------------------------
+#
+# These tests use JarvisCore's REAL (default) DeterministicCapabilityRouter and
+# the real ExplicitToolCommandPlanner (app/tools/command.py) - not
+# FakeCapabilityRouter - since the sequence is understood and validated from
+# the message itself; every other M6.14/M6.16 TOOL test in this file fixes
+# the decision directly because it isn't testing that. The parser's own edge
+# cases live in tests/test_tool_command.py, the /chat runtime path in
+# tests/test_tool_command_runtime.py.
+
+
+class PingTool(Tool):
+    """A third, distinct zero-parameter READ tool - proves a 3-step
+    sequence is generic across tools, not special-cased for 2."""
+
+    name = "ping"
+    description = "Returns pong."
+    permission = PermissionLevel.READ
+
+    def execute(self) -> ToolResult:
+        return ToolResult.success(message="pong")
+
+
+class RecordingTool(Tool):
+    """Zero-parameter READ tool that records every execution - used to
+    prove a step AFTER a stopped/rejected sequence never actually runs,
+    not merely that the reply text looks right."""
+
+    name = "record"
+    description = "Records that it ran."
+    permission = PermissionLevel.READ
+
+    def __init__(self):
+        self.runs = 0
+
+    def execute(self) -> ToolResult:
+        self.runs += 1
+        return ToolResult.success(message="recorded")
+
+
+class SubtractNumbersTool(Tool):
+    """Second AI-backed (two required number parameters) tool, distinct
+    from AddNumbersTool above - used to prove one step's clause never
+    leaks into another step's parameter construction."""
+
+    name = "subtract"
+    description = "Subtracts two numbers."
+    permission = PermissionLevel.READ
+    natural_language_arguments = True
+
+    @property
+    def parameters(self):
+        return [
+            ToolParameter(name="a", type="number"),
+            ToolParameter(name="b", type="number"),
+        ]
+
+    def execute(self, a: float = 0, b: float = 0) -> ToolResult:
+        return ToolResult.success(data=a - b)
+
+
+class RecordingToolCallProviderByName(ToolCallProvider):
+    """Records the EXACT message/candidate-tool-names of every `decide`
+    call (one per sequence step) and returns a fixed ToolCall looked up
+    by the offered tool's own name - lets a test assert precisely what
+    text each step's construction saw, proving no cross-step leakage."""
+
+    def __init__(self, results: dict[str, ToolCall]):
+        self.results = results
+        self.calls: list[tuple[str, list[str]]] = []
+
+    def decide(self, message: str, candidate_tools: list[Tool]) -> ToolCall:
+        self.calls.append((message, [t.name for t in candidate_tools]))
+        return self.results[candidate_tools[0].name]
+
+
+def make_sequence_core(tools: ToolRegistry, tool_call_builder=None) -> JarvisCore:
+    return JarvisCore(
+        provider=FakeProvider("unused"),
+        memory=SQLiteMemoryStore(":memory:"),
+        tools=tools,
+        tool_call_builder=tool_call_builder,
+    )
+
+
+def test_two_explicit_tools_execute_in_order():
+    registry = ToolRegistry()
+    registry.register(EchoTool())
+    registry.register(AddTool())
+    jarvis = make_sequence_core(registry)
+
+    reply, _, sources = jarvis.handle_chat("use tool echo, then use tool add")
+
+    assert reply == "1. echoed\n2. 42"
+    assert sources == []
+
+
+def test_three_explicit_tools_execute_in_order():
+    registry = ToolRegistry()
+    registry.register(EchoTool())
+    registry.register(AddTool())
+    registry.register(PingTool())
+    jarvis = make_sequence_core(registry)
+
+    reply, _, _ = jarvis.handle_chat(
+        "use tool echo, then use tool add, then use tool ping"
+    )
+
+    assert reply == "1. echoed\n2. 42\n3. pong"
+
+
+def test_a_sequence_with_an_unauthorized_step_is_rejected_and_nothing_executes():
+    """Each step is independently permission-checked (ToolRegistry's own
+    gate, via check_permission) BEFORE the first step runs: a CONFIRM-
+    gated step anywhere rejects the WHOLE sequence, so not even the
+    earlier, individually-permitted RecordingTool step executes."""
+    registry = ToolRegistry()
+    recorder = RecordingTool()
+    registry.register(recorder)
+    registry.register(ConfirmTool())
+    jarvis = make_sequence_core(registry)
+
+    reply, _, _ = jarvis.handle_chat(
+        "use tool record, then use tool confirm_me, then use tool record"
+    )
+
+    assert "Step 2 (confirm_me)" in reply
+    assert "requires confirmation" in reply
+    assert "Nothing was executed" in reply
+    assert recorder.runs == 0  # neither the first nor the third step ran
+
+
+def test_malformed_sequence_is_rejected_before_anything_executes():
+    """A trailing "...then use tool" with nothing named is malformed -
+    NOTHING in the sequence runs, not even the well-formed first step."""
+    registry = ToolRegistry()
+    recorder = RecordingTool()
+    registry.register(recorder)
+    jarvis = make_sequence_core(registry)
+
+    reply, _, _ = jarvis.handle_chat("use tool record, then use tool")
+
+    assert "step 2" in reply.lower()
+    assert recorder.runs == 0
+
+
+def test_a_sequence_naming_an_unregistered_tool_is_rejected_before_any_step_runs():
+    """An unknown tool anywhere in the sequence rejects the whole thing
+    at validation time - the well-formed steps around it never execute
+    (previously step 1 ran and only then was step 2 found to be unknown)."""
+    registry = ToolRegistry()
+    recorder = RecordingTool()
+    registry.register(recorder)
+    jarvis = make_sequence_core(registry)
+
+    reply, _, _ = jarvis.handle_chat(
+        "use tool record, then use tool nonexistent, then use tool record"
+    )
+
+    assert "Unknown tool: 'nonexistent'" in reply
+    assert "Nothing was executed" in reply
+    assert recorder.runs == 0
+
+
+def test_single_tool_call_behavior_is_unchanged_by_sequence_support():
+    """Regression guard: an ordinary single "use tool X" message (no
+    "then") behaves exactly as before sequence support existed."""
+    registry = ToolRegistry()
+    registry.register(EchoTool())
+    jarvis = make_sequence_core(registry)
+
+    reply, _, sources = jarvis.handle_chat("use tool echo")
+
+    assert reply == "echoed"
+    assert sources == []
+
+
+def test_sequence_steps_never_leak_arguments_into_each_other():
+    """The exact bug this fix closes: an AI-backed step's clause must be
+    ONLY that step's own wording - never the full message, and never
+    another step's clause. Uses two DISTINCT AI-backed (multi-required-
+    number-parameter) tools so a shared fixed ToolCall couldn't mask
+    leakage - each result is only correct if the right message reached
+    the right tool."""
+    registry = ToolRegistry()
+    registry.register(AddNumbersTool())
+    registry.register(SubtractNumbersTool())
+    call_provider = RecordingToolCallProviderByName(
+        {
+            "add": ToolCall(tool_name="add", parameters={"a": 1, "b": 2}),
+            "subtract": ToolCall(tool_name="subtract", parameters={"a": 9, "b": 3}),
+        }
+    )
+    jarvis = make_sequence_core(registry, tool_call_builder=ToolCallBuilder(call_provider))
+
+    reply, _, _ = jarvis.handle_chat("use tool add 1 2, then use tool subtract 9 3")
+
+    assert reply == "1. 3\n2. 6"
+    assert call_provider.calls == [
+        ("use tool add 1 2", ["add"]),
+        ("use tool subtract 9 3", ["subtract"]),
+    ]
+    # Neither call's message contains the OTHER step's own clause text.
+    assert "subtract" not in call_provider.calls[0][0]
+    assert "add 1 2" not in call_provider.calls[1][0]
+
+
+class SelectivelyFailingToolCallProvider(ToolCallProvider):
+    """Returns a fixed ToolCall for every tool EXCEPT `fails_for`, for
+    which it raises ToolCallError - simulates a genuine AI construction
+    failure (e.g. every configured provider 429ing/erroring) for exactly
+    one step, with no real provider or network call needed."""
+
+    def __init__(self, results: dict[str, ToolCall], fails_for: str):
+        self.results = results
+        self.fails_for = fails_for
+        self.calls: list[str] = []
+
+    def decide(self, message: str, candidate_tools: list[Tool]) -> ToolCall:
+        name = candidate_tools[0].name
+        self.calls.append(name)
+        if name == self.fails_for:
+            raise ToolCallError(
+                f"Failed to construct a tool call: All AI providers failed for '{name}'"
+            )
+        return self.results[name]
+
+
+def test_sequence_does_not_stop_after_the_first_successful_tool():
+    """Explicit regression guard for the exact defect class under
+    investigation: a SUCCESS result must never be treated as a reason to
+    stop the sequence - only a non-SUCCESS result or a construction
+    failure does."""
+    registry = ToolRegistry()
+    recorder = RecordingTool()
+    registry.register(recorder)
+    registry.register(PingTool())
+    jarvis = make_sequence_core(registry)
+
+    reply, _, _ = jarvis.handle_chat("use tool record, then use tool ping")
+
+    assert recorder.runs == 1
+    assert reply == "1. recorded\n2. pong"
+
+
+def test_the_second_tools_execute_method_is_actually_invoked():
+    """Direct proof the SECOND tool's own execute() runs - not merely
+    that ToolCallBuilder produced two ToolCall objects. RecordingTool
+    increments a real counter inside its own execute(), so this can only
+    pass if execution genuinely reached it."""
+    registry = ToolRegistry()
+    registry.register(PingTool())
+    recorder = RecordingTool()
+    registry.register(recorder)
+    jarvis = make_sequence_core(registry)
+
+    reply, _, _ = jarvis.handle_chat("use tool ping, then use tool record")
+
+    assert recorder.runs == 1
+    assert reply == "1. pong\n2. recorded"
+
+
+def test_first_step_execution_failure_stops_the_sequence_and_is_reported_normally():
+    """"If the first tool fails" (item 4): when it FAILS TO EXECUTE
+    cleanly (here, an unknown tool name - ToolRegistry's own existing
+    typed outcome), that's already a normal, safely-typed reply, never a
+    502 - and the sequence correctly stops before any later step runs."""
+    registry = ToolRegistry()
+    recorder = RecordingTool()
+    registry.register(recorder)
+    jarvis = make_sequence_core(registry)
+
+    reply, _, _ = jarvis.handle_chat("use tool nonexistent, then use tool record")
+
+    assert "Unknown tool: 'nonexistent'" in reply
+    assert recorder.runs == 0
+
+
+def test_first_step_construction_failure_still_raises_provider_error():
+    """"If the first tool fails" (item 4), the OTHER way it can fail:
+    tool-CALL CONSTRUCTION itself fails (e.g. every AI provider erroring)
+    on the very FIRST step. Documents and tests the INTENTIONAL current
+    behavior - nothing has executed yet, so this still raises
+    ProviderError exactly like a single-tool request already does; there
+    is no prior progress to lose (and, since construction is now phase 1 of
+    the whole sequence, there never is - see the test after this one)."""
+    registry = ToolRegistry()
+    registry.register(AddNumbersTool())
+    registry.register(SubtractNumbersTool())
+    call_provider = SelectivelyFailingToolCallProvider(
+        results={"subtract": ToolCall(tool_name="subtract", parameters={"a": 9, "b": 3})},
+        fails_for="add",
+    )
+    jarvis = make_sequence_core(registry, tool_call_builder=ToolCallBuilder(call_provider))
+
+    with pytest.raises(ProviderError):
+        jarvis.handle_chat("use tool add 1 2, then use tool subtract 9 3")
+
+    assert call_provider.calls == ["add"]  # subtract's step was never attempted
+
+
+def test_a_later_steps_construction_failure_now_prevents_every_earlier_step_from_running():
+    """Supersedes the M17.1-G behaviour. There, step 1 executed and a
+    later step's tool-call construction failure was reported alongside it
+    (to avoid a bare 502 hiding a completed side effect). Construction is
+    now PHASE 1 of the whole sequence: it fails before step 1 executes, so
+    the ProviderError convention (502) loses nothing - and, crucially, no
+    earlier step ever runs for a sequence that can't be completed."""
+
+    class RecordingAddTool(AddNumbersTool):
+        runs = 0
+
+        def execute(self, a: float = 0, b: float = 0) -> ToolResult:
+            type(self).runs += 1
+            return super().execute(a=a, b=b)
+
+    registry = ToolRegistry()
+    registry.register(RecordingAddTool())
+    registry.register(SubtractNumbersTool())
+    call_provider = SelectivelyFailingToolCallProvider(
+        results={"add": ToolCall(tool_name="add", parameters={"a": 1, "b": 2})},
+        fails_for="subtract",
+    )
+    jarvis = make_sequence_core(registry, tool_call_builder=ToolCallBuilder(call_provider))
+
+    with pytest.raises(ProviderError):
+        jarvis.handle_chat("use tool add 1 2, then use tool subtract 9 3")
+
+    assert call_provider.calls == ["add", "subtract"]  # both were constructed...
+    assert RecordingAddTool.runs == 0  # ...but nothing executed
+
+
+def test_computer_tools_remain_unreachable_from_m15_even_as_sequence_step_names():
+    """A sequence naming tools that only exist on core.computer_tools must
+    still be "Unknown tool" through core.tools/JobEngine's own registry -
+    M17.1-F adds no new path into M15's tool candidate pool."""
+    from app.computer.defaults import create_computer_tools_registry
+
+    core_tools = ToolRegistry()  # the same shape as M15's real core.tools
+    jarvis = make_sequence_core(core_tools)
+    computer_tools = create_computer_tools_registry()
+
+    assert core_tools.has("move_mouse") is False
+    assert core_tools.has("click_mouse") is False
+    assert computer_tools.has("move_mouse") is True
+
+    reply, _, _ = jarvis.handle_chat(
+        "use tool move_mouse 1 1, then use tool click_mouse 1 1"
+    )
+
+    assert "Unknown tool: 'move_mouse'" in reply
 
 
 def test_search_path_routes_through_the_manager_via_gemini_search_answer_generator():

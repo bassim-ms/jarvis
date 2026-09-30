@@ -36,6 +36,7 @@ from app.orchestration.base import (
     Plan,
     PlanStep,
     RetryPolicy,
+    StaleJobError,
     StepStatus,
     parse_autonomous_permissions,
 )
@@ -61,6 +62,8 @@ def _step_to_dict(step: PlanStep) -> dict[str, Any]:
         "confirmed": step.confirmed,
         "result": step.result,
         "error": step.error,
+        "expectation": step.expectation,
+        "evaluation": step.evaluation,
     }
 
 
@@ -81,6 +84,8 @@ def _step_from_dict(data: dict[str, Any]) -> PlanStep:
         confirmed=data.get("confirmed", False),
         result=data.get("result"),
         error=data.get("error"),
+        expectation=data.get("expectation"),
+        evaluation=data.get("evaluation"),
     )
 
 
@@ -125,6 +130,19 @@ class SQLiteJobStore(JobStore):
         self._conn.row_factory = sqlite3.Row
         self._init_schema()
 
+    @property
+    def connection(self) -> sqlite3.Connection:
+        """The store's one connection - shared with co-located stores in the
+        same database file (SQLiteInteractionStore) so a later stage can
+        change a Job and an interaction in a single transaction."""
+        return self._conn
+
+    @property
+    def lock(self) -> threading.Lock:
+        """The lock guarding `connection`; any store using the connection
+        must hold it for the duration of each operation."""
+        return self._lock
+
     def _init_schema(self) -> None:
         with self._lock:
             self._conn.executescript(
@@ -147,13 +165,15 @@ class SQLiteJobStore(JobStore):
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     conversation_id TEXT,
-                    autonomous_permissions TEXT NOT NULL DEFAULT '[]'
+                    autonomous_permissions TEXT NOT NULL DEFAULT '[]',
+                    version INTEGER NOT NULL DEFAULT 0
                 );
                 """
             )
             self._conn.commit()
             self._migrate_add_column("conversation_id", "TEXT")
             self._migrate_add_column("autonomous_permissions", "TEXT NOT NULL DEFAULT '[]'")
+            self._migrate_add_column("version", "INTEGER NOT NULL DEFAULT 0")
 
     def _migrate_add_column(self, name: str, ddl_type: str) -> None:
         """Add a column to an already-existing `jobs` table from before it
@@ -181,11 +201,35 @@ class SQLiteJobStore(JobStore):
         conversation_id: str | None = None,
         autonomous_permissions: frozenset[str] | None = None,
     ) -> Job:
+        job = self.build_job(
+            goal, priority, autonomy, context, conversation_id, autonomous_permissions
+        )
+        with self._lock:
+            self.insert_job_locked(self._conn, job)
+            self._conn.commit()
+        return job
+
+    # -- lock-free construction/insert, for creating a Job together with another
+    # row in ONE transaction (see SQLiteInteractionStore.create_job_awaiting_input)
+
+    @staticmethod
+    def build_job(
+        goal: str,
+        priority: JobPriority = JobPriority.MEDIUM,
+        autonomy: AutonomyLevel = AutonomyLevel.ASSISTED,
+        context: dict[str, Any] | None = None,
+        conversation_id: str | None = None,
+        autonomous_permissions: frozenset[str] | None = None,
+        status: JobStatus = JobStatus.PENDING,
+    ) -> Job:
+        """A new in-memory Job (nothing persisted). `create` always passes the
+        default PENDING; only an operation that inserts the Job in the same
+        transaction as the row that makes it wait may pass another status."""
         now = _now()
-        job = Job(
+        return Job(
             id=str(uuid.uuid4()),
             goal=goal,
-            status=JobStatus.PENDING,
+            status=status,
             priority=priority,
             autonomy=autonomy,
             created_at=now,
@@ -196,39 +240,41 @@ class SQLiteJobStore(JobStore):
                 list(autonomous_permissions) if autonomous_permissions is not None else None
             ),
         )
-        with self._lock:
-            self._conn.execute(
-                """
-                INSERT INTO jobs (
-                    id, goal, status, priority, autonomy, plan, context,
-                    replan_count, total_step_count, pending_step_ids,
-                    confirmation_message, final_result, error, events,
-                    created_at, updated_at, conversation_id, autonomous_permissions
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    job.id,
-                    job.goal,
-                    job.status.value,
-                    job.priority.value,
-                    job.autonomy.value,
-                    _plan_to_json(job.plan),
-                    json.dumps(job.context),
-                    job.replan_count,
-                    job.total_step_count,
-                    json.dumps(job.pending_step_ids),
-                    job.confirmation_message,
-                    job.final_result,
-                    job.error,
-                    json.dumps([]),
-                    job.created_at,
-                    job.updated_at,
-                    job.conversation_id,
-                    json.dumps(sorted(job.autonomous_permissions)),
-                ),
-            )
-            self._conn.commit()
-        return job
+
+    @staticmethod
+    def insert_job_locked(conn: sqlite3.Connection, job: Job) -> None:
+        """INSERT a new Job row WITHOUT committing. The caller must hold the
+        store's lock and commit on success."""
+        conn.execute(
+            """
+            INSERT INTO jobs (
+                id, goal, status, priority, autonomy, plan, context,
+                replan_count, total_step_count, pending_step_ids,
+                confirmation_message, final_result, error, events,
+                created_at, updated_at, conversation_id, autonomous_permissions
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                job.id,
+                job.goal,
+                job.status.value,
+                job.priority.value,
+                job.autonomy.value,
+                _plan_to_json(job.plan),
+                json.dumps(job.context),
+                job.replan_count,
+                job.total_step_count,
+                json.dumps(job.pending_step_ids),
+                job.confirmation_message,
+                job.final_result,
+                job.error,
+                json.dumps([_event_to_dict(e) for e in job.events]),
+                job.created_at,
+                job.updated_at,
+                job.conversation_id,
+                json.dumps(sorted(job.autonomous_permissions)),
+            ),
+        )
 
     def get(self, job_id: str) -> Job | None:
         with self._lock:
@@ -251,34 +297,77 @@ class SQLiteJobStore(JobStore):
         return [self._row_to_job(row) for row in rows]
 
     def save(self, job: Job) -> None:
+        """Compare-and-set: one atomic UPDATE guarded by `version = ?`.
+        Zero rows changed means the row is gone or someone saved it since
+        the caller read it - nothing was written, StaleJobError is raised
+        and `job.version` is left exactly as it was."""
         with self._lock:
-            self._conn.execute(
-                """
-                UPDATE jobs SET
-                    status = ?, priority = ?, autonomy = ?, plan = ?,
-                    context = ?, replan_count = ?, total_step_count = ?,
-                    pending_step_ids = ?, confirmation_message = ?,
-                    final_result = ?, error = ?, events = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (
-                    job.status.value,
-                    job.priority.value,
-                    job.autonomy.value,
-                    _plan_to_json(job.plan),
-                    json.dumps(job.context),
-                    job.replan_count,
-                    job.total_step_count,
-                    json.dumps(job.pending_step_ids),
-                    job.confirmation_message,
-                    job.final_result,
-                    job.error,
-                    json.dumps([_event_to_dict(e) for e in job.events]),
-                    job.updated_at,
-                    job.id,
-                ),
-            )
+            self.write_job_locked(self._conn, job)
             self._conn.commit()
+            job.version += 1
+
+    # -- lock-free building blocks -------------------------------------------------------
+    #
+    # For an operation that must change a Job AND another table in ONE
+    # transaction (see SQLiteInteractionStore.transition_with_job). The plain
+    # `threading.Lock` is not re-entrant, so such an operation takes
+    # `self.lock` ONCE, itself, and calls these directly on `self.connection`
+    # instead of going through `get`/`save` (which would try to take the lock
+    # again and deadlock). Neither helper takes the lock, commits, or bumps
+    # `job.version` - the caller does those, after the whole transaction has
+    # succeeded.
+
+    @staticmethod
+    def load_job_locked(conn: sqlite3.Connection, job_id: str) -> Job | None:
+        """Read a Job on `conn`. The caller must hold the store's lock."""
+        row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        return SQLiteJobStore._row_to_job(row) if row else None
+
+    @staticmethod
+    def write_job_locked(conn: sqlite3.Connection, job: Job) -> None:
+        """The guarded (`version = ?`) Job UPDATE, WITHOUT committing. If it
+        matches no row the whole open transaction is rolled back and
+        StaleJobError raised, so anything written earlier in the same
+        transaction is undone too. The caller must hold the store's lock,
+        commit on success, and advance `job.version` after the commit."""
+        cursor = conn.execute(
+            """
+            UPDATE jobs SET
+                status = ?, priority = ?, autonomy = ?, plan = ?,
+                context = ?, replan_count = ?, total_step_count = ?,
+                pending_step_ids = ?, confirmation_message = ?,
+                final_result = ?, error = ?, events = ?, updated_at = ?,
+                version = ?
+            WHERE id = ? AND version = ?
+            """,
+            (
+                job.status.value,
+                job.priority.value,
+                job.autonomy.value,
+                _plan_to_json(job.plan),
+                json.dumps(job.context),
+                job.replan_count,
+                job.total_step_count,
+                json.dumps(job.pending_step_ids),
+                job.confirmation_message,
+                job.final_result,
+                job.error,
+                json.dumps([_event_to_dict(e) for e in job.events]),
+                job.updated_at,
+                job.version + 1,
+                job.id,
+                job.version,
+            ),
+        )
+        if cursor.rowcount == 0:
+            conn.rollback()
+            current = conn.execute("SELECT version FROM jobs WHERE id = ?", (job.id,)).fetchone()
+            if current is None:
+                raise StaleJobError(f"Job '{job.id}' no longer exists; nothing was saved.")
+            raise StaleJobError(
+                f"Job '{job.id}' changed since it was read (read version "
+                f"{job.version}, current version {current['version']}); nothing was saved."
+            )
 
     @staticmethod
     def _row_to_job(row: sqlite3.Row) -> Job:
@@ -303,4 +392,5 @@ class SQLiteJobStore(JobStore):
             autonomous_permissions=frozenset(
                 json.loads(row["autonomous_permissions"] or "[]")
             ),
+            version=row["version"],
         )

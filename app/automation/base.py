@@ -46,6 +46,17 @@ from app.reminders.base import Recurrence
 from app.tools.decision import ToolCall
 
 
+#: Tools that must NEVER run as an automation's action, however the
+#: automation came to exist: they answer a question or confirmation a Job is
+#: waiting on the USER for. An unattended trigger approving (or declining)
+#: something on the user's behalf would defeat the confirmation. Checked when
+#: an automation is created (CreateAutomationTool) AND again when one runs
+#: (AutomationEngine), so a stored automation can't get around it. Interaction
+#: replies themselves are not tools at all - they only arrive through the chat
+#: resolver - so this list is the whole boundary on the tool side.
+FORBIDDEN_ACTION_TOOL_NAMES: frozenset[str] = frozenset({"confirm_job"})
+
+
 class AutomationStatus(Enum):
     """Lifecycle state of an Automation.
 

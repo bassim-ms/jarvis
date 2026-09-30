@@ -55,6 +55,32 @@ class ToolRegistry:
         """Return all registered tools."""
         return list(self._tools.values())
 
+    def check_permission(
+        self, name: str, confirmed: bool | None = None
+    ) -> ToolResult | None:
+        """The permission gate `execute` applies, without running anything.
+
+        Returns None when `name` WOULD run right now, otherwise the exact
+        blocking ToolResult `execute` would return (unknown tool,
+        CONFIRMATION_REQUIRED, or DENIED). Lets a caller pre-flight every
+        step of a multi-step request before executing the first one -
+        `execute` itself calls this, so there is one definition of the
+        rule, not two.
+        """
+        tool = self.get(name)
+        if tool is None:
+            return ToolResult.error(f"Unknown tool: '{name}'")
+
+        if tool.permission not in AUTOMATIC_PERMISSIONS:
+            if confirmed is None:
+                return ToolResult.confirmation_required(
+                    tool.permission,
+                    message=f"Tool '{name}' requires confirmation before running.",
+                )
+            if confirmed is False:
+                return ToolResult.denied(f"Execution of '{name}' was denied.")
+        return None
+
     def execute(
         self,
         name: str,
@@ -77,19 +103,11 @@ class ToolRegistry:
         both reported as ToolResult errors rather than propagating, so a
         single misbehaving tool can't crash the caller.
         """
+        blocked = self.check_permission(name, confirmed)
+        if blocked is not None:
+            return blocked
+
         tool = self.get(name)
-        if tool is None:
-            return ToolResult.error(f"Unknown tool: '{name}'")
-
-        if tool.permission not in AUTOMATIC_PERMISSIONS:
-            if confirmed is None:
-                return ToolResult.confirmation_required(
-                    tool.permission,
-                    message=f"Tool '{name}' requires confirmation before running.",
-                )
-            if confirmed is False:
-                return ToolResult.denied(f"Execution of '{name}' was denied.")
-
         try:
             return tool.execute(**(params or {}))
         except Exception as exc:  # noqa: BLE001 - isolate tool failures

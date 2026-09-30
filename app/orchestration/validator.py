@@ -20,8 +20,13 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from app.orchestration.base import PlanStep, RetryPolicy, StepStatus
-from app.tools.base import Tool
+from app.orchestration.base import MAX_EXPECTATION_CHARS, PlanStep, RetryPolicy, StepStatus
+from app.orchestration.references import (
+    ReferenceError,
+    looks_like_reference,
+    validate_reference,
+)
+from app.tools.base import PermissionLevel, Tool
 from app.tools.registry import ToolRegistry
 
 #: A plan-local step id must be a simple token - never used as anything
@@ -46,6 +51,7 @@ _TYPE_CHECKS: dict[str, type | tuple[type, ...]] = {
     "number": (int, float),
     "boolean": bool,
     "object": dict,
+    "structured": (dict, list),  # any JSON object or list
 }
 
 
@@ -65,7 +71,17 @@ def _matches_type(value: Any, declared_type: str) -> bool:
     return isinstance(value, expected)
 
 
-def _validate_arguments(tool: Tool, tool_name: str, arguments: dict[str, Any]) -> None:
+def _validate_arguments(
+    tool: Tool,
+    tool_name: str,
+    arguments: dict[str, Any],
+    *,
+    deferred: frozenset[str] = frozenset(),
+) -> None:
+    """`deferred` names arguments whose value is a step reference: their
+    presence counts (a required parameter given by a reference is
+    supplied), but their TYPE can only be checked once the reference is
+    resolved at execution time - see `validate_resolved_arguments`."""
     declared = {p.name: p for p in tool.parameters}
 
     unexpected = set(arguments) - set(declared)
@@ -85,12 +101,22 @@ def _validate_arguments(tool: Tool, tool_name: str, arguments: dict[str, Any]) -
         )
 
     for name, value in arguments.items():
+        if name in deferred:
+            continue
         param = declared[name]
         if not _matches_type(value, param.type):
             raise PlanValidationError(
                 f"Argument '{name}' for tool '{tool_name}' must be of type "
                 f"'{param.type}', got: {value!r}"
             )
+
+
+def validate_resolved_arguments(tool: Tool, tool_name: str, arguments: dict[str, Any]) -> None:
+    """The full argument check (unexpected/missing/type) applied to a
+    step's arguments AFTER every reference in them was resolved - the
+    second half of the validation a reference-carrying step could only
+    partly get at plan time. Raises PlanValidationError."""
+    _validate_arguments(tool, tool_name, arguments)
 
 
 def _parse_retry_policy(raw_step: dict[str, Any], tool_name: str, default: RetryPolicy) -> RetryPolicy:
@@ -213,12 +239,40 @@ def validate_plan(
         if step_id in depends_on:
             raise PlanValidationError(f"Step '{step_id}' cannot depend on itself.")
 
+        for arg_name, arg_value in arguments.items():
+            if not looks_like_reference(arg_value):
+                continue
+            try:
+                from_step, _segments = validate_reference(arg_value)
+            except ReferenceError as exc:
+                raise PlanValidationError(
+                    f"Step '{step_id}' argument '{arg_name}': {exc}."
+                ) from exc
+            if from_step not in depends_on:
+                raise PlanValidationError(
+                    f"Step '{step_id}' argument '{arg_name}' references step "
+                    f"'{from_step}', which must be listed in its depends_on."
+                )
+
+        expectation = raw_step.get("expectation")
+        if expectation is not None:
+            if not isinstance(expectation, str) or not expectation.strip():
+                raise PlanValidationError(
+                    f"Step '{step_id}' expectation must be a non-empty string."
+                )
+            if len(expectation) > MAX_EXPECTATION_CHARS:
+                raise PlanValidationError(
+                    f"Step '{step_id}' expectation is longer than {MAX_EXPECTATION_CHARS} characters."
+                )
+            expectation = expectation.strip()
+
         parsed.append(
             {
                 "id": step_id,
                 "tool": tool_name,
                 "arguments": arguments,
                 "depends_on": depends_on,
+                "expectation": expectation,
                 "raw": raw_step,
             }
         )
@@ -238,8 +292,28 @@ def validate_plan(
             raise PlanValidationError(
                 f"Step '{entry['id']}' refers to an unavailable tool: '{entry['tool']}'."
             )
-        _validate_arguments(tool, entry["tool"], entry["arguments"])
+        if not tool.plannable:
+            raise PlanValidationError(
+                f"Step '{entry['id']}' names tool '{entry['tool']}', which manages "
+                "Jarvis itself and cannot be used in a plan."
+            )
+        _validate_arguments(
+            tool,
+            entry["tool"],
+            entry["arguments"],
+            deferred=frozenset(
+                name for name, value in entry["arguments"].items() if looks_like_reference(value)
+            ),
+        )
         retry_policy = _parse_retry_policy(entry["raw"], entry["tool"], default_retry)
+        if entry["expectation"] is not None and tool.permission is not PermissionLevel.READ:
+            # An insufficient verdict fails the step and can lead a replan to
+            # do it again differently; that must never mean repeating a
+            # side effect, so only read-only steps can be evaluated.
+            raise PlanValidationError(
+                f"Step '{entry['id']}' has an expectation, but tool '{entry['tool']}' is not "
+                "read-only - only read-only steps can be evaluated."
+            )
 
         steps.append(
             PlanStep(
@@ -250,6 +324,7 @@ def validate_plan(
                 permission=tool.permission.value,
                 retry_policy=retry_policy,
                 status=StepStatus.PENDING,
+                expectation=entry["expectation"],
             )
         )
 

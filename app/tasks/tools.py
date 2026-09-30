@@ -45,7 +45,9 @@ class CreateTaskTool(Tool):
     @property
     def parameters(self) -> list[ToolParameter]:
         return [
-            ToolParameter(name="text", type="string", description="What the task is"),
+            ToolParameter(
+                name="text", type="string", description="What the task is", free_text=True
+            ),
             ToolParameter(
                 name="priority",
                 type="string",

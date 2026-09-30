@@ -35,6 +35,10 @@ from app.memory.base import MemoryStore
 from app.memory.sqlite_store import SQLiteMemoryStore
 from app.orchestration.base import JobStore
 from app.orchestration.factory import create_default_job_store
+from app.providers.base import AIProvider
+from app.notes.base import NoteStore
+from app.notes.factory import create_default_note_store
+from app.notes.tools import ListNotesTool, SaveNoteTool
 from app.orchestration.tools import (
     CancelJobTool,
     ConfirmJobTool,
@@ -61,7 +65,9 @@ from app.search.quality import ResultQualityProvider
 from app.tasks.base import TaskStore
 from app.tasks.factory import create_default_task_store
 from app.tasks.tools import CancelTaskTool, CompleteTaskTool, CreateTaskTool, ListTasksTool
+from app.tools.analyze import AnalyzeTool
 from app.tools.registry import ToolRegistry
+from app.orchestration.interactions import InteractionStore
 from app.tools.web_search import WebSearchTool
 
 
@@ -73,6 +79,9 @@ def register_default_tools(
     calendar_provider: CalendarProvider | None = None,
     task_store: TaskStore | None = None,
     job_store: JobStore | None = None,
+    note_store: NoteStore | None = None,
+    analysis_provider: AIProvider | None = None,
+    interaction_store: InteractionStore | None = None,
 ) -> AutomationEngine:
     """Register every tool Rhasspy ships with by default onto `registry`,
     and return the AutomationEngine built alongside the automation tools
@@ -183,13 +192,30 @@ def register_default_tools(
     registry.register(CancelTaskTool(store=task_store))
 
     job_store = job_store or create_default_job_store(settings.orchestration_db_path)
-    registry.register(CreateJobTool(store=job_store, context_provider=memory.get_facts))
+    registry.register(
+        CreateJobTool(
+            store=job_store, context_provider=memory.get_facts, interactions=interaction_store
+        )
+    )
     registry.register(ListJobsTool(store=job_store))
     registry.register(GetJobTool(store=job_store))
     registry.register(ConfirmJobTool(store=job_store))
     registry.register(PauseJobTool(store=job_store))
     registry.register(ResumeJobTool(store=job_store))
-    registry.register(CancelJobTool(store=job_store))
+    # With an interaction store, cancelling a Job also withdraws its pending
+    # interactions in the same transaction.
+    registry.register(CancelJobTool(store=job_store, interactions=interaction_store))
+
+    # Notes (their own store, separate from memory/facts and the World
+    # Model - see app/notes/base.py): save_note is SAFE_ACTION, list_notes
+    # READ. `analyze` is registered only when an AIProvider is supplied
+    # (app/main.py passes core.provider): it is READ, text-only, and holds
+    # nothing but that provider - see app/tools/analyze.py.
+    note_store = note_store or create_default_note_store(settings.notes_db_path)
+    registry.register(SaveNoteTool(store=note_store))
+    registry.register(ListNotesTool(store=note_store))
+    if analysis_provider is not None:
+        registry.register(AnalyzeTool(provider=analysis_provider))
 
     return engine
 

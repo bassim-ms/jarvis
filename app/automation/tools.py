@@ -25,6 +25,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from app.automation.base import (
+    FORBIDDEN_ACTION_TOOL_NAMES,
     Automation,
     AutomationStatus,
     AutomationStore,
@@ -93,6 +94,11 @@ class CreateAutomationTool(Tool):
         "manually), optionally gated by a basic condition."
     )
     permission = PermissionLevel.SAFE_ACTION
+    plannable = False  # Jarvis-control tool: never offered to / accepted from a plan
+    #: Prose arguments ("remind me to stretch in 10 minutes"): the one kind
+    #: of tool an explicit command may hand to the AI ToolCallProvider (see
+    #: app/tools/command.py). Every other tool is resolved deterministically.
+    natural_language_arguments = True
 
     def __init__(
         self, store: AutomationStore, tools: ToolRegistry, reminder_store: ReminderStore
@@ -209,6 +215,11 @@ class CreateAutomationTool(Tool):
         action_tool = self.tools.get(action_tool_name)
         if action_tool is None:
             return ToolResult.error(f"Unknown tool: '{action_tool_name}'")
+        if action_tool_name in FORBIDDEN_ACTION_TOOL_NAMES:
+            return ToolResult.error(
+                f"Tool '{action_tool_name}' answers a confirmation on your behalf "
+                "and can't be used as an automation's action."
+            )
         if action_tool_name in _AUTOMATION_TOOL_NAMES:
             return ToolResult.error(
                 f"Tool '{action_tool_name}' manages automations itself and "
@@ -327,6 +338,7 @@ class EnableAutomationTool(Tool):
     name = "enable_automation"
     description = "Enable (un-pause) an automation, by its ID."
     permission = PermissionLevel.SAFE_ACTION
+    plannable = False  # Jarvis-control tool: never offered to / accepted from a plan
 
     def __init__(self, store: AutomationStore):
         self.store = store
@@ -354,6 +366,7 @@ class DisableAutomationTool(Tool):
     name = "disable_automation"
     description = "Disable (pause) an automation, by its ID."
     permission = PermissionLevel.SAFE_ACTION
+    plannable = False  # Jarvis-control tool: never offered to / accepted from a plan
 
     def __init__(self, store: AutomationStore):
         self.store = store
@@ -381,6 +394,7 @@ class CancelAutomationTool(Tool):
     name = "cancel_automation"
     description = "Cancel an automation, by its ID."
     permission = PermissionLevel.SAFE_ACTION
+    plannable = False  # Jarvis-control tool: never offered to / accepted from a plan
 
     def __init__(self, store: AutomationStore):
         self.store = store
@@ -414,6 +428,7 @@ class RunAutomationTool(Tool):
     name = "run_automation"
     description = "Run an automation immediately, regardless of its schedule."
     permission = PermissionLevel.SAFE_ACTION
+    plannable = False  # Jarvis-control tool: never offered to / accepted from a plan
 
     def __init__(self, engine: AutomationEngine):
         self.engine = engine

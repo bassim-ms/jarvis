@@ -57,12 +57,39 @@ generate_reply directly - this is what lets M13's ProviderRouter actually
 pick an initial provider for real DIRECT requests. It's a no-op whenever
 `self.provider` isn't an AIProviderManager (a directly-injected
 AIProvider, every existing test fake, ...) - see call_with_requirements's
-own docstring. TOOL never reaches an AI provider through `self.provider`
-at all (tool-call construction, when needed, goes through its own
-deliberately Gemini-pinned ToolCallProvider - see app/tools/decision.py),
-so there's nothing to route there; SEARCH's routing lives in
-GeminiSearchAnswerGenerator instead (app/search/answer.py), since that's
-where the actual provider call happens.
+own docstring. SEARCH's routing lives in GeminiSearchAnswerGenerator
+instead (app/search/answer.py), since that's where the actual provider
+call happens.
+
+Until M17.1-E, TOOL never reached an AI provider through `self.provider`
+at all: tool-call construction, when needed, went through its own
+GeminiToolCallProvider (app/tools/decision.py) built around a hardcoded
+`GeminiProvider()` - a real gap, not a deliberate exclusion from routing:
+a live smoke test found that a Gemini 429 during tool-call construction
+(e.g. a computer-control tool needing more than one parameter, like
+`move_mouse`'s x/y) surfaced straight to the user instead of falling back
+to Groq/OpenRouter/Cloudflare/FreeLLMAPI the way DIRECT already does.
+M17.1-E fixes this the same way M14 wired DIRECT: Core's default
+`tool_call_builder` now builds its GeminiToolCallProvider around
+`self.provider` itself (see `__init__` below) instead of a fresh
+`GeminiProvider()`, so when `self.provider` is the real
+AIProviderManager, `GeminiToolCallProvider.decide`'s call to
+`self.provider.generate_reply(prompt)` gets the SAME ordered
+retry/cooldown/fallback behavior AIProviderManager.generate_reply already
+implements (app/providers/manager.py) - no new routing/retry/fallback
+logic anywhere, and no `requirements=`/ProviderRouter involvement (tool
+calls still don't build a RequestRequirements), just a plain
+multi-provider `generate_reply` call, exactly like every pre-M13 caller
+already gets. `GeminiToolCallProvider`'s own strict JSON/schema
+validation is completely unchanged and still runs only once, against
+whichever provider ultimately answered - an invalid/malformed reply from
+that provider is never retried, only a provider-level ProviderError
+(429/5xx/timeout/etc, classified exactly as before) triggers a fallback
+to the next provider in the SAME configured order. Tool-call construction
+still never sees a tool's permission level, and ToolRegistry.execute
+still independently enforces it after the ToolCall comes back - which
+provider's text happened to answer the prompt changes nothing about
+permission enforcement or which tools were ever offered as candidates.
 
 Since M15, TASK is a fourth capability (app/capability.py) alongside
 DIRECT/SEARCH/TOOL: `_handle_task` dispatches to the existing
@@ -124,6 +151,18 @@ API clients get a real structured field instead of having to parse the
 reply's prose for it. Both methods share one internal implementation
 (`_dispatch`) so there is exactly one place capability dispatch and
 conversation persistence happen, never two copies to keep in sync.
+
+M17.1-C connects the computer-control tools (app/computer/, M17.1-A/B)
+to ordinary interactive TOOL-capability chat, WITHOUT making them
+available to M15 Job planning or AutomationEngine: `computer_tools`
+(`__init__`) is a wholly separate `ToolRegistry` from `self.tools` - the
+exact registry M15's JobEngine and AutomationEngine are built with in
+app/main.py - so `_handle_tool`'s new `_resolve_tool_registry` can route
+an interactive, explicitly-named computer-tool request there while
+JobEngine/AutomationEngine simply never hold a reference to it at all.
+See `_handle_tool`/`_resolve_tool_registry`'s own docstrings for exactly
+how a request is routed and why that routing can never be influenced by
+the message/decision itself.
 """
 
 import re
@@ -159,9 +198,15 @@ from app.search.answer import (
 )
 from app.search.base import SearchProviderError
 from app.search.query_builder import DeterministicSearchQueryBuilder, SearchQueryBuilder
-from app.search.router import SearchRouter
+from app.search.router import SearchRouter, is_explicit_search_request
 from app.tools.base import ToolResult, ToolResultStatus
-from app.tools.decision import ToolCallBuilder, ToolCallError, ToolCallIncompleteError
+from app.tools.command import CommandRejection, ExplicitToolCommandPlanner, ToolSequence
+from app.tools.decision import (
+    GeminiToolCallProvider,
+    ToolCallBuilder,
+    ToolCallError,
+    ToolCallIncompleteError,
+)
 from app.tools.registry import ToolRegistry
 from app.tools.web_search import WebSearchTool
 from app.world_model.base import ContextSnapshot
@@ -198,6 +243,9 @@ class JarvisCore:
         context_planner: ContextPlanner | None = None,
         identity_context: str | None = None,
         self_development_engine: SelfDevelopmentEngine | None = None,
+        computer_tools: ToolRegistry | None = None,
+        interaction_resolver=None,
+        handle_this=None,
     ):
         self.provider = provider or create_default_ai_provider_manager()
         self.memory = memory or SQLiteMemoryStore(settings.memory_db_path)
@@ -205,6 +253,50 @@ class JarvisCore:
         # only). AI tool-calling isn't wired up here either; Core just has
         # a place to reach the registry without knowing any tool's type.
         self.tools = tools or ToolRegistry()
+        # Computer-control tools (M17.1-C, app/computer/) - `None` by
+        # default, same "purely additive, off unless explicitly
+        # configured" convention as context_engine/context_reasoner/
+        # context_planner/self_development_engine above: no existing
+        # caller/test passes one, so every existing behavior (including
+        # every current TOOL-capability request) is byte-for-byte
+        # unaffected. This is DELIBERATELY a SEPARATE ToolRegistry from
+        # `self.tools`, never merged into it: `self.tools` is the exact
+        # registry M15's JobEngine and AutomationEngine are constructed
+        # with in the real running app (see app/main.py) - JobEngine's
+        # planner offers `self.tools.list_tools()` to its planner as
+        # candidates, and PlanValidator rejects any plan step naming a
+        # tool `self.tools` doesn't contain (app/orchestration/
+        # validator.py). Registering computer tools onto `self.tools`
+        # would therefore silently make them available to M15 Job
+        # planning and to AutomationEngine's automation actions - neither
+        # of which this milestone permits. Keeping them in a wholly
+        # separate registry object that JobEngine/AutomationEngine are
+        # never given a reference to is what makes that exclusion
+        # DETERMINISTIC in application code (an absent object, not a
+        # runtime check an LLM or a Job plan could ever influence) -
+        # see `_resolve_tool_registry` below for the only place this
+        # registry is ever consulted.
+        self.computer_tools = computer_tools
+        # Routes a user's reply to a WAITING interaction (a question or
+        # confirmation a background Job is waiting on - see app/orchestration/
+        # interaction_resolver.py). `None` (every existing caller/test) means
+        # interactions aren't in use and chat behaves exactly as before. It
+        # decides only WHICH interaction a message answers and hands that,
+        # with the untrusted text, to JobEngine's atomic transition; it never
+        # runs a tool.
+        self.interaction_resolver = interaction_resolver
+        # Understands a goal-driven (TASK) request before a Job is started for
+        # it (see app/handle_this/service.py): a duck-typed object whose
+        # `handle(text, conversation_id)` returns an outcome carrying `reply`,
+        # `job_params` (None unless a Job should be started) and
+        # `already_running_reply`. `None` (every existing caller/test) means a
+        # TASK request starts a Job exactly as it always did. When set, the
+        # service only ever RETURNS data: the Job is still created here,
+        # through the ToolRegistry's own `create_job` tool, and planned,
+        # validated and executed by the existing M15 machinery. A request that
+        # needs clarification, is unsupported or could not be understood
+        # creates no Job and calls no tool.
+        self.handle_this = handle_this
         self.router = router or SearchRouter()
         # Reuses self.provider by default, so injecting a fake AIProvider
         # into Core (as tests do) covers the SEARCH path's answer
@@ -223,7 +315,18 @@ class JarvisCore:
         self.capability_router = capability_router or DeterministicCapabilityRouter(
             search_router=self.router
         )
-        self.tool_call_builder = tool_call_builder or ToolCallBuilder()
+        # M17.1-E: when `tool_call_builder` isn't explicitly injected, its
+        # GeminiToolCallProvider is built around `self.provider` - the SAME
+        # AIProviderManager (or directly-injected AIProvider/test fake)
+        # every other path already uses - instead of a hardcoded, always-
+        # Gemini-only `GeminiProvider()`. See GeminiToolCallProvider's own
+        # docstring for why this closes the M14-era tool-call fallback gap
+        # without changing any of its request/response/validation logic:
+        # `generate_reply` is called exactly the same way, only now against
+        # whatever provider Core itself was constructed with.
+        self.tool_call_builder = tool_call_builder or ToolCallBuilder(
+            GeminiToolCallProvider(self.provider)
+        )
         # M16.2: `None` by default (including for the module-level `core`
         # singleton below) - no existing caller/test passes one, so every
         # existing behavior is completely unaffected. When given, `_dispatch`
@@ -454,6 +557,32 @@ class JarvisCore:
         except CapabilityDecisionError as exc:
             raise ProviderError(f"Failed to decide a capability: {exc}") from exc
 
+        # A reply to a waiting interaction (an explicit `answer <code>: ...`,
+        # or a yes/no / free-text answer to something surfaced to THIS
+        # conversation) is handled here, before ordinary dispatch. Only a
+        # DIRECT-classified message (or a bare yes/no) can be an implicit
+        # answer: tool use, search, tasks, status and self-development are
+        # commands/questions and always win. A resolver fault must never
+        # break ordinary chat - it just means "not an interaction reply".
+        interaction_reply: str | None = None
+        if self.interaction_resolver is not None:
+            try:
+                outcome = self.interaction_resolver.handle(
+                    message,
+                    conversation_id,
+                    may_be_answer=decision.capability
+                    in (Capability.DIRECT, Capability.CONFIRMATION),
+                    # A message routed to SEARCH only by a freshness word ("...I
+                    # can spend right now") may still answer a question that
+                    # positively recognises it; an explicit search never does.
+                    may_answer_if_recognised=decision.capability is Capability.SEARCH
+                    and not is_explicit_search_request(message),
+                )
+                if outcome.handled:
+                    interaction_reply = outcome.reply
+            except Exception:  # noqa: BLE001 - see above
+                interaction_reply = None
+
         # M16.2: purely additive - computed only when a context_engine was
         # actually configured (never for the default `core` singleton or
         # any existing test, none of which pass one), and never consumed
@@ -491,12 +620,16 @@ class JarvisCore:
         # what "active" means and why this is conversation-scoped only.
         active_self_dev_sessions = self._active_self_dev_sessions(conversation_id)
 
-        if decision.capability is Capability.SEARCH:
+        if interaction_reply is not None:
+            reply, sources = interaction_reply, []
+        elif decision.capability is Capability.SEARCH:
             reply, sources = self._handle_search(message, history, facts)
         elif decision.capability is Capability.TOOL:
             reply, sources = self._handle_tool(message, decision)
         elif decision.capability is Capability.TASK:
-            reply, sources, job_id = self._handle_task(decision, conversation_id)
+            reply, sources, job_id = self._handle_task(
+                decision, conversation_id, context_snapshot, message=message
+            )
         elif decision.capability is Capability.TASK_STATUS:
             reply, sources = self._handle_task_status(message, conversation_id)
         elif decision.capability is Capability.CONFIRMATION:
@@ -594,6 +727,17 @@ class JarvisCore:
             reply, sources, reasoning_result, planning_directive = self._fallback_to_direct(
                 message, history, facts, request_context, context_snapshot
             )
+
+        # Surface anything now waiting on the user in this conversation (its
+        # own Jobs' and background Jobs' questions/confirmations), which is
+        # also what arms a plain reply to it. Best-effort: never breaks chat.
+        if self.interaction_resolver is not None:
+            try:
+                notice = self.interaction_resolver.surface(conversation_id)
+            except Exception:  # noqa: BLE001
+                notice = None
+            if notice:
+                reply = f"{reply}\n\n{notice}"
 
         self.memory.add_message(conversation_id, "user", message)
         self.memory.add_message(conversation_id, "assistant", reply)
@@ -846,21 +990,124 @@ class JarvisCore:
         unaffected by how the parameters were constructed - the `/chat`
         API has no confirmation round-trip yet, so those outcomes simply
         surface as the reply text, same as an error would.
+
+        M17.1-C: `decision.tool_name`, when given, is resolved against
+        `self.computer_tools` FIRST (via `_resolve_tool_registry` below),
+        falling back to `self.tools` otherwise - so an interactive chat
+        request naming a registered computer tool reaches it, while
+        M15/AutomationEngine (which only ever hold `self.tools`) never
+        see it exist at all. The AMBIGUOUS case (`decision.tool_name is
+        None` - nothing named, ToolCallBuilder must pick from a full
+        tool list) deliberately still only ever offers `self.tools`'s own
+        candidates: computer tools are reachable ONLY by an explicit,
+        named invocation, never by an LLM picking one from an ambiguous
+        "use tool" message - a narrower, more deliberate reachability
+        requirement than this milestone strictly needs, kept anyway
+        since nothing calls for offering them any other way yet.
+
+        Explicit tool commands (a message that itself says "use tool X
+        ..." / "use the X tool ...", one step or several joined with
+        "then" / "and then" / "followed by") are understood by
+        app/tools/command.py's ExplicitToolCommandPlanner, NOT by the
+        legacy ToolCallBuilder path below: the whole command is parsed,
+        every tool and argument resolved against the registered tool's own
+        schema, and every step validated (types, the tool's own value
+        check, permission) BEFORE anything runs. Only a fully valid
+        `ToolSequence` is executed (`_execute_tool_sequence`); any problem
+        anywhere rejects the entire command with NOTHING executed. A
+        message that isn't an explicit named command (a bare "use tool",
+        or a decision a router made from other wording) still takes the
+        legacy path below, byte-for-byte unchanged.
         """
+        planner = ExplicitToolCommandPlanner(
+            self._resolve_tool_registry, self.tool_call_builder
+        )
+        try:
+            outcome = planner.plan(message)
+        except ToolCallError as exc:
+            # Raised only while planning (nothing has executed), so the
+            # 502 convention below can't hide a completed side effect.
+            raise ProviderError(f"Failed to construct a tool call: {exc}") from exc
+
+        if isinstance(outcome, CommandRejection):
+            return outcome.render(), []
+        if outcome is not None:
+            return self._execute_tool_sequence(outcome), []
+
+        registry = self._resolve_tool_registry(decision.tool_name)
         try:
             tool_call = self.tool_call_builder.build(
-                message, self.tools, decision.tool_name
+                message, registry, decision.tool_name
             )
         except ToolCallIncompleteError as exc:
             return str(exc), []
         except ToolCallError as exc:
             raise ProviderError(f"Failed to construct a tool call: {exc}") from exc
 
-        result = self.tools.execute(tool_call.tool_name, params=tool_call.parameters)
+        result = registry.execute(tool_call.tool_name, params=tool_call.parameters)
         return self._format_tool_result(result), []
 
+    def _execute_tool_sequence(self, sequence: ToolSequence) -> str:
+        """PHASE 2: run an already fully validated `ToolSequence`, in
+        order, one `ToolRegistry.execute` per step - which still applies
+        the registry's own permission gate to every step. The sequence
+        (not the original sentence) is the only input: nothing is
+        re-parsed, no tool is added, and steps never repeat.
+
+        Execution stops after the first step that doesn't return
+        ToolResultStatus.SUCCESS; that step's real result is reported, the
+        earlier steps' real results are kept, and the remaining steps are
+        stated as NOT run - never reported as if they had happened. A
+        single-step sequence replies with just that step's result."""
+        steps = sequence.steps
+        lines: list[str] = []
+        for position, step in enumerate(steps):
+            registry = self._resolve_tool_registry(step.tool_name)
+            result = registry.execute(step.tool_name, params=step.parameters)
+            text = self._format_tool_result(result)
+            lines.append(text if len(steps) == 1 else f"{step.index}. {text}")
+            if result.status is not ToolResultStatus.SUCCESS and position < len(steps) - 1:
+                skipped = ", ".join(str(later.index) for later in steps[position + 1 :])
+                lines.append(
+                    f"Stopped after step {step.index}; step(s) {skipped} were not run."
+                )
+                break
+        return "\n".join(lines)
+
+    def _resolve_tool_registry(self, tool_name: str | None) -> ToolRegistry:
+        """The ONLY place `self.computer_tools` is ever consulted (M17.1-C).
+        A NAMED tool (`tool_name` not `None`) that this registry actually
+        contains dispatches there; every other case - including
+        `self.computer_tools` being `None` (every existing caller/test)
+        and the ambiguous `tool_name is None` case - falls back to
+        `self.tools`, byte-for-byte the same registry (and therefore the
+        same behavior) `_handle_tool` always used before this method
+        existed.
+
+        This is what makes the interactive-vs-M15 separation deterministic
+        in application code rather than a runtime permission decision: a
+        message can only ever name a TOOL by string - which registry (if
+        any) actually contains a tool by that name is fixed entirely by
+        what THIS process registered where (see app/main.py), never by
+        anything in the message/decision itself. There is no parameter,
+        capability, or tool argument that selects `self.computer_tools`
+        directly - only `Tool.name` membership does, and that membership
+        is application-controlled, not LLM-controlled.
+        """
+        if (
+            tool_name is not None
+            and self.computer_tools is not None
+            and self.computer_tools.has(tool_name)
+        ):
+            return self.computer_tools
+        return self.tools
+
     def _handle_task(
-        self, decision: CapabilityDecision, conversation_id: str
+        self,
+        decision: CapabilityDecision,
+        conversation_id: str,
+        context_snapshot: ContextSnapshot | None = None,
+        message: str | None = None,
     ) -> tuple[str, list[SearchSource], str | None]:
         """TASK path (M15): dispatches to the existing ToolRegistry's
         `create_job` tool (app/orchestration/tools.py) by name, exactly
@@ -892,14 +1139,71 @@ class JarvisCore:
         `handle_chat_with_job_id`'s own 4th return value; every other
         handler still returns a plain 2-tuple since none of them create
         anything with an id worth exposing this way."""
+        if self.handle_this is not None:
+            return self._handle_task_with_understanding(decision, conversation_id, message)
+
         goal = decision.goal or ""
-        result = self.tools.execute(
-            "create_job", params={"goal": goal, "conversation_id": conversation_id}
-        )
+        params: dict = {"goal": goal, "conversation_id": conversation_id}
+        # The Context Engine's own relevant-context selection (built in
+        # `_dispatch` for every request when a context_engine is
+        # configured) goes to the Job's planner directly - no reasoner
+        # call: nothing here would consume its output, so it isn't run.
+        request_context = self._snapshot_to_job_context(context_snapshot)
+        if request_context:
+            params["request_context"] = request_context
+        result = self.tools.execute("create_job", params=params)
         job_id = None
         if result.status is ToolResultStatus.SUCCESS and isinstance(result.data, dict):
             job_id = result.data.get("id")
         return self._format_tool_result(result), [], job_id
+
+    def _handle_task_with_understanding(
+        self, decision: CapabilityDecision, conversation_id: str, message: str | None
+    ) -> tuple[str, list[SearchSource], str | None]:
+        """TASK path when Handle This is configured: the request is understood
+        FIRST. Only a READY, supported outcome creates a Job - and it does so
+        through the very same `create_job` tool the plain path uses, with the
+        arguments the service supplied (the user's words as the goal, this
+        conversation, relevant context, the understood objective - never a
+        tool, permission or autonomy level). Anything else (a question to the
+        user, an unsupported request, a failure to understand) is just the
+        reply: no Job, no tool call, no planner.
+
+        The user's words go in exactly as sent when the router's goal is the
+        whole message (the natural-language path); for the explicit
+        "create a goal: ..." phrasing the goal text after the colon is what is
+        understood."""
+        goal = decision.goal or ""
+        text = message if message is not None and message.strip() == goal.strip() else goal
+        try:
+            outcome = self.handle_this.handle(text, conversation_id)
+        except Exception:  # noqa: BLE001 - never a Job from a request that was not understood
+            return "Sir, I couldn't get started on that just now. Please try again in a moment.", [], None
+        if outcome.job_params is None:
+            return outcome.reply, [], None
+
+        result = self.tools.execute("create_job", params=outcome.job_params)
+        if result.status is not ToolResultStatus.SUCCESS or not isinstance(result.data, dict):
+            # A clarification that could not be parked (this deployment cannot
+            # wait on a question) falls back to asking in plain words: nothing
+            # was created.
+            fallback = getattr(outcome, "fallback_reply", None)
+            return (fallback or self._format_tool_result(result)), [], None
+        pending = result.data.get("pending_interaction")
+        if isinstance(pending, dict) and self.interaction_resolver is not None:
+            # The reply below IS the question being put to the user in this
+            # conversation: record that, so a plain answer here is recognised.
+            try:
+                self.interaction_resolver.mark_surfaced(pending["id"], conversation_id)
+            except Exception:  # noqa: BLE001 - best effort; the question is also surfaced next turn
+                pass
+        if not result.data.get("already_started"):
+            reply = outcome.reply
+        elif isinstance(pending, dict) or not getattr(outcome, "underway_reply", None):
+            reply = outcome.already_running_reply  # still waiting on that very question
+        else:
+            reply = outcome.underway_reply  # its question was answered: it is simply under way
+        return reply, [], result.data.get("id")
 
     #: "show me my running tasks" / "list me my active tasks" (list intent)
     #: vs "is that finished?" / "what's the status of my task?" (single-job
@@ -917,7 +1221,7 @@ class JarvisCore:
     #: return it (a status query about ALL history isn't what "running
     #: tasks" asks for).
     _ACTIVE_JOB_STATUS_VALUES = frozenset(
-        {"pending", "planning", "running", "awaiting_confirmation", "paused"}
+        {"pending", "planning", "running", "awaiting_input", "awaiting_confirmation", "paused"}
     )
 
     def _handle_task_status(
@@ -1023,6 +1327,11 @@ class JarvisCore:
             return None  # can't tell anything is pending - not a confirmation reply
 
         pending: list[dict] = result.data or []
+        if self.interaction_resolver is not None:
+            # A Job with a pending interaction is the interaction system's to
+            # resolve (recency-, conversation- and DANGEROUS-aware); a bare
+            # "yes" must not approve it through this older, direct path.
+            pending = [j for j in pending if not self.interaction_resolver.governs_job(j["id"])]
         if not pending:
             return None
 
@@ -1472,6 +1781,27 @@ class JarvisCore:
         ("relevant_preferences", "Relevant preferences", lambda p: f"{p.key}={p.value}"),
         ("relevant_memory", "Relevant memory", lambda m: m),
     )
+
+    @classmethod
+    def _snapshot_to_job_context(
+        cls, snapshot: ContextSnapshot | None
+    ) -> dict[str, list[str]] | None:
+        """A ContextSnapshot as the plain `label -> [strings]` dict a Job
+        carries for its planner (`create_job`'s `request_context`), built
+        from the SAME `_WORLD_MODEL_CATEGORIES` table
+        `_format_world_model_context` uses, so the two can't disagree
+        about what a category is called or how an item is described.
+        Pure serialization: never re-ranks, filters or adds anything to
+        what ContextEngine selected, and never queries the World Model.
+        `None` when there is no snapshot or nothing was selected."""
+        if snapshot is None:
+            return None
+        context = {
+            label: [describe(item) for item in getattr(snapshot, field_name)]
+            for field_name, label, describe in cls._WORLD_MODEL_CATEGORIES
+            if getattr(snapshot, field_name)
+        }
+        return context or None
 
     @classmethod
     def _format_world_model_context(cls, snapshot: ContextSnapshot | None) -> str:

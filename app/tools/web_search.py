@@ -47,7 +47,9 @@ class WebSearchTool(Tool):
     name = "web_search"
     description = (
         "Search the web and return a list of results (title, url, snippet). "
-        "Optional mode: fast, normal (default), research, or critical."
+        "Optional mode: fast, normal (default), research, or critical. "
+        "Result data: {query, mode, queries_used, results: [{title, url, "
+        "snippet, source, query}, ...]}."
     )
     permission = PermissionLevel.READ
     requirements = ToolRequirements(network=True)
@@ -63,7 +65,9 @@ class WebSearchTool(Tool):
     @property
     def parameters(self) -> list[ToolParameter]:
         return [
-            ToolParameter(name="query", type="string", description="Search query"),
+            ToolParameter(
+                name="query", type="string", description="Search query", free_text=True
+            ),
             ToolParameter(
                 name="max_results",
                 type="number",

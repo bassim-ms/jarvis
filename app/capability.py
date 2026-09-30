@@ -51,6 +51,7 @@ from enum import Enum
 from app.providers.base import AIProvider, ProviderError
 from app.providers.gemini import GeminiProvider
 from app.search.router import SearchDecision, SearchRouter
+from app.tools.command import match_invocation_head
 
 
 class Capability(Enum):
@@ -159,6 +160,13 @@ class CapabilityDecision:
     the same meaning as for CONFIRMATION, just for a different pending
     thing.
 
+    A multi-tool sequence ("use tool X ..., then use tool Y ...") is
+    still just `TOOL` here, with `tool_name` set to the FIRST step's name:
+    which steps exist, what their arguments are, and whether they are all
+    valid depends on the tool registry, so that understanding lives in
+    app/tools/command.py (ExplicitToolCommandPlanner), run by
+    JarvisCore._handle_tool - never in this registry-free router.
+
     `self_dev_gate` is used ONLY when `capability` is `SELF_DEV_APPROVAL`:
     which of the Self-Development Engine's three explicit approval gates
     the message named - `"plan"`, `"security_edit"`, or `"commit"` (see
@@ -197,32 +205,14 @@ class CapabilityRouter(ABC):
         """
 
 
-#: Deliberately conservative (M6.14): only an explicit, command-like
-#: invocation at the start of the message counts as a TOOL request - never
-#: a message that merely mentions "a tool" in passing ("what tool should I
-#: use for this job?" stays DIRECT). The tool name itself, if given, is
-#: captured verbatim - no fuzzy matching, no case-folding, no synonym
-#: mapping. There is currently no safe, general way to map arbitrary
-#: natural language to a specific registered tool, so none is invented
-#: here; this pattern is the entire extent of TOOL "understanding" for
-#: M6.14.
-_TOOL_INVOCATION_PATTERN = re.compile(
-    r"^\s*(?:use|run|call|invoke)\s+tool\b\s*:?\s*(\S+)?", re.IGNORECASE
-)
-
-#: M6.16: the mirror-image phrasing - the tool name given BEFORE the
-#: literal word "tool" instead of after it ("use the echo tool[...]"),
-#: still anchored to the same explicit verb set and still requiring the
-#: literal word "tool" right after the name. Not a general NLP pattern -
-#: just the other natural word order for the same explicit intent. The
-#: negative lookahead stops the optional article from backtracking into
-#: the capture group itself (without it, "use a tool to..." would wrongly
-#: match with "a" captured as the tool name).
-_TOOL_MENTION_PATTERN = re.compile(
-    r"^\s*(?:use|run|call|invoke)\s+(?:(?:the|a|an)\s+)?"
-    r"(?!(?:the|a|an)\b)(\S+)\s+tool\b",
-    re.IGNORECASE,
-)
+# TOOL detection (M6.14/M6.16) is deliberately conservative: only an
+# explicit, command-like invocation at the START of the message counts -
+# "use tool echo" / "use the echo tool" (verbs use/run/call/invoke) - never
+# a message that merely mentions "a tool" in passing ("what tool should I
+# use for this job?" stays DIRECT). The phrasing itself is defined once, in
+# app/tools/command.py (`match_invocation_head`), which is also what parses
+# the command's steps and arguments - so this router and the parser can
+# never disagree about what an explicit tool command looks like.
 
 
 #: M15: the explicit, unambiguous TASK invocation - "create/start/begin a
@@ -366,16 +356,15 @@ class DeterministicCapabilityRouter(CapabilityRouter):
     then SELF_DEV_APPROVAL, then SELF_DEVELOPMENT, then TASK_STATUS, then
     TASK, then DIRECT vs SEARCH, all without any Gemini/LLM call.
 
-    TOOL is checked first, via two narrow explicit-invocation phrasings -
-    `_TOOL_INVOCATION_PATTERN` ("use tool echo") and `_TOOL_MENTION_PATTERN`
-    ("use the echo tool") - the most deliberate, unambiguous signal of the
-    three, so either takes priority even over a message that also happens
-    to contain a SEARCH-triggering word (e.g. "use tool weather" is TOOL,
-    not SEARCH, even though "weather" alone would be SEARCH). Both checks
-    are pure text parsing - neither looks at what tools are actually
-    registered (that's ToolRegistry's job, at dispatch time in
-    JarvisCore._handle_tool - see app/core.py) and neither executes
-    anything.
+    TOOL is checked first, via the narrow explicit-invocation phrasings in
+    app/tools/command.py (`match_invocation_head`: "use tool echo", "use
+    the echo tool") - the most deliberate, unambiguous signal, so it takes
+    priority even over a message that also happens to contain a
+    SEARCH-triggering word (e.g. "use tool weather" is TOOL, not SEARCH).
+    This is pure text matching - it neither looks at what tools are
+    registered nor executes anything; a multi-step "..., then ..." message
+    is still one TOOL decision, whose steps JarvisCore._handle_tool has the
+    registry-aware ExplicitToolCommandPlanner understand and validate.
 
     CONFIRMATION is checked next: `_CONFIRMATION_YES_PATTERN`/
     `_CONFIRMATION_NO_PATTERN` match a short affirmative/negative reply
@@ -440,13 +429,9 @@ class DeterministicCapabilityRouter(CapabilityRouter):
         self.search_router = search_router or SearchRouter()
 
     def route(self, message: str) -> CapabilityDecision:
-        tool_match = _TOOL_INVOCATION_PATTERN.match(
-            message
-        ) or _TOOL_MENTION_PATTERN.match(message)
-        if tool_match:
-            return CapabilityDecision(
-                capability=Capability.TOOL, tool_name=tool_match.group(1)
-            )
+        head = match_invocation_head(message)
+        if head is not None:
+            return CapabilityDecision(capability=Capability.TOOL, tool_name=head.tool_name)
 
         if _CONFIRMATION_YES_PATTERN.match(message):
             return CapabilityDecision(capability=Capability.CONFIRMATION, approve=True)
@@ -663,7 +648,10 @@ class HybridCapabilityRouter(CapabilityRouter):
     resolves (DIRECT by default, SEARCH via SearchRouter's patterns, TOOL
     with a named tool) is treated as fully confident, matching M6.9-M6.14
     behavior exactly - see the README's Hybrid Capability Routing section
-    for the reasoning.
+    for the reasoning. A multi-step message whose first step names a tool
+    ("use tool A, then use tool B") has a `tool_name` and so is never
+    ambiguous here - its steps are understood, and validated as a whole,
+    by app/tools/command.py inside JarvisCore._handle_tool.
 
     Whatever CapabilityDecision the decision_provider returns still goes
     through JarvisCore's normal dispatch (app/core.py) - for TOOL, that

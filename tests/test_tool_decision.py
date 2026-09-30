@@ -314,6 +314,78 @@ def test_underlying_provider_failure_raises_tool_call_error():
         tool_call_provider.decide("echo hi", [EchoTool()])
 
 
+# --- GeminiToolCallProvider + AIProviderManager: fallback (M17.1-E) -------------
+#
+# GeminiToolCallProvider itself only ever depends on the generic
+# AIProvider.generate_reply interface (see its class docstring) - these
+# tests prove that plugging an AIProviderManager in as `provider` (exactly
+# what app/core.py's default wiring does since M17.1-E) gives tool-call
+# construction the SAME ordered retry/cooldown/fallback AIProviderManager
+# already provides for ordinary chat, with no changes needed to this
+# module at all.
+
+
+def test_first_provider_429_falls_back_to_the_next_configured_provider():
+    from app.providers.manager import AIProviderEntry, AIProviderManager
+
+    gemini = FakeAIProvider(error=ProviderError("Gemini returned 429: quota exceeded"))
+    groq = FakeAIProvider(reply='{"tool_name": "add", "parameters": {"a": 2, "b": 3}}')
+    manager = AIProviderManager(
+        [AIProviderEntry("gemini", gemini), AIProviderEntry("groq", groq)]
+    )
+    tool_call_provider = GeminiToolCallProvider(provider=manager)
+
+    call = tool_call_provider.decide("use tool add 2 3", [AddTool()])
+
+    assert call == ToolCall(tool_name="add", parameters={"a": 2, "b": 3})
+    assert gemini.last_message is not None  # gemini was tried first...
+    assert groq.last_message is not None  # ...and groq actually answered
+
+
+def test_all_providers_failing_raises_one_clear_tool_call_error():
+    from app.providers.manager import AIProviderEntry, AIProviderManager
+
+    gemini = FakeAIProvider(error=ProviderError("Gemini returned 429: quota exceeded"))
+    groq = FakeAIProvider(error=ProviderError("Groq returned 503: overloaded"))
+    manager = AIProviderManager(
+        [AIProviderEntry("gemini", gemini), AIProviderEntry("groq", groq)],
+        retry_count=0,
+    )
+    tool_call_provider = GeminiToolCallProvider(provider=manager)
+
+    with pytest.raises(ToolCallError) as exc_info:
+        tool_call_provider.decide("use tool add 2 3", [AddTool()])
+
+    message = str(exc_info.value)
+    assert "gemini" in message
+    assert "groq" in message
+
+
+def test_malformed_reply_from_fallback_provider_is_not_retried_further():
+    """A fallback provider answering with garbage is a VALIDATION failure,
+    not a provider failure - AIProviderManager already returned
+    successfully once groq answered, so this must fail immediately and
+    never reach a third configured provider."""
+    from app.providers.manager import AIProviderEntry, AIProviderManager
+
+    gemini = FakeAIProvider(error=ProviderError("Gemini returned 429: quota exceeded"))
+    groq = FakeAIProvider(reply="not json at all")
+    third = FakeAIProvider(reply='{"tool_name": "add", "parameters": {"a": 1, "b": 1}}')
+    manager = AIProviderManager(
+        [
+            AIProviderEntry("gemini", gemini),
+            AIProviderEntry("groq", groq),
+            AIProviderEntry("third", third),
+        ]
+    )
+    tool_call_provider = GeminiToolCallProvider(provider=manager)
+
+    with pytest.raises(ToolCallError, match="Invalid JSON"):
+        tool_call_provider.decide("use tool add 2 3", [AddTool()])
+
+    assert third.last_message is None  # never reached - no retry past validation
+
+
 # --- Dependency injection / defaults --------------------------------------------
 
 

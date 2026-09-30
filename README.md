@@ -567,6 +567,134 @@ message + CapabilityDecision.tool_name -> ToolCallBuilder
   call only ever proposes one `ToolCall` for `JarvisCore` to dispatch,
   never a sequence of them.
 
+### Explicit Tool Commands (`app/tools/command.py`)
+
+A message that itself says `use tool X ...` / `use the X tool ...` is
+understood by a small, deterministic, schema-aware layer - never by
+"give the tool the rest of the sentence":
+
+    "use tool open_url https://luniti.app, then use tool scroll -600"
+      -> tokenize (words / quoted strings / commas, with source offsets)
+      -> split into steps on `then` / `and then` / `followed by`
+         (optional leading comma; never inside a quoted string)
+      -> resolve every tool in the registry
+      -> bind every argument against THAT tool's own `ToolParameter`s
+      -> validate every step (types, the tool's own `validate_arguments`,
+         `ToolRegistry.check_permission`)
+      -> ToolSequence            # immutable; the source of truth
+      -> execute step 1, 2, ...  # via ToolRegistry.execute, in order
+
+If **any** step is unknown, malformed, unbindable, invalid or unauthorized,
+the whole command is rejected and **nothing executes**. Execution only starts
+once the entire sequence has validated; if a step then fails at execution,
+the sequence stops there, earlier real results are reported, and later steps
+are stated as not run.
+
+- **Argument boundaries come from the schema.** `number` = one numeric token
+  (`-600` needs no AI); `boolean` = one true/false/yes/no token; `string` =
+  one token or one quoted string. A string parameter declared
+  `ToolParameter(..., free_text=True)` (a task's text, a search query) may
+  span the rest of its step. Anything a tool's parameters don't consume is a
+  rejection - text is never silently ignored, and values are never guessed
+  (`use tool move_mouse somewhere` fails closed). To pass text containing
+  `then`, a comma-clause or several words to a single-token parameter, quote
+  it.
+- **No wait tool exists**, so `..., wait for 5 seconds, ...` is rejected as
+  an unavailable tool rather than absorbed into the previous step's URL.
+- **AI is opt-in.** Only a tool that declares `natural_language_arguments =
+  True` (reminders, calendar events, automations) may have its arguments
+  extracted from prose by the `ToolCallProvider`; the result goes through the
+  same validation. Computer tools are always deterministic.
+- **Isolation is unchanged.** The planner resolves tools through
+  `JarvisCore._resolve_tool_registry`; computer tools live only in
+  `core.computer_tools`, which M15's JobEngine and AutomationEngine are never
+  given.
+
+Adding a tool needs no parser change: declare its `ToolParameter`s (and,
+optionally, a side-effect-free `validate_arguments`).
+
+### Goal-driven Jobs: data flow, `analyze` and Notes
+
+A Job's plan (M15) can pass data between steps **deterministically** and
+without an AI in the loop:
+
+- **Step references.** An argument may be
+  `{"from_step": "s1", "path": "data.results.0.title"}`. The referenced step
+  must be in the step's own `depends_on`; the path (`status` / `message` /
+  `data`, then keys or list indexes, no expressions) is validated at plan
+  time and walked exactly at run time. A missing key, bad index, or a source
+  that didn't succeed **fails the step** - nothing is guessed or defaulted -
+  and goes through the existing bounded retry/replan path (a reference
+  failure itself is never retried). The resolved value is re-validated
+  against the target tool's schema and `validate_arguments`. Values are
+  bounded (`MAX_REFERENCE_CHARS`, 12000): a larger string, list or object is
+  **never truncated or pruned** (that could silently change what research
+  data means) - the reference fails with a clear size error and the step goes
+  through the normal failure/replan path. A gated step's confirmation
+  message shows the resolved values.
+- **`analyze`** (READ): analysis/synthesis of material an earlier step
+  collected, via the existing AI provider. It holds only the provider - no
+  registry, stores or OS access - so it can't execute tools or change
+  anything; the material is presented as untrusted data inside per-call
+  random markers, and the reply is plain text returned in the step's
+  `message`. Its `material` may be an object or a list (a search result
+  list, say).
+- **Notes** (`save_note` SAFE_ACTION, `list_notes` READ): a separate SQLite
+  store (`settings.notes_db_path`), never memory facts or the World Model,
+  and never promoted into either automatically. When a Job step saves a
+  note, the engine records `source_job_id`/`source_step_id`; a plan cannot
+  supply them.
+
+Together these express e.g. `web_search -> analyze -> save_note ->
+create_reminder` as plan data (see `tests/test_job_data_flow.py`); nothing
+about that workflow is hardcoded.
+
+**Observation-driven replanning.** A plan step may carry an optional
+`"expectation"` (read-only tools only): a short statement of what its result
+must contain. Only such a step is evaluated - ordinary steps cost no AI call.
+
+    step runs -> result -> has an expectation?
+        no  -> continue
+        yes -> ResultEvaluator: sufficient?
+                 yes -> continue
+                 no / unavailable -> step FAILED -> the existing bounded
+                                     retry/replan path (max_replans,
+                                     max_total_steps) -> the Planner decides
+
+The evaluator answers one question - "is this result sufficient for this
+step's stated expectation?" - and returns only `{sufficient, reason}`; any
+extra key makes its answer invalid. It is given the expectation, the tool
+name and the stored result, holds only an AI provider, and cannot plan,
+name or run tools, or change permissions/autonomy. A provider outage,
+malformed answer or missing evaluator is recorded as verdict `unavailable`
+and fails the step - never treated as "sufficient". A result with no message
+and no data is judged insufficient without any AI call. The verdict is
+persisted on the step, so a restart never re-runs the tool, never evaluates
+twice, and never lets a dependent run on an unvetted result. Tool results
+remain untrusted data throughout.
+
+**One provider path for every AI call in a Job.** Planning, replanning,
+result evaluation and `analyze` all run through `core.provider` (the
+AIProviderManager), so they share its ordered fallback and cooldown: one
+rate-limited provider no longer fails a Job while another is healthy.
+
+**Final report.** A completed Job's `final_result` is built from the plan's
+*terminal* steps (the ones nothing depends on) - not a transcript of every
+tool message: the synthesis of a step whose tool declares `produces_report`
+(`analyze`) leads, followed by one bounded `tool: output` line per other
+terminal step ("save_note: Saved note ...", "create_reminder: Reminder set
+..."). It is deterministic (no AI call), persisted on the Job, and is what
+"is that finished?" replies with.
+
+**Completion notification (optional).** When a Job completes or fails, a
+desktop toast can announce it (`JARVIS_ORCHESTRATION_NOTIFY_ON_COMPLETION`,
+default on; the same `Notifier` reminders use). It is best-effort and never
+part of the execution path: it is sent only after the Job's final state is
+persisted, on its own daemon thread, its text is sanitised (single line, no
+control characters, bounded, always starting with "Goal:"), and any failure -
+or a notifier that hangs - cannot change the Job. The persisted Job is the
+source of truth; a notification is never sent twice for one Job.
+
 ### Search Routing (M6.9)
 
 The deterministic DIRECT/SEARCH matching rules themselves still live in

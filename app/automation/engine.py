@@ -25,6 +25,7 @@ import threading
 from datetime import datetime, timezone
 
 from app.automation.base import (
+    FORBIDDEN_ACTION_TOOL_NAMES,
     Automation,
     AutomationStatus,
     AutomationStore,
@@ -199,7 +200,13 @@ class AutomationEngine:
         )
         conditions_met = all(c.evaluate(context) for c in automation.conditions)
 
-        if conditions_met:
+        if automation.action.tool_name in FORBIDDEN_ACTION_TOOL_NAMES:
+            # Defence in depth (creation already refuses these): an automation
+            # must never answer a confirmation for the user, even one that got
+            # into the store some other way. Recorded as a failure; nothing runs.
+            outcome = ExecutionOutcome.FAILURE
+            detail = "this action can't be run by an automation"
+        elif conditions_met:
             result = self.tools.execute(
                 automation.action.tool_name, params=automation.action.parameters
             )

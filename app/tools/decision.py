@@ -125,6 +125,7 @@ _TYPE_CHECKS: dict[str, type | tuple[type, ...]] = {
     "number": (int, float),
     "boolean": bool,
     "object": dict,
+    "structured": (dict, list),  # any JSON object or list
 }
 
 
@@ -170,16 +171,32 @@ def _validate_parameters(tool: Tool, parameters: dict[str, Any]) -> None:
 
 
 class GeminiToolCallProvider(ToolCallProvider):
-    """ToolCallProvider backed by the existing AIProvider/Gemini
-    integration - the same free-tier client GeminiProvider (and
+    """ToolCallProvider backed by the existing AIProvider abstraction - not
+    tied to any one vendor despite the name (kept for backward
+    compatibility with every existing caller/test). Defaults to a plain
+    GeminiProvider() - the same free-tier client GeminiProvider (and
     GeminiSearchAnswerGenerator/GeminiCapabilityDecisionProvider) already
-    use. No second Gemini client, no new API key/config, no billing.
+    use - when constructed with no arguments, exactly as before. Since
+    M17.1-E, JarvisCore's own default `tool_call_builder` instead passes
+    its own `self.provider` explicitly (see app/core.py), which in the
+    real running app is an AIProviderManager - so `self.provider.
+    generate_reply(prompt)` below already gets AIProviderManager's
+    existing ordered retry/cooldown/fallback across every configured
+    provider (Gemini -> Groq -> OpenRouter -> Cloudflare -> FreeLLMAPI) on
+    a ProviderError, with no changes needed here: this class has always
+    only ever depended on the generic AIProvider interface, never on
+    GeminiProvider specifically.
 
     Strictly validates the response before constructing a ToolCall: valid
     JSON object with only tool_name/parameters, tool_name matching one of
     the offered candidates exactly, parameters a JSON object conforming
     to that tool's own schema (see _validate_parameters). Any failure
-    raises ToolCallError/ToolCallIncompleteError - never a fallback guess.
+    raises ToolCallError/ToolCallIncompleteError - never a fallback guess,
+    and never retried against another provider: `self.provider.
+    generate_reply` returning successfully - Gemini, or the provider
+    AIProviderManager fell back to - ends this call's only attempt at
+    parsing/validation; a malformed reply from whichever provider
+    answered is a ToolCallError, exactly as before M17.1-E.
     """
 
     def __init__(self, provider: AIProvider | None = None):

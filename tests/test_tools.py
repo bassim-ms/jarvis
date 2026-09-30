@@ -288,3 +288,67 @@ def test_adding_a_brand_new_tool_requires_no_infrastructure_changes():
     assert result.status == ToolResultStatus.SUCCESS
     assert result.data == "weather for London"
     assert registry.get("weather_stub").requirements.network is True
+
+
+# --- pre-flight permission check + explicit-command metadata ------------------
+
+
+def test_check_permission_is_none_for_a_tool_that_would_run_automatically():
+    registry = ToolRegistry()
+    registry.register(EchoTool())
+
+    assert registry.check_permission("echo") is None
+
+
+def test_check_permission_reports_exactly_what_execute_would_return_without_running_anything():
+    ran: list[str] = []
+
+    class Gated(Tool):
+        name = "gated"
+        description = "gated"
+        permission = PermissionLevel.CONFIRM
+
+        def execute(self) -> ToolResult:
+            ran.append("gated")
+            return ToolResult.success(message="ran")
+
+    registry = ToolRegistry()
+    registry.register(Gated())
+    registry.register(DeleteEverythingTool())
+
+    for name in ("gated", "delete_everything"):
+        blocked = registry.check_permission(name)
+        assert blocked.status == ToolResultStatus.CONFIRMATION_REQUIRED
+        assert blocked == registry.execute(name)  # same gate, one definition
+
+    assert registry.check_permission("gated", confirmed=False).status == ToolResultStatus.DENIED
+    assert registry.check_permission("gated", confirmed=True) is None
+    assert registry.check_permission("nope").status == ToolResultStatus.ERROR
+    assert registry.check_permission("nope").message == "Unknown tool: 'nope'"
+    assert ran == []  # checking never executes
+
+
+def test_tool_defaults_are_fail_closed():
+    tool = EchoTool()
+
+    assert tool.natural_language_arguments is False
+    assert ToolParameter(name="x", type="string").free_text is False
+    assert tool.validate_arguments(text="anything") is None  # default: accept, no side effect
+
+
+def test_real_tools_declare_prose_arguments_explicitly():
+    """The AI is only ever consulted for tools that opt in; every computer
+    tool stays deterministic."""
+    from app.automation.tools import CreateAutomationTool
+    from app.calendar.tools import CreateEventTool, UpdateEventTool
+    from app.computer.defaults import create_computer_tools_registry
+    from app.reminders.tools import CreateReminderTool
+
+    for cls in (CreateReminderTool, CreateEventTool, UpdateEventTool, CreateAutomationTool):
+        assert cls.natural_language_arguments is True
+
+    class NullBackend:  # never called: construction only
+        pass
+
+    for tool in create_computer_tools_registry(backend=NullBackend()).list_tools():
+        assert tool.natural_language_arguments is False, tool.name

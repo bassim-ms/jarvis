@@ -72,6 +72,16 @@ _SEARCH_REGEX = re.compile(
 )
 
 
+_EXPLICIT_SEARCH_REGEX = re.compile("|".join(_EXPLICIT_SEARCH_PATTERNS), re.IGNORECASE)
+
+
+def is_explicit_search_request(message: str) -> bool:
+    """Whether the message explicitly ASKS for a search ("search for ...",
+    "look it up", "web search") - as opposed to being routed to SEARCH only
+    because it contains a freshness word such as "now" or "today". Pure."""
+    return bool(_EXPLICIT_SEARCH_REGEX.search(message))
+
+
 class SearchRouter:
     """Deterministically decides whether a message needs a web search."""
 

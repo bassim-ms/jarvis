@@ -59,6 +59,10 @@ class CreateReminderTool(Tool):
         "optionally repeating on a fixed interval."
     )
     permission = PermissionLevel.SAFE_ACTION
+    #: Prose arguments ("remind me to stretch in 10 minutes"): the one kind
+    #: of tool an explicit command may hand to the AI ToolCallProvider (see
+    #: app/tools/command.py). Every other tool is resolved deterministically.
+    natural_language_arguments = True
 
     def __init__(self, store: ReminderStore):
         self.store = store

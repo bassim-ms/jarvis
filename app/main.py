@@ -16,9 +16,13 @@ background JobEngine that plans and executes goal-driven Jobs (see
 app/orchestration/) - a TASK-capability chat message just creates a
 PENDING Job and returns immediately; JobEngine does the actual planning/
 execution on its own thread, the same way AutomationEngine/
-ReminderScheduler already do their own background work. No dashboard,
-browser/computer control, or hardware control yet - those come in later
-milestones.
+ReminderScheduler already do their own background work. Since M17.1-C,
+it also wires up local Windows computer-control tools (see
+app/computer/) for ordinary interactive TOOL-capability chat ONLY - a
+separate ToolRegistry from `core.tools`, deliberately never reachable
+from M15 Job planning or AutomationEngine (see this file's own
+`core.computer_tools` wiring below). No dashboard, browser agent, or
+hardware control beyond that yet - those come in later milestones.
 """
 
 from contextlib import asynccontextmanager
@@ -28,16 +32,39 @@ from pydantic import BaseModel
 
 from app.automation.factory import create_default_automation_store
 from app.calendar.factory import create_default_calendar_provider
+from app.computer.defaults import create_computer_tools_registry
 from app.config import settings
 from app.context_engine.factory import create_default_context_engine
 from app.context_planning.factory import create_default_context_planner
 from app.context_reasoning.factory import create_default_context_reasoner
+from app.handle_this.continuation import ObjectiveContinuer, plausible_input_answer
+from app.handle_this.dialogue import ClarificationDialogue
+from app.handle_this.factory import create_default_intake
+from app.handle_this.routing import ObjectiveAwareCapabilityRouter
+from app.handle_this.service import HandleThisService
 from app.core import ConversationNotFoundError, core
 from app.identity import load_identity_context
-from app.orchestration.factory import create_default_job_engine, create_default_job_store
+from app.notes.factory import create_default_note_store
+from app.orchestration.factory import (
+    create_default_interaction_store,
+    create_default_job_engine,
+    create_default_job_store,
+)
+from app.orchestration.interaction_lifecycle import InteractionLifecycle
+from app.orchestration.interaction_resolver import InteractionResolver
+from app.notifications.base import (
+    NotificationPriority,
+    NotificationRouter,
+    SQLiteNotificationLedger,
+)
+from app.notifications.channels import DesktopToastChannel
 from app.providers.base import ProviderError
 from app.self_development.factory import create_default_self_development_engine
-from app.reminders.factory import create_default_reminder_store, create_default_scheduler
+from app.reminders.factory import (
+    create_default_notifier,
+    create_default_reminder_store,
+    create_default_scheduler,
+)
 from app.tasks.factory import create_default_task_store
 from app.tools.defaults import register_default_tools
 from app.world_model.factory import (
@@ -63,6 +90,29 @@ _automation_store = create_default_automation_store(settings.automations_db_path
 _calendar_provider = create_default_calendar_provider()
 _task_store = create_default_task_store(settings.tasks_db_path)
 _job_store = create_default_job_store(settings.orchestration_db_path)
+# Interactions (questions/confirmations a Job waits on the user for) live in
+# the same database, sharing the Job store's connection so the engine can
+# change a Job and its interaction in one transaction.
+_interaction_store = create_default_interaction_store(_job_store)
+_note_store = create_default_note_store(settings.notes_db_path)
+
+
+def _build_notification_router() -> NotificationRouter:
+    """The channel-neutral router Jobs and interactions notify through. Today
+    its one channel is the desktop toast (the Notifier reminders use); future
+    channels (speech, phone, watch, glasses) are added here. Its delivery
+    ledger lives in the Job database, so de-duplication survives restarts."""
+    router = NotificationRouter(ledger=SQLiteNotificationLedger.for_job_store(_job_store))
+    if settings.notifications_desktop_enabled:
+        try:
+            floor = NotificationPriority[settings.notifications_desktop_min_priority.strip().upper()]
+        except KeyError:
+            floor = NotificationPriority.LOW
+        router.add_channel(DesktopToastChannel(create_default_notifier(), min_priority=floor))
+    return router
+
+
+_notification_router = _build_notification_router()
 automation_engine = register_default_tools(
     core.tools,
     reminder_store=_reminder_store,
@@ -71,6 +121,9 @@ automation_engine = register_default_tools(
     calendar_provider=_calendar_provider,
     task_store=_task_store,
     job_store=_job_store,
+    note_store=_note_store,
+    analysis_provider=core.provider,
+    interaction_store=_interaction_store,
 )
 
 reminder_scheduler = create_default_scheduler(
@@ -98,6 +151,49 @@ job_engine = create_default_job_engine(
     retry_delay_seconds=settings.orchestration_retry_delay_seconds,
     poll_interval_seconds=settings.orchestration_poll_interval_seconds,
     context_provider=core.memory.get_facts,
+    # `core.provider` (the AIProviderManager) drives the planner - planning
+    # and replanning - and the result evaluator (which judges a step's
+    # result ONLY when its plan entry carries an `expectation`, see
+    # app/orchestration/evaluator.py), so both get the same ordered
+    # fallback every other AI call in this app already gets, instead of a
+    # single unmanaged Gemini client. `analyze` uses it too (see
+    # register_default_tools above).
+    provider=core.provider,
+    interaction_store=_interaction_store,
+    # A Job's outcome is announced through the notification router: a
+    # failure (only once it can't be recovered) at HIGH priority, a
+    # background Job's completion at LOW. Best-effort and off the critical
+    # path: the persisted Job is authoritative whether or not anything shows.
+    notification_router=_notification_router,
+    notify_on_completion=settings.orchestration_notify_on_completion,
+    # Continues a Handle This objective that waited on a question once it is
+    # answered: folds the answer into the ORIGINAL objective and re-checks it,
+    # deterministically, before the existing planner runs.
+    objective_continuer=ObjectiveContinuer(),
+)
+
+# Tells the user about waiting questions/confirmations (immediately, then a
+# few bounded reminders, one final warning) and closes them when they expire.
+# Runs at the end of every engine tick; it also opens the confirmation for a
+# Job the engine parked in AWAITING_CONFIRMATION.
+interaction_lifecycle = InteractionLifecycle(
+    _interaction_store, _job_store, job_engine, _notification_router
+).attach()
+
+# Routes a user's chat reply to a waiting interaction (`answer <code>: ...`,
+# or a yes/no / free-text answer to something surfaced to that conversation)
+# and hands it to the engine's atomic transition. It never runs a tool.
+# `answer_gate`: a pending clarification is only answered by a message that
+# plausibly answers it, so ordinary conversation never uses up a question.
+# `dialogue`: the conversation around a question - cancelling, changing an
+# answer, coming back to a stale question, the next question - all
+# deterministic, all through the engine's own version-guarded transitions.
+core.interaction_resolver = InteractionResolver(
+    _interaction_store,
+    _job_store,
+    job_engine,
+    answer_gate=plausible_input_answer,
+    dialogue=ClarificationDialogue(),
 )
 
 # Personal World Model + Context Engine (M16.1/M16.2) - wired onto the
@@ -148,6 +244,29 @@ core.context_reasoner = create_default_context_reasoner(core.provider)
 # (untouched by this milestone) remains the only path that does.
 core.context_planner = create_default_context_planner(core.provider)
 
+# Handle This (see app/handle_this/): understands a goal-driven request BEFORE
+# a Job is started for it - the objective, its family of work, the relevant
+# context, whether something material is missing, whether it is supported.
+# Only a READY, supported request goes on, and it still becomes an ordinary
+# Job through the ordinary `create_job` tool, planned, validated and executed
+# by the existing JobEngine/Planner/validator/ToolRegistry. `tools=core.tools`
+# is the JOB-facing registry (NOT the isolated computer-control one), so a
+# request needing computer control is honestly reported unsupported. Wired
+# after the Context Engine above, which it reads (selectively, read-only).
+core.handle_this = HandleThisService(
+    create_default_intake(
+        provider=core.provider, context_engine=core.context_engine, tools=core.tools
+    )
+)
+
+# Routing INTO Handle This: a wrapper around the router `core` already has. It
+# leaves every explicit intent (tool command, confirmation, self-development,
+# task status) exactly as decided, and only sends a message to Handle This when
+# it is clearly a delegated multi-step objective (structure, not keywords; no
+# AI call). A plain question, a simple command or an explicit search keeps its
+# existing path. Installed together with `core.handle_this` above.
+core.capability_router = ObjectiveAwareCapabilityRouter(core.capability_router)
+
 # Identity context (personality.md/user_profile.md, repo root - see
 # app/identity.py) - `core.identity_context` defaults to `None` (see
 # JarvisCore.__init__), so this is what actually ACTIVATES it for the
@@ -178,6 +297,26 @@ core.self_development_engine = create_default_self_development_engine(
     command_timeout_seconds=settings.self_dev_command_timeout_seconds,
     test_command=settings.self_dev_test_command,
 )
+
+# Computer Control (M17.1-A/B/C, see app/computer/) - `core.computer_tools`
+# defaults to `None` (see JarvisCore.__init__), so this is what actually
+# ACTIVATES computer-control tools for ordinary interactive chat: a TOOL-
+# capability request explicitly naming one (e.g. "use tool open_url ...")
+# now reaches it via JarvisCore._handle_tool's `_resolve_tool_registry`.
+#
+# Deliberately its OWN ToolRegistry, built here and NEVER passed to
+# `register_default_tools`/`core.tools` above, nor to `job_engine`/
+# `automation_engine` below - those are constructed with `core.tools`
+# only, exactly as before this milestone. M15's JobEngine offers
+# `core.tools.list_tools()` to its planner and rejects any plan step
+# naming a tool `core.tools` doesn't contain (app/orchestration/
+# validator.py); AutomationEngine likewise only ever looks tools up on
+# the registry it was built with. Since neither is ever given a
+# reference to `core.computer_tools`, computer-control tools are
+# unreachable from M15 Job planning/execution and from automations - not
+# because of a permission check, but because that object simply doesn't
+# exist in their scope.
+core.computer_tools = create_computer_tools_registry()
 
 
 @asynccontextmanager
