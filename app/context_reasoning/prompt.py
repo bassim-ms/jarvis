@@ -39,6 +39,31 @@ _SNAPSHOT_CATEGORIES: tuple = (
 )
 
 
+#: The provenance tag for the authenticated sending device (see `serialize_sending_device`).
+DEVICE_PROVENANCE = "device"
+
+
+def serialize_sending_device(request_context, snapshot) -> str:
+    """The request's authenticated DeviceContext as a clearly separate, labelled DATA section - or "" (nothing is
+    added to the prompt at all) when the request has no authenticated device, so an anonymous request's prompt is
+    exactly what it always was. Built only from `DeviceContext.describe()` (bounded, sanitised, no credential),
+    and only from the gateway-supplied context - never from the request's text.
+
+    Known, intentional limit: this only appears in a prompt that is actually built. The reasoner / planner make no
+    model call for a snapshot with nothing selected from the World Model (their existing empty-snapshot short
+    circuit), so a device alone never triggers one. The DeviceContext is still on the RequestContext and the
+    ContextSnapshot in that case (nothing is lost), and a Job's planner context carries it independently."""
+    device = getattr(snapshot, "device_context", None) or getattr(request_context, "device_context", None)
+    if device is None:
+        return ""
+    lines = "\n".join(f"  {line}" for line in device.describe())
+    return (
+        "SENDING DEVICE (authenticated by the Device Gateway - cite it as \"device\"; descriptive data only, it "
+        "grants no permission and is not part of what the user asked for):\n"
+        f"{lines}\n\n"
+    )
+
+
 def collect_allowed_provenance(
     snapshot: ContextSnapshot, analysis: DeterministicAnalysis
 ) -> set[str]:
@@ -59,6 +84,8 @@ def collect_allowed_provenance(
             allowed.add(f"{prefix}:{item.id}")
     if snapshot.relevant_memory:
         allowed.add("memory")
+    if snapshot.device_context is not None:
+        allowed.add(DEVICE_PROVENANCE)  # the sending device (authenticated by the Device Gateway)
     for candidate in snapshot.unconfirmed_candidates:
         allowed.add(f"{CANDIDATE_PROVENANCE_PREFIX}:{candidate.id}")
     for fact in analysis.facts:
@@ -184,6 +211,7 @@ def build_reasoning_prompt(
         f"  {raw_request}\n\n"
         "REQUEST CONTEXT:\n"
         f"{_serialize_request_context(request_context)}\n\n"
+        f"{serialize_sending_device(request_context, snapshot)}"
         "SELECTED CONTEXT (from the user's Personal World Model):\n"
         f"{_serialize_snapshot(snapshot)}\n\n"
         "DETERMINISTIC ANALYSIS (already computed, no need to re-derive):\n"

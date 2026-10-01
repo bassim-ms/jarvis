@@ -5,8 +5,10 @@ JarvisCore hands a message to `command_reply(message, conversation_id)` (the sam
 context and the Morning Brief use) only when the WHOLE message is one of a few fixed phrasings. There is no
 intent engine and no model call here.
 
-  READ     "what devices do you have?" / "is my phone connected?" / "what can my PC do?"  - answered straight
-           from the registry, read-only.
+  READ     "what devices do you have?" / "is my phone connected?" / "what can my PC do?" - answered straight
+           from the registry, read-only. "What device am I using?" / "what can this device do?" are answered
+           from the AUTHENTICATED DeviceContext of the request (looked up in the registry), or - on the
+           anonymous /chat, which is never proof of a device - an honest "I can't tell which device this is".
   REVOKE   "revoke my phone" - CONSEQUENTIAL, so it is not done: it is ASKED, through the same Job / interaction /
            ToolRegistry confirmation the memory policy uses (a waiting Job whose one step is the CONFIRM-level,
            non-plannable, non-automatable `commit_device_revocation`). Only an approved confirmation of THAT Job
@@ -54,11 +56,17 @@ def _rx(body: str) -> re.Pattern:
 
 _LIST = _rx(
     r"(?:(?:what|which)\s+devices\s+(?:do\s+(?:you|i)\s+have|are\s+(?:registered|connected|known))|"
+    r"what\s+are\s+my\s+(?:registered\s+)?devices|"
     r"(?:show|list)(?:\s+me)?\s+(?:all\s+)?(?:my\s+)?(?:registered\s+)?devices|my\s+devices)"
 )
 _CONNECTED = _rx(r"is\s+" + _WHO + r"\s+(?:connected|online|offline|available|on)")
 _CAPABILITIES = _rx(r"what\s+can\s+" + _WHO + r"\s+do")
 _REVOKE = _rx(r"revoke\s+" + _WHO)
+_THIS_DEVICE = _rx(
+    r"(?:(?:what|which)\s+(?:device|machine|computer)\s+(?:am\s+i|are\s+we)\s+(?:using|on)|"
+    r"(?:what|which)\s+device\s+is\s+this|what\s+is\s+this\s+(?:device|machine)|what'?s\s+this\s+(?:device|machine))"
+)
+_THIS_CAPABILITIES = _rx(r"what\s+can\s+this\s+(?:device|machine|computer)\s+do")
 _REGISTER = _rx(r"register\s+(?:a\s+|another\s+)?(?:new\s+)?device")
 
 #: Words that name a KIND of device ("my phone"). A name that is not one of these must match a registered name.
@@ -133,9 +141,15 @@ class DeviceOperations:
 
     # -- the chat hook ------------------------------------------------------------------------------------------------
 
-    def command_reply(self, message: str, conversation_id: str | None = None) -> str | None:
+    def command_reply(self, message: str, conversation_id: str | None = None, device_context=None) -> str | None:
+        """`device_context` is the Gateway-authenticated DeviceContext of THIS request (None on the anonymous
+        /chat). It is only ever used to answer "this device" questions - never to change anything."""
         if not isinstance(message, str) or not message.strip() or len(message) > 160 or "\n" in message:
             return None
+        if _THIS_DEVICE.match(message):
+            return self._this_device(device_context, capabilities=False)
+        if _THIS_CAPABILITIES.match(message):
+            return self._this_device(device_context, capabilities=True)
         if _LIST.match(message):
             return self._list()
         if _REGISTER.match(message):
@@ -150,6 +164,23 @@ class DeviceOperations:
         return None
 
     # -- reading ------------------------------------------------------------------------------------------------------
+
+    def _this_device(self, device_context, *, capabilities: bool) -> str:
+        """The sending device, from the authenticated context and the registry (the source of truth). Read-only."""
+        if device_context is None or not getattr(device_context, "is_authenticated", False):
+            return (
+                "I can't tell which device this is: this request didn't come through an authenticated device. "
+                "(The plain chat interface isn't proof of a device.)"
+            )
+        device = self.registry.get(device_context.device_id)
+        if device is None:
+            return "This request says it came from a device I no longer have registered, so I can't vouch for it."
+        if device.trust_state is not TrustState.TRUSTED:
+            return f"{device.name} is {device.trust_state.value}, so I'm not treating this request as coming from a trusted device."
+        if capabilities:
+            return self._capabilities(device, None)
+        status = "connected" if device.status is DeviceStatus.ONLINE else device.status.value
+        return f"You're on {device.name}, a {device.device_type.value} - trusted and {status}."
 
     def _list(self) -> str:
         devices = self.registry.list_devices()

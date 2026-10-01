@@ -29,6 +29,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 
+from app.devices.base import DeviceContext
+
 
 class RequestContextError(ValueError):
     """Raised by RequestContext.__post_init__ (and TimeScope's/
@@ -380,6 +382,12 @@ class RequestContext:
         default_factory=lambda: default_required_context(ContextIntent.GENERAL)
     )
     context_budget: ContextBudget = DEFAULT_CONTEXT_BUDGET
+    #: The AUTHENTICATED device this request came from (app.devices.base.DeviceContext), supplied by the Device
+    #: Gateway - or None (the anonymous /chat, a background caller). Request-scoped: it lives and dies with this
+    #: object, is never stored, and is kept separate from the user and from the request's text. It is
+    #: information about WHERE the request came from, not part of what the user wants (that is HandleThis / the
+    #: intent classifier), and never a permission.
+    device_context: "DeviceContext | None" = None
 
     def __post_init__(self) -> None:
         """Lightweight structural validation only - never re-classifies
@@ -399,6 +407,11 @@ class RequestContext:
             raise RequestContextError(
                 f"time_scope must be a TimeScope, got: {self.time_scope!r}"
             )
+        if self.device_context is not None and (
+            not isinstance(self.device_context, DeviceContext) or not self.device_context.is_authenticated
+        ):
+            # Only an authenticated DeviceContext (made by the Gateway) may ride a request.
+            raise RequestContextError("device_context must be an authenticated DeviceContext or None")
         if not isinstance(self.context_budget, ContextBudget):
             raise RequestContextError(
                 f"context_budget must be a ContextBudget, got: {self.context_budget!r}"

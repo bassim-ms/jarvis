@@ -299,6 +299,7 @@ def build_request_context(
     *,
     capability: Capability | None = None,
     now: datetime | None = None,
+    device_context=None,
 ) -> RequestContext:
     """Deterministically build a RequestContext from a raw message and
     (optionally) the Capability the existing M13/M14 CapabilityRouter
@@ -310,6 +311,9 @@ def build_request_context(
     caller building a RequestContext some other way (or overriding
     either field afterward) is free to, this function just supplies the
     deterministic defaults every ordinary call site needs.
+
+    `device_context` is the Device Gateway's authenticated DeviceContext for this request (or None). It is
+    carried as-is: never derived from `message`, and never used to classify the intent.
     """
     intent = classify_context_intent(message, capability=capability)
     time_scope = extract_time_scope(message, now=now)
@@ -325,4 +329,5 @@ def build_request_context(
         mentioned_resources=mentions["mentioned_resources"],
         time_scope=time_scope,
         required_context=default_required_context(intent),
+        device_context=device_context,
     )

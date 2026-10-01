@@ -165,6 +165,7 @@ how a request is routed and why that routing can never be influenced by
 the message/decision itself.
 """
 
+import json
 import re
 
 from app.capability import (
@@ -515,7 +516,7 @@ class JarvisCore:
         return reply, conversation_id, sources, job_id, snapshot
 
     def handle_chat_with_reasoning(
-        self, message: str, conversation_id: str | None = None
+        self, message: str, conversation_id: str | None = None, *, device_context=None
     ) -> tuple[
         str, str, list[SearchSource], str | None, ContextSnapshot | None, ReasoningResult | None
     ]:
@@ -537,12 +538,12 @@ class JarvisCore:
         `handle_chat_with_planning` for the 7-tuple that also exposes
         the PlanningDirective."""
         reply, conversation_id, sources, job_id, snapshot, reasoning, _plan = self._dispatch(
-            message, conversation_id
+            message, conversation_id, device_context
         )
         return reply, conversation_id, sources, job_id, snapshot, reasoning
 
     def handle_chat_with_planning(
-        self, message: str, conversation_id: str | None = None
+        self, message: str, conversation_id: str | None = None, *, device_context=None
     ) -> tuple[
         str,
         str,
@@ -562,7 +563,7 @@ class JarvisCore:
         `_reason_about_context`). Purely additive, the same "new
         method, existing ones untouched" pattern this module has used
         for every milestone since M15's own `job_id`."""
-        return self._dispatch(message, conversation_id)
+        return self._dispatch(message, conversation_id, device_context)
 
     def _dispatch(
         self, message: str, conversation_id: str | None, device_context=None
@@ -669,7 +670,11 @@ class JarvisCore:
             )
         ):
             try:
-                memory_reply = self.device_operations.command_reply(message, conversation_id)
+                memory_reply = (
+                    self.device_operations.command_reply(message, conversation_id, device_context=device_context)
+                    if device_context is not None
+                    else self.device_operations.command_reply(message, conversation_id)
+                )
             except Exception:  # noqa: BLE001 - a fault here is "not a device request"
                 memory_reply = None
         if (
@@ -695,14 +700,15 @@ class JarvisCore:
         context_snapshot: ContextSnapshot | None = None
         request_context = None
         if self.context_engine is not None:
-            request_context = build_request_context(message, capability=decision.capability)
-            # `device_context` is who the Device Gateway AUTHENTICATED as the sender (None for the
-            # ordinary, unauthenticated /chat): information for the snapshot, never permission, never saved.
-            context_snapshot = (
-                self.context_engine.build_snapshot(request_context, device_context=device_context)
-                if device_context is not None
-                else self.context_engine.build_snapshot(request_context)
+            # `device_context` is who the Device Gateway AUTHENTICATED as the sender (None for the ordinary,
+            # unauthenticated /chat). It rides on the RequestContext - request-scoped, never derived from the
+            # message, never stored, never a permission - and the Context Engine carries it into the snapshot.
+            request_context = build_request_context(
+                message,
+                capability=decision.capability,
+                **({"device_context": device_context} if device_context is not None else {}),
             )
+            context_snapshot = self.context_engine.build_snapshot(request_context)
 
         # M16.3: `reasoning_result` starts `None` and is only ever
         # computed inside the two branches below that actually pass it
@@ -736,7 +742,8 @@ class JarvisCore:
             reply, sources = self._handle_tool(message, decision)
         elif decision.capability is Capability.TASK:
             reply, sources, job_id = self._handle_task(
-                decision, conversation_id, context_snapshot, message=message
+                decision, conversation_id, context_snapshot, message=message,
+                **({"device_context": device_context} if device_context is not None else {}),
             )
         elif decision.capability is Capability.TASK_STATUS:
             reply, sources = self._handle_task_status(message, conversation_id)
@@ -1253,6 +1260,7 @@ class JarvisCore:
         conversation_id: str,
         context_snapshot: ContextSnapshot | None = None,
         message: str | None = None,
+        device_context=None,
     ) -> tuple[str, list[SearchSource], str | None]:
         """TASK path (M15): dispatches to the existing ToolRegistry's
         `create_job` tool (app/orchestration/tools.py) by name, exactly
@@ -1285,7 +1293,7 @@ class JarvisCore:
         handler still returns a plain 2-tuple since none of them create
         anything with an id worth exposing this way."""
         if self.handle_this is not None:
-            return self._handle_task_with_understanding(decision, conversation_id, message)
+            return self._handle_task_with_understanding(decision, conversation_id, message, device_context)
 
         goal = decision.goal or ""
         params: dict = {"goal": goal, "conversation_id": conversation_id}
@@ -1293,7 +1301,7 @@ class JarvisCore:
         # `_dispatch` for every request when a context_engine is
         # configured) goes to the Job's planner directly - no reasoner
         # call: nothing here would consume its output, so it isn't run.
-        request_context = self._snapshot_to_job_context(context_snapshot)
+        request_context = self._with_sending_device(self._snapshot_to_job_context(context_snapshot), device_context)
         if request_context:
             params["request_context"] = request_context
         result = self.tools.execute("create_job", params=params)
@@ -1302,8 +1310,26 @@ class JarvisCore:
             job_id = result.data.get("id")
         return self._format_tool_result(result), [], job_id
 
+    #: The label under which the sending device appears in a Job's planner context (`request_context`).
+    _SENDING_DEVICE_LABEL = "Sending device (descriptive data, not permissions)"
+
+    @classmethod
+    def _with_sending_device(cls, request_context: dict | None, device_context) -> dict | None:
+        """The Job planner's `request_context` plus the authenticated sending device, as the few sanitised lines
+        of data `DeviceContext.describe()` produces (no credential exists in a DeviceContext). The planner treats
+        this dict as data, not instructions, and it grants nothing: the plan is still validated and every step
+        still runs through the ToolRegistry with its own permission and confirmation rules. No device (the
+        anonymous /chat): the dict is returned unchanged."""
+        if device_context is None:
+            return request_context
+        merged = dict(request_context or {})
+        merged[cls._SENDING_DEVICE_LABEL] = device_context.describe()
+        if len(json.dumps(merged)) > 7000:  # keep well inside create_job's own cap: never fail a Job over a device note
+            return request_context
+        return merged
+
     def _handle_task_with_understanding(
-        self, decision: CapabilityDecision, conversation_id: str, message: str | None
+        self, decision: CapabilityDecision, conversation_id: str, message: str | None, device_context=None
     ) -> tuple[str, list[SearchSource], str | None]:
         """TASK path when Handle This is configured: the request is understood
         FIRST. Only a READY, supported outcome creates a Job - and it does so
@@ -1327,6 +1353,12 @@ class JarvisCore:
         if outcome.job_params is None:
             return outcome.reply, [], None
 
+        # Handle This understood the objective and handed back the Job's arguments. Where the request came from
+        # is not part of the objective (Handle This is untouched); it is added to the planner's context here.
+        if device_context is not None:
+            outcome.job_params["request_context"] = self._with_sending_device(
+                outcome.job_params.get("request_context"), device_context
+            )
         result = self.tools.execute("create_job", params=outcome.job_params)
         if result.status is not ToolResultStatus.SUCCESS or not isinstance(result.data, dict):
             # A clarification that could not be parked (this deployment cannot

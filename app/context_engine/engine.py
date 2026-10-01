@@ -223,8 +223,9 @@ class ContextEngine:
             relevant_preferences=relevant_preferences,
             relevant_memory=relevant_memory,
             unconfirmed_candidates=unconfirmed_candidates,
-            # Who sent this request (from the Device Gateway), when known. Carried, never stored.
-            device_context=device_context,
+            # Who sent this request (from the Device Gateway), when known: the RequestContext's own, unless a
+            # caller passes one explicitly. Carried through unchanged - never stored, never derived.
+            device_context=device_context if device_context is not None else request_context.device_context,
             context_window=ContextWindow(
                 start=request_context.time_scope.start, end=request_context.time_scope.end
             ),

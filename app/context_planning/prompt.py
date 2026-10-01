@@ -17,7 +17,7 @@ from __future__ import annotations
 from app.context_engine.base import RequestContext
 from app.context_reasoning.base import ReasoningResult
 from app.context_reasoning.deterministic import DeterministicAnalysis
-from app.context_reasoning.prompt import collect_allowed_provenance
+from app.context_reasoning.prompt import collect_allowed_provenance, serialize_sending_device
 from app.world_model.base import ContextSnapshot
 
 
@@ -126,6 +126,7 @@ def build_planning_prompt(
         f"  {raw_request}\n\n"
         "REQUEST CONTEXT:\n"
         f"{_serialize_request_context(request_context)}\n\n"
+        f"{serialize_sending_device(request_context, snapshot)}"
         "REASONING (M16.3 - already produced, do not re-derive):\n"
         f"{_serialize_reasoning_result(reasoning_result)}\n\n"
         "ALLOWED PROVENANCE (the only identifiers you may cite in any "

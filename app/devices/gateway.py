@@ -57,7 +57,7 @@ class DeviceGateway:
             self._fail("unknown device or wrong credential", device_id)
         if device.trust_state is not TrustState.TRUSTED:
             self._fail(f"device is {device.trust_state.value}", device_id)
-        return self._context(device)
+        return self._context(self.registry.view(device))
 
     def check_in(self, device_id: object, credential: object) -> Device:
         """An authenticated "I am alive": ONLINE, last_seen = now. No background process is involved."""
@@ -73,6 +73,8 @@ class DeviceGateway:
             capabilities=device.capabilities,
             trust_state=device.trust_state,
             authentication_state=AuthenticationState.AUTHENTICATED,
+            name=device.name,
+            status=device.status,
         )
 
     @staticmethod
