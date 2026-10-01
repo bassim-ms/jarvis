@@ -84,9 +84,9 @@ def test_transcribe_returns_recognized_text(tmp_path, monkeypatch):
 
 
 def test_transcribe_strips_surrounding_whitespace(tmp_path, monkeypatch):
-    provider = _make_provider(tmp_path, monkeypatch, text="  hello rhasspy  ")
+    provider = _make_provider(tmp_path, monkeypatch, text="  hello jarvis  ")
 
-    assert provider.transcribe(b"\x00\x01" * 100, 16000) == "hello rhasspy"
+    assert provider.transcribe(b"\x00\x01" * 100, 16000) == "hello jarvis"
 
 
 def test_transcribe_returns_empty_string_for_silence(tmp_path, monkeypatch):

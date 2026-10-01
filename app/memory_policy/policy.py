@@ -190,14 +190,15 @@ class WritePolicy:
         """`existing_value`: what is already recorded for this proposal's key
         (None if nothing), looked up by the caller."""
         p = proposal
-        # 1. shape: one short clean line, or nothing
-        if not _is_clean_line(p.value, MAX_VALUE_CHARS) or not _is_clean_line(p.key, MAX_KEY_CHARS):
-            return WriteDecision(Destination.REJECT, "the text is empty, too long, or not a single line")
-
-        # 2. secrets: never, by anyone, through any door
-        sensitivity = classify_sensitivity(p.key, p.value, p.evidence, p.project)
+        # 1. secrets: never, by anyone, through any door. Checked FIRST - even on a line that is also too long or not a
+        # single line - so the rejection is recorded as a secret (and its key withheld from the journal).
+        sensitivity = classify_sensitivity(*(t for t in (p.key, p.value, p.evidence, p.project) if isinstance(t, str)))
         if sensitivity is Sensitivity.SECRET:
             return WriteDecision(Destination.REJECT, "it looks like a credential or secret", sensitivity)
+
+        # 2. shape: one short clean line, or nothing
+        if not _is_clean_line(p.value, MAX_VALUE_CHARS) or not _is_clean_line(p.key, MAX_KEY_CHARS):
+            return WriteDecision(Destination.REJECT, "the text is empty, too long, or not a single line", sensitivity)
 
         # 3. external content is data, never authority
         if p.origin is Origin.EXTERNAL:

@@ -97,6 +97,12 @@ class WriteStore(ABC):
         """Newest first."""
 
     @abstractmethod
+    def scrub_key(self, kind: str, key: str) -> int:
+        """Blank the recorded VALUES (value / previous_value) of every journal entry for this kind and key and
+        return how many were changed. Used when the user asks Jarvis to forget something: the audit trail keeps
+        THAT a write happened, never WHAT was written."""
+
+    @abstractmethod
     def stage_candidate(
         self, *, kind: str, key: str, value: str, category: str, origin: str, confidence: float, evidence: str
     ) -> tuple[Candidate, bool]:
@@ -117,6 +123,9 @@ class WriteStore(ABC):
 class SQLiteWriteStore(WriteStore):
     def __init__(self, db_path: str):
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        # "Forget" must really forget: have SQLite overwrite deleted content with zeros instead of leaving it in
+        # the file's free pages.
+        self._conn.execute("PRAGMA secure_delete = ON")
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.Lock()
         with self._lock:
@@ -211,6 +220,16 @@ class SQLiteWriteStore(WriteStore):
                 f"SELECT * FROM write_journal {where} ORDER BY at DESC, rowid DESC", params
             ).fetchall()
         return [JournalEntry(**dict(r)) for r in rows]
+
+    def scrub_key(self, kind: str, key: str) -> int:
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE write_journal SET value = NULL, previous_value = NULL "
+                "WHERE kind = ? AND key = ? AND (value IS NOT NULL OR previous_value IS NOT NULL)",
+                (kind, key),
+            )
+            self._conn.commit()
+        return cursor.rowcount
 
     # -- candidates ------------------------------------------------------------------------------
 

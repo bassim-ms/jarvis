@@ -126,7 +126,7 @@ class ToolArgumentError(ValueError):
 
 
 class Tool(ABC):
-    """A single capability Rhasspy can invoke.
+    """A single capability Jarvis can invoke.
 
     Implementations declare their own name, description, parameters, and
     permission level, and provide `execute`. Nothing outside a Tool's own

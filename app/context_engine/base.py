@@ -1,8 +1,8 @@
 """
 Context Engine abstraction (M16.2): RequestContext - a structured
-representation of what a request needs Rhasspy to UNDERSTAND, as opposed
+representation of what a request needs Jarvis to UNDERSTAND, as opposed
 to RequestRequirements (app/providers/requirements.py), which represents
-what a request needs Rhasspy to DO.
+what a request needs Jarvis to DO.
 
 The two are deliberately separate types, never merged into one enum:
 RequestRequirements' TaskType (GENERAL/REASONING/CODING/TOOL_USE/
@@ -355,8 +355,8 @@ class ContextWindow:
 
 @dataclass
 class RequestContext:
-    """A structured representation of what a request needs Rhasspy to
-    UNDERSTAND (as opposed to RequestRequirements: what it needs Rhasspy
+    """A structured representation of what a request needs Jarvis to
+    UNDERSTAND (as opposed to RequestRequirements: what it needs Jarvis
     to DO - see this module's own docstring). Built deterministically by
     app/context_engine/request_builder.py; consumed by
     app/context_engine/engine.py:ContextEngine.build_snapshot.

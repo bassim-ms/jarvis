@@ -7,7 +7,7 @@ file-based ones persist), guarded by a lock since FastAPI/the reminder
 scheduler can call into a store from more than one thread.
 
 Backed by a plain local file, so reminders - and whether they've already
-fired - survive a Rhasspy restart with no special recovery code: a new
+fired - survive a Jarvis restart with no special recovery code: a new
 SQLiteReminderStore pointed at the same db_path just sees the same rows
 `list_due` already knows how to query.
 """

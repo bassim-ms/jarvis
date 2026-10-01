@@ -92,7 +92,7 @@ def test_chat_prompt_is_enriched_with_real_world_model_context(tmp_path, monkeyp
 
     assert response.status_code == 200
     prompt = provider.prompts[0]
-    assert "What Rhasspy currently knows from the user's world model" in prompt
+    assert "What Jarvis currently knows from the user's world model" in prompt
     assert "Robotics Arm" in prompt
     assert "Printer nozzle isn't heating" in prompt
     assert prompt.endswith("User: hello there")

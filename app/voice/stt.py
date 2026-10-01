@@ -16,7 +16,7 @@ import vosk
 from app.voice.base import SpeechToTextError, SpeechToTextProvider
 
 # Vosk logs its own diagnostics straight to stderr by default (including
-# on every recognizer call) - silenced so app/voice's own [rhasspy] status
+# on every recognizer call) - silenced so app/voice's own [jarvis] status
 # lines stay the only console output.
 vosk.SetLogLevel(-1)
 

@@ -7,7 +7,7 @@ so it scales from a couple of fake test tools to hundreds of real ones
 without ever needing an `if tool_name == ...` branch or a code change here.
 
 Permission enforcement (see app/tools/base.py PermissionLevel) happens here,
-inside Rhasspy, so it applies no matter what eventually decides to call a
+inside Jarvis, so it applies no matter what eventually decides to call a
 tool - an AI provider's tool-calling loop, a script, or a human.
 """
 

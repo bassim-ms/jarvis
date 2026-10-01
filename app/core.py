@@ -167,6 +167,7 @@ the message/decision itself.
 
 import json
 import re
+from datetime import datetime
 
 from app.capability import (
     Capability,
@@ -185,6 +186,7 @@ from app.context_reasoning.base import ReasoningResult
 from app.context_reasoning.reasoner import ContextReasoner, ContextReasonerError
 from app.memory.base import MemoryStore, Message
 from app.memory.sqlite_store import SQLiteMemoryStore
+from app.memory_policy.derived import with_derived_facts
 from app.providers.base import AIProvider, ProviderError
 from app.providers.factory import create_default_ai_provider_manager
 from app.providers.manager import call_with_requirements
@@ -588,7 +590,7 @@ class JarvisCore:
             )
 
         history = self.memory.get_messages(conversation_id)
-        facts = self.memory.get_facts()
+        facts = with_derived_facts(self.memory.get_facts(), datetime.now().astimezone().date())
 
         try:
             decision = self.capability_router.route(message)
@@ -686,6 +688,22 @@ class JarvisCore:
             try:
                 memory_reply = self.memory_writer.command_reply(message, conversation_id)
             except Exception:  # noqa: BLE001
+                memory_reply = None
+        # The user's own questions about their memory ("what did I note down?", "what are my preferences?", "how old
+        # am I?") and an explicit "forget that preference" are answered from the existing stores by the same service -
+        # on the ordinary conversation path only (DIRECT, or SEARCH when only a freshness word like "today" put it there).
+        if (
+            memory_reply is None
+            and self.memory_writer is not None
+            and interaction_reply is None
+            and (
+                decision.capability is Capability.DIRECT
+                or (decision.capability is Capability.SEARCH and not is_explicit_search_request(message))
+            )
+        ):
+            try:
+                memory_reply = self.memory_writer.recall_reply(message, conversation_id)
+            except Exception:  # noqa: BLE001 - a fault here is "not a memory question"
                 memory_reply = None
 
         # M16.2: purely additive - computed only when a context_engine was
@@ -2037,7 +2055,7 @@ class JarvisCore:
 
         if not lines:
             return ""
-        return "What Rhasspy currently knows from the user's world model:\n" + "\n".join(lines)
+        return "What Jarvis currently knows from the user's world model:\n" + "\n".join(lines)
 
     @staticmethod
     def _format_reasoning_result(reasoning_result: ReasoningResult | None) -> str:
@@ -2083,7 +2101,7 @@ class JarvisCore:
                 f"This request is ambiguous given what's known - ask the user: "
                 f"{reasoning_result.clarification_question}"
             )
-        return "What Rhasspy's reasoning about this request concluded:\n" + "\n".join(
+        return "What Jarvis's reasoning about this request concluded:\n" + "\n".join(
             f"- {line}" for line in lines
         )
 
@@ -2137,9 +2155,9 @@ class JarvisCore:
         if planning_directive.requires_execution:
             lines.append(
                 "This may require actually starting a task - only if the user "
-                "asks for that, it goes through Rhasspy's existing task system."
+                "asks for that, it goes through Jarvis's existing task system."
             )
-        return "What Rhasspy's planning about this request concluded:\n" + "\n".join(
+        return "What Jarvis's planning about this request concluded:\n" + "\n".join(
             f"- {line}" for line in lines
         )
 

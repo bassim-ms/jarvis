@@ -4,7 +4,7 @@ sqlite3 - the exact same pattern as SQLiteJobStore/SQLiteTaskStore: one
 connection held for the store's lifetime, guarded by a lock since
 multiple threads (a future Context Engine, tests, tools) can call into
 it concurrently, backed by a plain local file so every entity survives a
-Rhasspy restart with no special recovery code.
+Jarvis restart with no special recovery code.
 
 One file, many tables - the same "one store, several typed tables" shape
 SQLiteJobStore already uses for jobs/plan/events (there, folded into one
@@ -81,6 +81,9 @@ class SQLiteWorldModelStore(WorldModelStore):
         self.db_path = db_path
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        # "Forget" must really forget: have SQLite overwrite deleted content with zeros instead of leaving it in
+        # the file's free pages.
+        self._conn.execute("PRAGMA secure_delete = ON")
         self._conn.row_factory = sqlite3.Row
         self._init_schema()
 
@@ -754,6 +757,12 @@ class SQLiteWorldModelStore(WorldModelStore):
                 f"SELECT * FROM preferences {where} ORDER BY updated_at DESC", params
             ).fetchall()
         return [self._row_to_preference(row) for row in rows]
+
+    def delete_preference(self, preference_id: str) -> bool:
+        with self._lock:
+            cursor = self._conn.execute("DELETE FROM preferences WHERE id = ?", (preference_id,))
+            self._conn.commit()
+        return cursor.rowcount > 0
 
     def save_preference(self, preference: Preference) -> None:
         with self._lock:

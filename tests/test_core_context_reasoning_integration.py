@@ -283,7 +283,7 @@ def test_reasoning_result_reaches_the_direct_prompt():
 
     assert len(reply_provider.prompts) == 1
     assert "nothing blocking it right now" in reply_provider.prompts[0]
-    assert "What Rhasspy's reasoning about this request concluded" in reply_provider.prompts[0]
+    assert "What Jarvis's reasoning about this request concluded" in reply_provider.prompts[0]
 
 
 # -- empty-context regression -------------------------------------------------

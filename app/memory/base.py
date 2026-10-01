@@ -44,3 +44,8 @@ class MemoryStore(ABC):
     @abstractmethod
     def get_facts(self) -> dict[str, str]:
         """Return all stored facts about the user."""
+
+    @abstractmethod
+    def delete_fact(self, key: str) -> bool:
+        """Forget one fact. True if it existed. Only ever called for an explicit, unambiguous request
+        from the user (see app/memory_policy/service.py)."""

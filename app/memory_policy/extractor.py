@@ -20,7 +20,10 @@ from __future__ import annotations
 
 import re
 
+from datetime import date
+
 from app.memory_policy.base import MAX_KEY_CHARS, Kind, Origin, WriteProposal
+from app.memory_policy.derived import DOB_KEY, parse_date, plausible_birth_date
 
 _I = re.IGNORECASE
 MAX_PROPOSALS = 3
@@ -49,8 +52,9 @@ _LEAD = _rx(
 _SENTENCES = re.compile(r"(?<=[.!])\s+")
 
 _PREFER = _rx(r"^(?:i|we)\s+(?:really\s+|much\s+|generally\s+|always\s+|now\s+)?prefer\s+(?P<v>[^.!?]{2,120})$")
+_LIKE = _rx(r"^(?:i|we)\s+(?:really\s+|generally\s+|always\s+)?(?:like|love|enjoy)\s+(?P<v>[^.!?]{2,120})$")
 _BUDGET = _rx(
-    r"^my\s+(?:current\s+|maximum\s+|max\s+|monthly\s+|printer\s+)?budget\s+(?:is|=|:)\s*"
+    r"^my\s+(?:(?:current|maximum|max|monthly|printer|preferred|laptop|phone)\s+){0,2}budget\s+(?:is|=|:)\s*"
     r"(?:now\s+|about\s+|around\s+|up\s+to\s+)?(?P<v>[^.!?]{1,60})$"
 )
 _PROJECT = _rx(
@@ -61,6 +65,19 @@ _PROJECT = _rx(
 _CMD_REMEMBER = _rx(
     r"^\s*(?:(?:yes|ok|okay|please|jarvis)[,.!\s]+)*remember(?:\s+(?:that|this|it))?"
     r"(?:\s+anyway)?\s*[:,-]?\s*(?:that\s+)?(?P<clause>[^\n]+?)\s*$"
+)
+#: "Jarvis, note this down: I prefer X." / "Note that ..." / "Make a note that ..." / "Keep in mind that ..." - the same deliberate
+#: memory command as "remember that ...", worded the way people say it. ("don't forget to ..." is a reminder, not a note.)
+_CMD_NOTE = _rx(
+    r"^\s*(?:(?:yes|ok|okay|please|jarvis|hey\s+jarvis)[,.!\s]+)*"
+    r"(?:(?:note|jot|write)\s+(?:this\s+|that\s+|it\s+)?down|make\s+a\s+note|take\s+a\s+note|note\s+that|"
+    r"keep\s+in\s+mind|don'?t\s+forget)"
+    r"(?:\s+that)?\s*[:,-]?\s*(?:that\s+)?(?P<clause>[^\n]+?)\s*$"
+)
+#: "My date of birth is 14 March 2009." / "My birthday is ..." / "I was born on ...": kept as a stable ISO date; age is derived.
+_DOB = _rx(
+    r"^(?:my\s+(?:date\s+of\s+birth|birth\s?date|birthday|dob)\s+(?:is|=|:)\s*(?:on\s+)?|i\s+was\s+born\s+(?:on\s+)?)"
+    r"(?P<v>[^.!?]{4,40})$"
 )
 _CMD_GOAL = _rx(r"^\s*(?:please\s+)?(?:set|make)\s+my\s+goal\s+(?:to|as|:)\s*(?P<t>[^\n?]{2,120}?)\s*[.!]?\s*$")
 _CMD_GOAL_ADD = _rx(
@@ -111,6 +128,17 @@ def _statement(sentence: str, origin: Origin, evidence: str) -> WriteProposal | 
             return WriteProposal(
                 Kind.PREFERENCE, "prefers:" + slug(value), value, origin, evidence=evidence, **flags
             )
+    if origin is Origin.USER_COMMAND and (m := _LIKE.match(text)):
+        # "Remember that I like concise explanations." A DELIBERATE command makes it a preference; the same words said in
+        # passing ("I like this song") are not captured from chat.
+        value = _clean(m.group("v"))
+        if value:
+            return WriteProposal(Kind.PREFERENCE, "likes:" + slug(value), value, origin, evidence=evidence, **flags)
+    if m := _DOB.match(text):
+        born = parse_date(m.group("v"))
+        if born is not None and plausible_birth_date(born, date.today()):
+            return WriteProposal(Kind.FACT, DOB_KEY, born.isoformat(), origin, evidence=evidence, **flags)
+        return None  # an unclear or numeric-only date is never guessed (the age question explains what to say)
     if m := _BUDGET.match(text):
         value = _clean(m.group("v"))
         if value and re.search(r"\d", value):
@@ -152,11 +180,11 @@ def parse_command(message: str) -> list[WriteProposal] | None:
     if m := _CMD_PROJECT.match(message):
         return [WriteProposal(Kind.PROJECT, "project", _project_name(m.group("v")), Origin.USER_COMMAND, evidence=message.strip())]
 
-    m = _CMD_REMEMBER.match(message)
+    m = _CMD_REMEMBER.match(message) or _CMD_NOTE.match(message)
     if not m:
         return None
     clause = m.group("clause").strip()
-    if re.match(r"to\b", clause, _I):  # "remember to call mom" is a reminder, not a fact
+    if re.match(r"(?:to|of|about)\b", clause, _I):  # "remember to call mom" is a reminder; "make a note of that" has no content
         return None
     proposals: list[WriteProposal] = []
     for sentence in _SENTENCES.split(clause):

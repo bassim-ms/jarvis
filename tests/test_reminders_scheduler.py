@@ -44,7 +44,7 @@ def test_tick_notifies_for_a_due_reminder():
     processed = scheduler.tick()
 
     assert processed == 1
-    assert notifier.calls == [("Rhasspy Reminder", "walk the dog")]
+    assert notifier.calls == [("Jarvis Reminder", "walk the dog")]
 
 
 def test_tick_ignores_reminders_not_yet_due():
@@ -163,7 +163,7 @@ def test_tick_isolates_an_unexpected_exception_from_one_reminder():
     processed = scheduler.tick()  # must not raise
 
     assert processed == 0
-    assert notifier.calls == [("Rhasspy Reminder", "boom")]
+    assert notifier.calls == [("Jarvis Reminder", "boom")]
 
 
 def test_tick_continues_processing_other_reminders_after_one_fails_unexpectedly():
@@ -186,7 +186,7 @@ def test_tick_continues_processing_other_reminders_after_one_fails_unexpectedly(
     processed = scheduler.tick()  # must not raise
 
     assert processed == 1
-    assert ("Rhasspy Reminder", "fine") in notifier.calls
+    assert ("Jarvis Reminder", "fine") in notifier.calls
     assert store.get(ok_reminder.id).status is ReminderStatus.TRIGGERED
 
 
@@ -207,7 +207,7 @@ def test_tick_isolates_an_overflow_error_computing_the_next_occurrence():
     processed = scheduler.tick()  # must not raise
 
     assert processed == 0
-    assert notifier.calls == [("Rhasspy Reminder", "extreme")]
+    assert notifier.calls == [("Jarvis Reminder", "extreme")]
 
 
 def test_background_thread_survives_a_failed_poll_and_keeps_running():
@@ -244,7 +244,7 @@ def test_background_thread_survives_a_failed_poll_and_keeps_running():
         scheduler.stop()
 
     assert store.list_due_calls >= 2
-    assert notifier.calls == [("Rhasspy Reminder", "after recovery")]
+    assert notifier.calls == [("Jarvis Reminder", "after recovery")]
 
 
 # --- restart recovery --------------------------------------------------
@@ -271,7 +271,7 @@ def test_scheduler_recovers_reminders_due_while_jarvis_was_offline(tmp_path):
     processed = scheduler.tick()
 
     assert processed == 1
-    assert notifier.calls == [("Rhasspy Reminder", "missed while offline")]
+    assert notifier.calls == [("Jarvis Reminder", "missed while offline")]
     assert restarted_store.get(reminder.id).status is ReminderStatus.TRIGGERED
 
 
@@ -293,7 +293,7 @@ def test_scheduler_recovers_a_recurring_reminder_after_restart(tmp_path):
     processed = scheduler.tick()
 
     assert processed == 1
-    assert notifier.calls == [("Rhasspy Reminder", "daily check-in")]
+    assert notifier.calls == [("Jarvis Reminder", "daily check-in")]
 
 
 # --- background thread lifecycle ----------------------------------------
@@ -313,7 +313,7 @@ def test_start_runs_tick_in_the_background_until_stopped():
     finally:
         scheduler.stop()
 
-    assert notifier.calls == [("Rhasspy Reminder", "background")]
+    assert notifier.calls == [("Jarvis Reminder", "background")]
 
 
 def test_start_is_a_no_op_when_already_running():

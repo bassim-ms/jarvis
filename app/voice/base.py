@@ -1,6 +1,6 @@
 """
 Voice abstraction (M10): microphone -> wake word -> STT -> (existing
-`/chat`) -> TTS -> speaker, entirely as a *client* of Rhasspy - see
+`/chat`) -> TTS -> speaker, entirely as a *client* of Jarvis - see
 app/voice/session.py's module docstring for why this never imports
 `app.core.core` directly.
 

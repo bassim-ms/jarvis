@@ -1,5 +1,5 @@
 """
-Rhasspy - entry point.
+Jarvis - entry point.
 
 FastAPI server with a health check endpoint and a /chat endpoint backed by
 Jarvis Core, which routes to an AI provider (Gemini for now) through the
@@ -10,7 +10,7 @@ notifications for due ones. Since M8, it also starts a background
 AutomationEngine that polls persisted automations and runs their
 already-permission-checked tool actions when due. Since M9, it also
 wires up Google Calendar (OAuth-authorized separately via
-`python -m app.calendar.authorize`) and local Rhasspy Tasks - neither
+`python -m app.calendar.authorize`) and local Jarvis Tasks - neither
 needs a background process of its own. Since M15, it also starts a
 background JobEngine that plans and executes goal-driven Jobs (see
 app/orchestration/) - a TASK-capability chat message just creates a

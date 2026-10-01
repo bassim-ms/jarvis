@@ -4,7 +4,7 @@ user wants X; plan how to get there using existing tools; execute the
 plan; track progress; recover from failure" - built entirely on top of
 architecture M1-M14 already established, not a parallel system.
 
-Deliberately NOT the same thing as app.tasks.Task ("Rhasspy Tasks", M9):
+Deliberately NOT the same thing as app.tasks.Task ("Jarvis Tasks", M9):
 that's a plain user-facing todo item with no plan, no steps, and no
 execution of its own - just create/list/complete/cancel free text. A Job
 here is the opposite: it has no meaning to a user as a standalone note,

@@ -1,9 +1,9 @@
 """
-Run Rhasspy's hands-free voice interface:
+Run Jarvis's hands-free voice interface:
 
     python -m app.voice.run
 
-Requires the regular Rhasspy server to already be running separately
+Requires the regular Jarvis server to already be running separately
 (`uvicorn app.main:app`) - this process is only ever a *client* of the
 existing `/chat` endpoint (see app/voice/chat_client.py); it never
 imports `app.core.core` and never starts its own copy of Core, the
@@ -47,12 +47,12 @@ def check_in_at_startup(chat_client: ChatClient) -> None:
     try:
         chat_client.check_in()
     except (DeviceAuthError, DeviceCredentialError) as exc:  # rejected, or no credential at all: never carry on anonymously
-        print(f"[rhasspy] startup failed: {exc}")
+        print(f"[jarvis] startup failed: {exc}")
         raise SystemExit(1) from exc
     except ChatClientError as exc:
-        print(f"[rhasspy] could not check in yet ({exc}) - will retry when the first request is sent")
+        print(f"[jarvis] could not check in yet ({exc}) - will retry when the first request is sent")
         return
-    print("[rhasspy] checked in as the registered PC")
+    print("[jarvis] checked in as the registered PC")
 
 
 def main() -> None:
@@ -65,7 +65,7 @@ def main() -> None:
         if not chat_client.authenticated:  # defence in depth: the PC voice client is never the anonymous /chat client
             raise DeviceCredentialError("The voice client has no device credential, so it will not start.")
     except (MicrophoneError, WakeWordError, SpeechToTextError, TextToSpeechError, ChatClientError) as exc:
-        print(f"[rhasspy] startup failed: {exc}")
+        print(f"[jarvis] startup failed: {exc}")
         raise SystemExit(1) from exc
     check_in_at_startup(chat_client)
 

@@ -154,8 +154,8 @@ def test_chat_prompt_is_enriched_with_real_planning_output(tmp_path, monkeypatch
 
     assert response.status_code == 200
     prompt = provider.prompts[0]
-    assert "What Rhasspy's reasoning about this request concluded" in prompt
-    assert "What Rhasspy's planning about this request concluded" in prompt
+    assert "What Jarvis's reasoning about this request concluded" in prompt
+    assert "What Jarvis's planning about this request concluded" in prompt
     assert "Work through the remaining assembly steps around other commitments." in prompt
     assert prompt.endswith("User: finish my robotics arm")
 
@@ -179,7 +179,7 @@ def test_chat_with_informational_request_never_invokes_the_planner(tmp_path, mon
     assert response.status_code == 200
     assert reasoner_provider.calls == 1  # M16.3 still reasons about this
     assert planner_provider.calls == 0  # M16.4 never does
-    assert "What Rhasspy's planning about this request concluded" not in provider.prompts[0]
+    assert "What Jarvis's planning about this request concluded" not in provider.prompts[0]
 
 
 # -- D: no relevant context still works, unchanged -------------------------

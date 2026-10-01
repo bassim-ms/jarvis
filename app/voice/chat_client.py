@@ -1,8 +1,8 @@
 """
-HTTP client for Rhasspy's chat endpoints (app/main.py) - the *only* way
+HTTP client for Jarvis's chat endpoints (app/main.py) - the *only* way
 app/voice ever reaches Jarvis Core. Deliberately never imports
 `app.core.core`: voice is just another client of the already-running
-Rhasspy server, exactly like curl or a future UI would be.
+Jarvis server, exactly like curl or a future UI would be.
 
 Two modes, chosen by whether the client was given device credentials:
 
@@ -159,9 +159,9 @@ class ChatClient:
                     "Device authentication failed: the server did not accept this PC's credential "
                     "(it may have been revoked or replaced). Nothing was sent. Ask the admin to register this PC again."
                 ) from None
-            raise ChatClientError(f"Failed to reach Rhasspy at {url}: {exc}") from exc
+            raise ChatClientError(f"Failed to reach Jarvis at {url}: {exc}") from exc
         except httpx.HTTPError as exc:
-            raise ChatClientError(f"Failed to reach Rhasspy at {url}: {exc}") from exc
+            raise ChatClientError(f"Failed to reach Jarvis at {url}: {exc}") from exc
         try:
             return response.json()
         except ValueError as exc:

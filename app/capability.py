@@ -55,7 +55,7 @@ from app.tools.command import match_invocation_head
 
 
 class Capability(Enum):
-    """A handler Rhasspy can dispatch a message to.
+    """A handler Jarvis can dispatch a message to.
 
     DIRECT, SEARCH, TOOL, and TASK were the M15 set; TASK_STATUS and
     CONFIRMATION were added right after, to close two gaps the initial
@@ -291,7 +291,7 @@ _SELF_DEV_APPROVAL_PATTERN = re.compile(
 #: ("what's the status of my task?", "what are you doing?", "is that
 #: finished?", "show me my running tasks"), same discipline as every
 #: other pattern here. Deliberately does NOT match a bare "my tasks" -
-#: that phrase alone is genuinely ambiguous with app.tasks (Rhasspy
+#: that phrase alone is genuinely ambiguous with app.tasks (Jarvis
 #: Tasks, M9's unrelated simple todo list) and is left to existing
 #: DIRECT/SEARCH/TOOL handling; every pattern below instead requires a
 #: word implying an in-progress GOAL specifically ("status," "doing,"

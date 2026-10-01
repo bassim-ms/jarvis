@@ -11,9 +11,9 @@ That narrowness is the whole security boundary this milestone adds:
 persisted "do this later" state can only ever mean "show a notification,"
 never "run this tool/command" - see app/reminders/base.py.
 
-Survives a Rhasspy restart with no special recovery code: `list_due` is a
+Survives a Jarvis restart with no special recovery code: `list_due` is a
 plain "due_at <= now" query against ReminderStore's persistent SQLite
-backing, so a Reminder that became due while Rhasspy was offline is simply
+backing, so a Reminder that became due while Jarvis was offline is simply
 found and triggered on the first poll after startup, exactly like any
 other due reminder - restart recovery is a property of persistence, not a
 poller feature.
@@ -140,7 +140,7 @@ class ReminderScheduler:
             success, detail = self._emit(reminder)
         else:
             try:
-                self.notifier.notify(title="Rhasspy Reminder", message=reminder.text)
+                self.notifier.notify(title="Jarvis Reminder", message=reminder.text)
                 success, detail = True, ""
             except NotifierError as exc:
                 success, detail = False, str(exc)

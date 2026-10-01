@@ -621,6 +621,9 @@ class WorldModelService:
         self.store.save_preference(preference)
         return preference
 
+    def delete_preference(self, preference_id: str) -> bool:
+        return self.store.delete_preference(preference_id)
+
     def get_preference(self, preference_id: str) -> Preference | None:
         return self.store.get_preference(preference_id)
 

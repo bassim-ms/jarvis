@@ -168,7 +168,7 @@ class _CallbackHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.end_headers()
         self.wfile.write(
-            b"<html><body>Rhasspy calendar authorization complete. "
+            b"<html><body>Jarvis calendar authorization complete. "
             b"You can close this tab.</body></html>"
         )
 

@@ -4,7 +4,7 @@ the exact same pattern as SQLiteAutomationStore/SQLiteReminderStore/
 SQLiteTaskStore: one connection held for the store's lifetime, guarded by
 a lock since FastAPI/JobEngine can call into a store from more than one
 thread, backed by a plain local file so a Job's plan and progress survive
-a Rhasspy restart with no special recovery code (see
+a Jarvis restart with no special recovery code (see
 app/orchestration/engine.py:JobEngine._recover_interrupted_steps for the
 one piece of state - a step caught mid-execution - that does need
 explicit, deliberate handling on top of that).

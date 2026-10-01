@@ -134,8 +134,8 @@ def test_chat_prompt_is_enriched_with_real_reasoning_output(tmp_path, monkeypatc
 
     assert response.status_code == 200
     prompt = provider.prompts[0]
-    assert "What Rhasspy currently knows from the user's world model" in prompt
-    assert "What Rhasspy's reasoning about this request concluded" in prompt
+    assert "What Jarvis currently knows from the user's world model" in prompt
+    assert "What Jarvis's reasoning about this request concluded" in prompt
     assert "Nothing is currently blocking the robotics arm project." in prompt
     assert prompt.endswith("User: tell me about my robotics arm project")
 
@@ -162,7 +162,7 @@ def test_chat_with_empty_world_model_matches_no_context_reasoner_at_all(tmp_path
     empty_reasoning_prompt = provider_with_reasoner.prompts[0]
 
     assert empty_reasoning_prompt == baseline_prompt
-    assert "Rhasspy's reasoning" not in baseline_prompt
+    assert "Jarvis's reasoning" not in baseline_prompt
     # The reasoner's own empty-ContextSnapshot short circuit means the
     # provider backing it was never even called for this message.
     assert reasoner_provider.calls == 0

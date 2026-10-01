@@ -75,7 +75,7 @@ def test_send_raises_on_connection_error(monkeypatch):
     monkeypatch.setattr(chat_client_module.httpx, "post", fake_post)
     client = ChatClient(base_url="http://127.0.0.1:8000")
 
-    with pytest.raises(ChatClientError, match="Failed to reach Rhasspy"):
+    with pytest.raises(ChatClientError, match="Failed to reach Jarvis"):
         client.send("hello", None)
 
 

@@ -105,13 +105,13 @@ def test_the_conversation_continues_across_messages(pc):
 def test_the_voice_session_end_to_end_speaks_the_reply_through_the_authenticated_path(pc):
     tts = FakeTTSProvider()
     frames = [WAKE_FRAME, LOUD_FRAME, QUIET_FRAME, QUIET_FRAME]
-    session, _ = make_session(frames, stt_provider=FakeSTTProvider(text="hello rhasspy"), tts_provider=tts, chat_client=pc.chat)
+    session, _ = make_session(frames, stt_provider=FakeSTTProvider(text="hello jarvis"), tts_provider=tts, chat_client=pc.chat)
 
     session.run_one_cycle()
 
     assert tts.spoken == ["an ordinary chat reply"] and session.conversation_id
     assert [c.path for c in pc.calls] == ["/device/check-in", "/device/chat"]
-    assert pc.core_calls[0][0][0] == "hello rhasspy" and device_context_seen(pc)[0].device_id == pc.credentials.device_id
+    assert pc.core_calls[0][0][0] == "hello jarvis" and device_context_seen(pc)[0].device_id == pc.credentials.device_id
 
 
 # --- check-in and ONLINE --------------------------------------------------------------------------------------------------------------------
@@ -326,7 +326,7 @@ def test_a_server_that_is_down_is_the_existing_connection_error_with_no_fallback
 
     monkeypatch.setattr(chat_client_module.httpx, "post", down)
 
-    with pytest.raises(ChatClientError, match="Failed to reach Rhasspy") as caught:
+    with pytest.raises(ChatClientError, match="Failed to reach Jarvis") as caught:
         pc.chat.send("hello", None)
 
     assert not isinstance(caught.value, DeviceAuthError) and pc.credentials.credential not in str(caught.value)

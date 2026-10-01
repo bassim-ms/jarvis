@@ -2,7 +2,7 @@
 SQLite-backed implementation of TokenStore, using Python's stdlib sqlite3 -
 the exact same pattern as SQLiteReminderStore/SQLiteMemoryStore: one
 connection held for the store's lifetime, guarded by a lock, backed by a
-plain local file so a completed OAuth authorization survives a Rhasspy
+plain local file so a completed OAuth authorization survives a Jarvis
 restart with no special recovery code - `get()` simply returns whatever
 was last `save()`d.
 

@@ -1,4 +1,4 @@
-# Rhasspy
+# Jarvis
 
 Personal AI assistant project. This is **Milestone 11: Multi-Provider AI
 Foundation** — `app/providers/` now has three more `AIProvider`
@@ -14,7 +14,7 @@ the full provider table (base URL/required env/model config per
 provider) and what's still deliberately missing. `SearchRouter`,
 `CapabilityRouter`, `ToolCallBuilder`, Core's DIRECT/SEARCH/TOOL
 dispatch, Hands-Free Voice + Wake Word (M10), Google Calendar + Local
-Rhasspy Tasks (M9), Persistent Automation Engine (M8), Persistent Tasks,
+Jarvis Tasks (M9), Persistent Automation Engine (M8), Persistent Tasks,
 Reminders & Background Scheduling (M7), natural-language tool selection
 (M6.16), capability routing (M6.13-M6.15), and the search pipeline
 (M6.5-6.12) are all unchanged. No provider fallback/rotation, no quota
@@ -39,7 +39,7 @@ required for any of the three new providers yet.
 
 Run these from inside the `jarvis` folder.
 
-1. Create a virtual environment (keeps Rhasspy's packages separate from the
+1. Create a virtual environment (keeps Jarvis's packages separate from the
    rest of your system):
    ```
    python3 -m venv venv
@@ -62,11 +62,11 @@ Run these from inside the `jarvis` folder.
    to the base URL of a SearXNG instance you run or trust, and optionally
    `JARVIS_SEARCH_PROVIDER_ORDER`, `JARVIS_SEARCH_CACHE_TTL`, and
    `JARVIS_SEARCH_CACHE_DB_PATH` (see [Web Search](#web-search) below).
-   Reminders, automations, and Rhasspy Tasks need no setup at all - they
+   Reminders, automations, and Jarvis Tasks need no setup at all - they
    work with the defaults in `.env.example` (see
    [Persistent Tasks, Reminders & Background Scheduling](#persistent-tasks-reminders--background-scheduling-m7),
    [Persistent Automation Engine](#persistent-automation-engine-m8), and
-   [Rhasspy Tasks](#rhasspy-tasks-m9) below). To use the calendar tools,
+   [Jarvis Tasks](#jarvis-tasks-m9) below). To use the calendar tools,
    set `JARVIS_GOOGLE_CLIENT_ID`/`JARVIS_GOOGLE_CLIENT_SECRET` (from a
    Google Cloud "Desktop app" OAuth client) and run
    `python -m app.calendar.authorize` once (see
@@ -89,7 +89,7 @@ curl http://127.0.0.1:8000/health
 
 Expected output:
 ```json
-{"status": "ok", "app": "Rhasspy", "environment": "development"}
+{"status": "ok", "app": "Jarvis", "environment": "development"}
 ```
 
 Try the chat endpoint (requires `JARVIS_GEMINI_API_KEY` to be set):
@@ -177,10 +177,10 @@ jarvis/
     voice/
       base.py             - Microphone/WakeWordProvider/SpeechToTextProvider/TextToSpeechProvider interfaces + *Error types
       microphone.py         - SoundDeviceMicrophone: sounddevice-backed Microphone
-      wake_word.py           - OpenWakeWordProvider: local "hey rhasspy" wake-word detection
+      wake_word.py           - OpenWakeWordProvider: local "hey jarvis" wake-word detection
       stt.py                  - VoskSTTProvider: local, offline speech-to-text
       tts.py                   - WindowsSapiTTSProvider: powershell.exe + System.Speech.Synthesis
-      chat_client.py            - ChatClient: the only way this module ever reaches Rhasspy (POSTs to /chat)
+      chat_client.py            - ChatClient: the only way this module ever reaches Jarvis (POSTs to /chat)
       session.py                 - VoiceState/VoiceSession: the wake-word -> listen -> STT -> /chat -> TTS loop
       factory.py                  - builds the default Microphone/providers/ChatClient from config
       run.py                       - `python -m app.voice.run`: the application entry point
@@ -256,13 +256,13 @@ jarvis/
   .gitignore
 ```
 
-As Rhasspy grows, new capabilities (dashboard, memory, agents, voice,
+As Jarvis grows, new capabilities (dashboard, memory, agents, voice,
 hardware control, etc.) will each get their own module under `app/`,
 keeping this structure from turning into a single giant file.
 
 ## Tool System
 
-Rhasspy is meant to grow to support many integrations (web, email, calendar,
+Jarvis is meant to grow to support many integrations (web, email, calendar,
 files, WhatsApp, smart home, robotics, printers, ...). To avoid rewriting
 Core every time one is added, tools live behind a small, generic
 architecture in `app/tools/`:
@@ -816,7 +816,7 @@ WebSearchTool -> ResultQualityProvider -> CachedSearchProvider -> SearchProvider
   implementation, following the same pattern as `SQLiteMemoryStore`: one
   held `sqlite3` connection guarded by a lock, a single `search_cache`
   table (`key`, `value`, `expires_at`), and a local file so cached results
-  survive Rhasspy restarts. No Redis or other external service. An entry
+  survive Jarvis restarts. No Redis or other external service. An entry
   past its `expires_at` is returned as a plain miss (`None`), not an
   error.
 - **`CachedSearchProvider`** (`app/search/cached.py`) is itself a
@@ -1109,7 +1109,7 @@ message (already routed to SEARCH by SearchRouter)
   what was actually searched. Neither dataclass's shape changed.
 - Zero added latency or cost: the builder is plain string/regex matching,
   no network or model call, so it adds nothing to the per-request cost of
-  a SEARCH turn - matching Rhasspy's zero-dollar/minimal-cost stance. A
+  a SEARCH turn - matching Jarvis's zero-dollar/minimal-cost stance. A
   misfire (over- or under-enriching) degrades to today's existing failure
   mode (a possibly-weak search), never a crash, and never touches the
   M6.8 grounding guarantee - answers still only ever cite real, validated
@@ -1135,7 +1135,7 @@ See `.env.example` for all four.
 
 ## Persistent Tasks, Reminders & Background Scheduling (M7)
 
-A new `app/reminders/` module adds Rhasspy's first form of scheduled state:
+A new `app/reminders/` module adds Jarvis's first form of scheduled state:
 persistent reminders, a background poller that fires them, and a free
 local notification mechanism - all deliberately narrow, so "something can
 be scheduled" never becomes "something can be automated":
@@ -1181,7 +1181,7 @@ ReminderScheduler (background thread, polls every JARVIS_REMINDER_POLL_INTERVAL_
   thread that calls `tick()` (`list_due(now)` -> notify each -> record the
   outcome) on a fixed interval. **Restart recovery needs no special code**:
   `list_due` is just `status = 'pending' AND due_at <= now` against
-  persistent SQLite, so a reminder that came due while Rhasspy was offline
+  persistent SQLite, so a reminder that came due while Jarvis was offline
   is simply found and triggered on the very first poll after startup,
   exactly like any other due reminder.
 - **`Notifier`/`WindowsToastNotifier`/`ConsoleNotifier`**
@@ -1353,7 +1353,7 @@ AutomationEngine (background thread, polls every JARVIS_AUTOMATION_POLL_INTERVAL
   same function, including automation tools registered after the engine
   object already exists) is still visible once the engine actually runs.
 - **Extensibility, not implementation**: nothing here builds toward
-  Rhasspy writing code, creating/modifying files, testing/debugging, or
+  Jarvis writing code, creating/modifying files, testing/debugging, or
   designing hardware workflows - none of that exists yet. But nothing
   here blocks it either: once a future milestone registers a new kind of
   `Tool` for one of those (with a deliberately-chosen permission level),
@@ -1417,7 +1417,7 @@ CreateEventTool/UpdateEventTool/DeleteEventTool/ListEventsTool (app/calendar/too
   `READ`; `create_event`/`update_event` are `CONFIRM` (a created/changed
   event can be visible to other people, unlike a local reminder/task);
   `delete_event` is `DANGEROUS` (destructive, not easily undone from
-  Rhasspy's side). None of that is enforced in `app/calendar/tools.py`
+  Jarvis's side). None of that is enforced in `app/calendar/tools.py`
   itself - `ToolRegistry.execute` (unchanged) already does it for every
   tool. A direct consequence, requiring zero changes anywhere in
   `app/automation/*`: `AutomationEngine` (M8) only ever runs
@@ -1444,7 +1444,7 @@ Configuration:
 - `JARVIS_CALENDAR_TOKEN_DB_PATH` - local SQLite file the OAuth token is
   stored in. Defaults to `jarvis_calendar_token.db`. Never commit it.
 
-## Rhasspy Tasks (M9)
+## Jarvis Tasks (M9)
 
 `app/tasks/` is a small, local-only, SQLite-backed todo-item model -
 deliberately independent from M7 Reminders, following the same
@@ -1482,13 +1482,13 @@ Configuration:
 
 A new `app/voice/` module adds a fully local, $0 voice interface - a
 separate process, `python -m app.voice.run`, that talks to the
-**already-running** Rhasspy server (`uvicorn app.main:app`) purely as an
+**already-running** Jarvis server (`uvicorn app.main:app`) purely as an
 HTTP client of the existing `/chat` endpoint:
 
 ```
 [app/voice/run.py - a separate process, requires the server already running]
   microphone (continuous, wake-word-only listening)
-    -> WakeWordProvider.process_frame(frame) -> "hey rhasspy" heard?
+    -> WakeWordProvider.process_frame(frame) -> "hey jarvis" heard?
     -> Microphone.read() again, now capturing the utterance until silence
     -> SpeechToTextProvider.transcribe(audio) -> text
     -> ChatClient.send(text, conversation_id) -> POST 127.0.0.1:8000/chat  [EXISTING, unmodified]
@@ -1514,8 +1514,8 @@ HTTP client of the existing `/chat` endpoint:
 - **Wake word: openWakeWord** (`app/voice/wake_word.py`) - Apache-2.0,
   fully local ONNX models, **no account or API key of any kind** (unlike
   commercial wake-word SDKs that require a signed-up access key even on
-  their free tier). Ships a pretrained **"hey_rhasspy"** model - matching
-  the assistant's name (Rhasspy) - that you download once (see Setup below);
+  their free tier). Ships a pretrained **"hey_jarvis"** model - matching
+  the assistant's name (Jarvis) - that you download once (see Setup below);
   never fetched automatically. `OpenWakeWordProvider.process_frame`
   resets the model's internal prediction buffer right after a detection
   so one utterance of the wake word can't fire twice.
@@ -1563,7 +1563,7 @@ HTTP client of the existing `/chat` endpoint:
   than losing it. Startup-time failures (no microphone, no downloaded
   model) are reported once, clearly, by `app/voice/run.py` - never
   discovered deep inside the loop.
-- Terminal status only - no GUI: `[rhasspy] wake-word listener active` /
+- Terminal status only - no GUI: `[jarvis] wake-word listener active` /
   `wake word detected` / `listening...` / `processing...` / `speaking...`
   / `returning to wake-word listening`, plus clear one-line messages for
   errors and empty/silent speech.
@@ -1575,7 +1575,7 @@ HTTP client of the existing `/chat` endpoint:
    text-to-speech uses Windows SAPI directly, no new package).
 2. **TODO:** download the wake-word model:
    `python -m app.voice.download_wakeword_model` (fetches the pretrained
-   "hey_rhasspy" model + openWakeWord's required feature models from its
+   "hey_jarvis" model + openWakeWord's required feature models from its
    GitHub releases - a one-time, $0 file download, not a runtime API
    call). Set `JARVIS_VOICE_WAKEWORD_MODEL_PATH` to the path it prints.
 3. **TODO:** download a Vosk speech-to-text model yourself from
@@ -1610,7 +1610,7 @@ this section for what comes after them. This is **foundation only**:
 selected, no fallback, no retries, no quota tracking, and no health
 scoring or rotation - that's the next milestone. `SearchRouter`,
 `CapabilityRouter`, `ToolCallBuilder`, Core's DIRECT/SEARCH/TOOL
-dispatch, voice, reminders, automations, calendar, and Rhasspy Tasks are
+dispatch, voice, reminders, automations, calendar, and Jarvis Tasks are
 all completely unchanged.
 
 Every provider still implements the same `AIProvider.generate_reply(message: str) -> str`
@@ -1653,7 +1653,7 @@ token and the account id are set.
 - Add a real key to `.env` for whichever provider(s) you want to actually
   call (see `.env.example` for every placeholder + a safe example model
   name); leaving all of them but Gemini blank changes nothing about how
-  Rhasspy runs today, since Core still only ever constructs `GeminiProvider()`.
+  Jarvis runs today, since Core still only ever constructs `GeminiProvider()`.
 - Tests (`tests/test_openai_compatible_provider.py`,
   `test_groq_provider.py`, `test_openrouter_provider.py`,
   `test_cloudflare_provider.py`, `test_provider_factory.py`) mock every
@@ -1668,7 +1668,7 @@ dedicated local model as the final fallback - hosted on a separate,
 network-connected machine (not this one), reached over the local network
 through a secure API, so it stays fully independent of any cloud
 provider's availability/quota. After that, a possible emergency
-browser/computer-use fallback (Rhasspy driving a web AI service's UI like
+browser/computer-use fallback (Jarvis driving a web AI service's UI like
 a human would) if every API-based option is unavailable. Neither is
 built yet - `app/providers/factory.py`'s by-name registry is already the
 right extension point for both: a local or browser-driven provider would
@@ -1683,11 +1683,11 @@ These were not decided now, to avoid overbuilding before they're needed:
 - Database (SQLite) — added when the first feature that needs persistence
   (memory, the search cache, and now tasks/reminders as of M7) is built.
   Each still gets its own local SQLite file rather than a shared one.
-- Barge-in (interrupting Rhasspy mid-sentence by speaking), always-on
+- Barge-in (interrupting Jarvis mid-sentence by speaking), always-on
   cloud transcription, wake-word/STT/TTS cloud services, a GUI, remote
   voice clients, and voice-controlled hardware — all explicitly deferred
   from M10. Barge-in specifically needs simultaneous mic-listening-
-  during-TTS-playback plus echo cancellation (so Rhasspy doesn't hear
+  during-TTS-playback plus echo cancellation (so Jarvis doesn't hear
   itself) - meaningfully harder than push-word-triggered capture, and
   not attempted here; `TextToSpeechProvider.stop()` covers the narrower
   "Ctrl+C interrupts speech" case this milestone does support.
@@ -1704,7 +1704,7 @@ These were not decided now, to avoid overbuilding before they're needed:
 - Google Tasks sync, multi-calendar/multi-account support, attendee/
   invite management, full RRULE authoring for recurring events, and
   calendar write-conflict/double-booking detection — all explicitly
-  deferred from M9. Rhasspy Tasks stays local-only rather than syncing to
+  deferred from M9. Jarvis Tasks stays local-only rather than syncing to
   a second Google API/OAuth surface; `GoogleCalendarProvider` targets a
   single primary calendar and returns each occurrence of a recurring
   Google event as its own `CalendarEvent` (read-only, via
@@ -1726,7 +1726,7 @@ These were not decided now, to avoid overbuilding before they're needed:
   automatic-permission tools only ("safe actions only for now" in this
   milestone's scope); a deliberate future design is needed for what an
   unattended-but-still-confirmed action would even mean.
-- Rhasspy writing/modifying code, running tests, or designing hardware
+- Jarvis writing/modifying code, running tests, or designing hardware
   workflows — explicitly out of scope for M8; see this section's
   "Extensibility, not implementation" note above for why the automation
   action architecture doesn't need to change when that capability

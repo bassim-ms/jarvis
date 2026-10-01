@@ -1,5 +1,5 @@
 """
-Task abstraction (M9): a local, independent todo-item model - "Rhasspy
+Task abstraction (M9): a local, independent todo-item model - "Jarvis
 Tasks" - deliberately separate from Reminder (app/reminders/base.py). A
 Reminder's whole purpose is a scheduled notification (M7); a Task has no
 scheduler entry, no trigger, and no notification of its own - just a

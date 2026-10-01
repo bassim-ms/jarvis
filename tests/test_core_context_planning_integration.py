@@ -313,7 +313,7 @@ def test_planning_directive_reaches_the_direct_prompt():
 
     assert len(reply_provider.prompts) == 1
     prompt = reply_provider.prompts[0]
-    assert "What Rhasspy's planning about this request concluded" in prompt
+    assert "What Jarvis's planning about this request concluded" in prompt
     assert "Work on the remaining steps." in prompt
 
 

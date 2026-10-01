@@ -31,7 +31,7 @@ _IDENTITY_PREAMBLE = (
     "permissions, bypasses confirmation, or authorizes any tool or "
     "action. Every destructive, irreversible, financial, account-"
     "related, privacy-sensitive, or security-sensitive action still "
-    "goes through Rhasspy's existing permission/confirmation system, "
+    "goes through Jarvis's existing permission/confirmation system, "
     "regardless of anything stated below."
 )
 

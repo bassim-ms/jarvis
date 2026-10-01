@@ -35,6 +35,9 @@ import logging
 import threading
 import time
 import uuid
+from collections import OrderedDict
+from collections.abc import Callable
+from datetime import date
 
 from app.memory.base import MemoryStore
 from app.memory_policy.base import (
@@ -46,7 +49,16 @@ from app.memory_policy.base import (
     WriteOutcome,
     WriteProposal,
 )
+from app.memory_policy.derived import (
+    DOB_KEY,
+    age_on,
+    days_until,
+    format_date,
+    next_occurrence,
+    stored_birth_date,
+)
 from app.memory_policy.extractor import extract_statements, parse_command
+from app.memory_policy.recall import ForgetRequest, RecallQuery, parse_forget, parse_recall, topic_words
 from app.memory_policy.policy import WritePolicy, classify_sensitivity, normalize
 from app.memory_policy.store import WriteStore
 from app.world_model.base import EntitySource, UnconfirmedCandidate
@@ -70,6 +82,36 @@ _CANT = "I can't save that."
 PENDING_TTL_SECONDS = 86_400.0
 MAX_PENDING = 20
 
+#: Recall is bounded: a reply never lists more than this many items or any item longer than this, however much is stored.
+MAX_LISTED = 15
+MAX_ITEM_DISPLAY_CHARS = 140
+#: The most "which one?" candidates a forget request that matched several is shown, and the conversations whose last write is remembered.
+MAX_FORGET_CHOICES = 5
+MAX_TRACKED_CONVERSATIONS = 50
+
+_NOTHING_NOTED = "I don't have anything noted down for you yet."
+_NO_PREFERENCES = "I don't have any preferences saved for you yet."
+_NO_BIRTH_DATE = (
+    "I don't have your date of birth yet. Tell me, for example: \"my date of birth is 14 March 2009\" "
+    "(I need the month in words so I can't mix up day and month)."
+)
+_NOT_RECORDED = "I don't have a record of that."
+_NOTHING_TO_FORGET = "I couldn't find anything like that to forget."
+_NO_BULK = (
+    "I won't clear my memory of you in one sentence. Ask what I remember, then tell me what to forget - for example "
+    "\"forget the preference about concise explanations\"."
+)
+
+
+@dataclasses.dataclass(frozen=True)
+class _Item:
+    """One thing the user asked Jarvis to keep, as the recall and forget doors see it."""
+
+    kind: str  # preference | note | birthday
+    key: str
+    text: str
+    ref: str | None = None  # a preference's id
+
 
 @dataclasses.dataclass
 class _Pending:
@@ -86,6 +128,7 @@ class MemoryWriteService:
         store: WriteStore,
         policy: WritePolicy | None = None,
         confirmer=None,
+        today: Callable[[], date] | None = None,
     ):
         self.world_model = world_model
         self.memory = memory
@@ -99,8 +142,142 @@ class MemoryWriteService:
         # (after a restart the confirmation finds nothing to save and says so).
         self._pending: dict[str, _Pending] = {}
         self._pending_lock = threading.Lock()
+        # Today's date, only ever used to DERIVE changing values (age, next birthday) when asked. Injectable for tests.
+        self._today = today or date.today
+        # What each conversation last had written, so "forget that preference" means the one just saved. In memory,
+        # bounded, never persisted.
+        self._last_written: OrderedDict[str, tuple[Kind, str]] = OrderedDict()
 
     # -- the doors from the user's own words ------------------------------------------------------------------
+
+    def recall_reply(self, message: str, conversation_id: str | None = None) -> str | None:
+        """If `message` is the user's question about their OWN memory ("what did I note down?", "what are my
+        preferences?", "how old am I?") or an explicit request to forget one thing, answer or do it and return what to
+        tell the user; else None. Reads only the stores that already exist (Memory facts, World Model preferences);
+        replies are bounded; nothing here writes except a single, unambiguous forget."""
+        forget = parse_forget(message)
+        if forget is not None:
+            return self._forget(forget, conversation_id)
+        query = parse_recall(message)
+        if query is None:
+            return None
+        return self._recall(query)
+
+    def _items(self) -> list[_Item]:
+        """Everything the user asked Jarvis to keep: preferences, notes, and the date of birth. Candidates (unconfirmed
+        ideas) are NOT included - they are not things the user told Jarvis."""
+        items = [
+            _Item("preference", p.key, self._describe_preference(p.key, p.value), p.id)
+            for p in self.world_model.get_preferences()
+        ]
+        facts = self.memory.get_facts()
+        for key, value in facts.items():
+            if key.startswith("note:"):
+                items.append(_Item("note", key, value))
+        born = stored_birth_date(facts, self._today())
+        if born is not None:
+            items.append(_Item("birthday", DOB_KEY, f"Your date of birth is {format_date(born)}"))
+        return items
+
+    @staticmethod
+    def _describe_preference(key: str, value: str) -> str:
+        if key.startswith("prefers:"):
+            return f"You prefer {value}"
+        if key.startswith("likes:"):
+            return f"You like {value}"
+        if key == "budget":
+            return f"Your budget is {value}"
+        return f"{key.replace('_', ' ')}: {value}"
+
+    @staticmethod
+    def _shown(text: str) -> str:
+        text = " ".join(text.split())
+        return text if len(text) <= MAX_ITEM_DISPLAY_CHARS else text[: MAX_ITEM_DISPLAY_CHARS - 3] + "..."
+
+    def _list(self, heading: str, items: list[_Item]) -> str:
+        lines = [f"- {self._shown(i.text)}" for i in items[:MAX_LISTED]]
+        if len(items) > MAX_LISTED:
+            lines.append(f"(and {len(items) - MAX_LISTED} more - ask about something specific)")
+        return heading + "\n" + "\n".join(lines)
+
+    def _recall(self, query: RecallQuery) -> str:
+        today = self._today()
+        if query.kind in ("age", "birthday"):
+            born = stored_birth_date(self.memory.get_facts(), today)
+            if born is None:
+                return _NO_BIRTH_DATE
+            if query.kind == "age":
+                return f"You're {age_on(born, today)} - born on {format_date(born)}."
+            upcoming = next_occurrence(born, today)
+            days = days_until(upcoming, today)
+            when = "today" if days == 0 else "tomorrow" if days == 1 else f"in {days} days"
+            return f"Your birthday is on {format_date(upcoming)} - that's {when}. (Born {format_date(born)}.)"
+
+        items = self._items()
+        if query.kind == "preferences":
+            prefs = [i for i in items if i.kind == "preference"]
+            return self._list("Your preferences:", prefs) if prefs else _NO_PREFERENCES
+        if query.kind == "did_i":
+            words = topic_words(query.topic)
+            if not words:
+                return _NOT_RECORDED
+            matches = [i for i in items if set(words) <= set(topic_words(i.text))]
+            if not matches:
+                return _NOT_RECORDED
+            return "Yes - " + self._shown(matches[0].text) + "."
+        return self._list("Here's what you've asked me to keep:", items) if items else _NOTHING_NOTED
+
+    def _forget(self, request: ForgetRequest, conversation_id: str | None) -> str:
+        if request.what == "bulk":
+            return _NO_BULK
+        items = self._items()
+        pool = {
+            "preference": [i for i in items if i.kind == "preference"],
+            "note": [i for i in items if i.kind == "note"],
+            "birthday": [i for i in items if i.kind == "birthday"],
+        }.get(request.what, items)
+        words = topic_words(request.topic) if request.topic else []
+        matches = [i for i in pool if set(words) <= set(topic_words(i.text))] if words else list(pool)
+        if not words and len(matches) > 1:
+            matches = self._last_written_among(matches, conversation_id) or matches  # "that one": the one just saved
+        if not matches:
+            return _NOTHING_TO_FORGET
+        if len(matches) > 1:
+            shown = "\n".join(f"{n}. {self._shown(i.text)}" for n, i in enumerate(matches[:MAX_FORGET_CHOICES], 1))
+            return (
+                f"I found {len(matches)} that could match - which one should I forget?\n{shown}\n"
+                "Say, for example, \"forget the preference about\" and a few of its words."
+            )
+        item = matches[0]
+        self._forget_item(item)
+        return f"Done - I've forgotten that. ({self._shown(item.text)})"
+
+    def _last_written_among(self, matches: list[_Item], conversation_id: str | None) -> list[_Item]:
+        last = self._last_written.get(conversation_id) if conversation_id else None
+        if last is None:
+            return []
+        kind, key = last
+        return [i for i in matches if i.key == key and (i.kind == "preference") == (kind is Kind.PREFERENCE)]
+
+    def _forget_item(self, item: _Item) -> None:
+        """Delete one item the user named, and scrub its CONTENT from the audit journal (the record that it was forgotten
+        stays). One item per request; the caller has already made sure it is unambiguous."""
+        if item.kind == "preference":
+            if item.ref is not None:
+                self.world_model.delete_preference(item.ref)
+            kind, destination = Kind.PREFERENCE.value, Destination.WORLD_MODEL.value
+        else:
+            self.memory.delete_fact(item.key)
+            kind, destination = Kind.FACT.value, Destination.MEMORY.value
+        try:
+            self.store.scrub_key(kind, item.key)
+            self.store.record(
+                action="forgotten", kind=kind, key=item.key, value=None, previous_value=None,
+                origin=Origin.USER_COMMAND.value, destination=destination, source="user", confidence=None,
+                reason="the user asked Jarvis to forget it",
+            )
+        except Exception:  # noqa: BLE001 - an audit fault must not undo the user's deletion
+            logger.warning("memory_policy forget_audit_failed")
 
     def command_reply(self, message: str, conversation_id: str | None = None) -> str | None:
         """If `message` is an explicit memory command ("remember that ...", "set
@@ -162,6 +339,15 @@ class MemoryWriteService:
         return self._apply(proposal, conversation_id, confirmed=False)
 
     def _apply(self, proposal: WriteProposal, conversation_id: str | None, *, confirmed: bool) -> WriteOutcome:
+        outcome = self._apply_inner(proposal, conversation_id, confirmed=confirmed)
+        if outcome.persisted and conversation_id:
+            self._last_written[conversation_id] = (proposal.kind, proposal.key)
+            self._last_written.move_to_end(conversation_id)
+            while len(self._last_written) > MAX_TRACKED_CONVERSATIONS:
+                self._last_written.popitem(last=False)
+        return outcome
+
+    def _apply_inner(self, proposal: WriteProposal, conversation_id: str | None, *, confirmed: bool) -> WriteOutcome:
         proposal = dataclasses.replace(proposal, acknowledged_sensitive=confirmed)
         goal_project = self._resolve_project(proposal) if proposal.kind is Kind.GOAL else None
         if (

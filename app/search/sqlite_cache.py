@@ -4,7 +4,7 @@ SQLite-backed SearchCache implementation.
 Uses Python's stdlib sqlite3 directly, following the same pattern as
 SQLiteMemoryStore (app/memory/sqlite_store.py): one connection held for the
 store's lifetime, guarded by a lock since FastAPI can call in from more than
-one thread, backed by a plain file so cached results survive Rhasspy
+one thread, backed by a plain file so cached results survive Jarvis
 restarts. No Redis or other external service.
 """
 

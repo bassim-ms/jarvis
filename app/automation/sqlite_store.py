@@ -5,7 +5,7 @@ sqlite3 - the exact same pattern as SQLiteReminderStore
 (app/memory/sqlite_store.py): one connection held for the store's
 lifetime, guarded by a lock since FastAPI/the automation engine can call
 into a store from more than one thread, backed by a plain local file so
-automations - and their execution history - survive a Rhasspy restart.
+automations - and their execution history - survive a Jarvis restart.
 
 `trigger.recurrence`/`trigger.reminder_id` get their own typed columns
 (fixed shape, exactly like Reminder's own recurrence columns); `action`

@@ -415,6 +415,6 @@ def test_build_prompt_still_ends_with_the_unaltered_user_message():
 
 def test_build_prompt_world_model_section_precedes_the_user_message():
     prompt = JarvisCore._build_prompt("hello there", [], {}, _full_snapshot())
-    world_model_index = prompt.index("What Rhasspy currently knows")
+    world_model_index = prompt.index("What Jarvis currently knows")
     user_index = prompt.index("User: hello there")
     assert world_model_index < user_index

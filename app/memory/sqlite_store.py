@@ -25,6 +25,9 @@ class SQLiteMemoryStore(MemoryStore):
         self.db_path = db_path
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        # "Forget" must really forget: have SQLite overwrite deleted content with zeros instead of leaving it in
+        # the file's free pages.
+        self._conn.execute("PRAGMA secure_delete = ON")
         self._conn.row_factory = sqlite3.Row
         self._init_schema()
 
@@ -100,6 +103,12 @@ class SQLiteMemoryStore(MemoryStore):
                 (key, value, _now()),
             )
             self._conn.commit()
+
+    def delete_fact(self, key: str) -> bool:
+        with self._lock:
+            cursor = self._conn.execute("DELETE FROM facts WHERE key = ?", (key,))
+            self._conn.commit()
+        return cursor.rowcount > 0
 
     def get_facts(self) -> dict[str, str]:
         with self._lock:

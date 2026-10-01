@@ -12,7 +12,7 @@ things about the user:
   * NOT the World Model (app/world_model): that is structured, curated
     knowledge (projects, goals, commitments...). A note is free text and
     unvetted - it may contain whatever a web page said.
-  * NOT Rhasspy Tasks (app/tasks): those are todo items.
+  * NOT Jarvis Tasks (app/tasks): those are todo items.
 
 Nothing here (or anywhere) promotes a note into memory or the World Model
 automatically; that would have to be a separate, deliberate, user-approved

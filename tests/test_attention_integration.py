@@ -255,7 +255,7 @@ def test_a_reminder_scheduler_without_a_router_still_calls_the_notifier_directly
 
     ReminderScheduler(store=store, notifier=notifier).tick()
 
-    assert notifier.calls == [("Rhasspy Reminder", "walk the dog")]
+    assert notifier.calls == [("Jarvis Reminder", "walk the dog")]
 
 
 def test_importance_is_decided_in_one_table_from_the_events_kind_never_its_text():

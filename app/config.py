@@ -1,9 +1,9 @@
 """
-Central configuration for Rhasspy.
+Central configuration for Jarvis.
 
 All settings are read from environment variables (or a local .env file).
 Nothing sensitive is hard-coded here — see .env.example for the list of
-variables Rhasspy understands.
+variables Jarvis understands.
 """
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -11,7 +11,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     # Basic app info
-    app_name: str = "Rhasspy"
+    app_name: str = "Jarvis"
     environment: str = "development"  # development | production
 
     # Server
@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     # for the registry these are selected through). Each is independently
     # optional: leaving a provider's API key blank just means that
     # provider raises a clear config error if it's ever actually invoked -
-    # it never affects importing, testing, or starting Rhasspy. FreeLLMAPI
+    # it never affects importing, testing, or starting Jarvis. FreeLLMAPI
     # (below, after Cloudflare) extends this same set as the final
     # fallback - it's a self-hosted gateway rather than a cloud vendor, so
     # its base URL is user-configurable instead of fixed like the others.
@@ -117,6 +117,15 @@ class Settings(BaseSettings):
     automations_db_path: str = "jarvis_automations.db"
     automation_poll_interval_seconds: float = 30.0
 
+    # Scheduling foundation (see app/scheduling/): the IANA time zone NEW schedules are created in (JARVIS_TIMEZONE, e.g.
+    # "Europe/London"). Empty -> the system's zone is used only if it can be determined reliably; if not, creating a
+    # time-based schedule fails with a clear message instead of guessing. An existing schedule keeps the zone it was
+    # created in. Also: how late a due run may be and still simply run (the grace window), and the shortest gap between
+    # runs of a NEW repeating schedule. None of these change any existing reminder or automation.
+    timezone: str = ""
+    schedule_grace_seconds: int = 600
+    schedule_min_interval_minutes: int = 15
+
     # Google Calendar (OAuth 2.0 desktop/localhost flow, see
     # app/calendar/) - client_id/client_secret come from a Google Cloud
     # "Desktop app" OAuth client; no default and no key is hard-coded
@@ -127,7 +136,7 @@ class Settings(BaseSettings):
     calendar_id: str = "primary"
     calendar_token_db_path: str = "jarvis_calendar_token.db"
 
-    # Rhasspy Tasks (local-only todo items, see app/tasks/) - independent
+    # Jarvis Tasks (local-only todo items, see app/tasks/) - independent
     # of Reminders; no scheduling, no notifications, no external sync.
     tasks_db_path: str = "jarvis_tasks.db"
 

@@ -5,7 +5,7 @@ background context for Jarvis's own replies - it is never a set of
 executable instructions, and it never grants permissions, bypasses
 confirmation, executes tools, modifies any stored personal data, or
 overrides any existing security policy. All of that is decided entirely by
-Rhasspy's existing code (ToolRegistry permissions, Job confirmation,
+Jarvis's existing code (ToolRegistry permissions, Job confirmation,
 etc.), never by this file.
 
 ## Core identity

@@ -978,7 +978,7 @@ def test_status_query_phrasings_route_to_task_status(message):
 
 @pytest.mark.parametrize("message", ["my tasks", "show me my tasks", "list my tasks"])
 def test_bare_my_tasks_does_not_route_to_task_status(message):
-    """Deliberately excluded - ambiguous with app.tasks (Rhasspy Tasks,
+    """Deliberately excluded - ambiguous with app.tasks (Jarvis Tasks,
     M9's unrelated todo list); only phrasings implying an in-progress
     GOAL (status/doing/finished/running/active/in-progress) trigger
     TASK_STATUS, never a bare 'my tasks' with no such qualifier."""

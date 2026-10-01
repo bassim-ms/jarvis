@@ -5,7 +5,7 @@ Voice Session (M10): the hands-free
 Deliberately talks to Jarvis Core only through `ChatClient`
 (app/voice/chat_client.py), which only ever calls the server's HTTP
 endpoints (app/main.py) - `VoiceSession` never imports `app.core.core`.
-Voice is just another client of an already-running Rhasspy server, the
+Voice is just another client of an already-running Jarvis server, the
 same way curl or a future UI would be; this milestone needed (and made)
 zero changes to Core, ToolRegistry, or any Tool. As run by
 `python -m app.voice.run` the ChatClient is the registered, authenticated
@@ -58,7 +58,7 @@ class VoiceState(Enum):
 
 
 def _status(message: str) -> None:
-    print(f"[rhasspy] {message}")
+    print(f"[jarvis] {message}")
 
 
 class VoiceSession:
@@ -108,8 +108,8 @@ class VoiceSession:
                 try:
                     self.run_one_cycle()
                 except Exception as exc:  # noqa: BLE001 - one bad interaction must not crash the process
-                    print(f"[rhasspy] error: {exc}")
-                    print("[rhasspy] returning to wake-word listening")
+                    print(f"[jarvis] error: {exc}")
+                    print("[jarvis] returning to wake-word listening")
                     self.state = VoiceState.WAKE_WORD_LISTENING
         except KeyboardInterrupt:
             print()
@@ -132,7 +132,7 @@ class VoiceSession:
         _status("processing...")
         text = self.stt_provider.transcribe(audio, VOICE_SAMPLE_RATE).strip()
         if not text:
-            print("[rhasspy] didn't catch anything - returning to wake-word listening")
+            print("[jarvis] didn't catch anything - returning to wake-word listening")
             self.state = VoiceState.WAKE_WORD_LISTENING
             return
 
@@ -143,7 +143,7 @@ class VoiceSession:
         try:
             self.tts_provider.speak(reply)
         except TextToSpeechError as exc:
-            print(f"[rhasspy] speech synthesis failed ({exc}) - reply was: {reply}")
+            print(f"[jarvis] speech synthesis failed ({exc}) - reply was: {reply}")
 
         _status("returning to wake-word listening")
         self.state = VoiceState.WAKE_WORD_LISTENING

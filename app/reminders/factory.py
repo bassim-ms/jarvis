@@ -13,7 +13,7 @@ from app.reminders.sqlite_store import SQLiteReminderStore
 
 
 def create_default_notifier() -> Notifier:
-    """WindowsToastNotifier on Windows (the only platform Rhasspy targets
+    """WindowsToastNotifier on Windows (the only platform Jarvis targets
     today - see README); ConsoleNotifier elsewhere, so tests and any
     non-Windows dev environment still run without a native toast backend."""
     if platform.system() == "Windows":

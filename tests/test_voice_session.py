@@ -123,7 +123,7 @@ def make_session(
     session = VoiceSession(
         microphone=mic,
         wake_word_provider=wake_word_provider or FakeWakeWordProvider(),
-        stt_provider=stt_provider or FakeSTTProvider(text="hello rhasspy"),
+        stt_provider=stt_provider or FakeSTTProvider(text="hello jarvis"),
         tts_provider=tts_provider or FakeTTSProvider(),
         chat_client=chat_client or FakeChatClient(),
         silence_seconds=silence_seconds,

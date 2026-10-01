@@ -1,6 +1,6 @@
 """
 Personal World Model abstraction (M16.1): a deterministic, structured
-record of what Rhasspy currently believes is true about the user's
+record of what Jarvis currently believes is true about the user's
 life/projects - "what IS true," never "what was said" (that's
 MemoryStore, app/memory/base.py) and never "what should be done about
 it" (that's a future Context Engine, M16.2+, reasoning over a
@@ -516,8 +516,8 @@ class Goal:
 class Commitment:
     """An external obligation - "submit the physics assignment by
     Thursday" - deliberately NOT the same thing as an internal Task/Job:
-    a Task/Job is work Rhasspy tracks/executes; a Commitment is an
-    obligation that exists whether or not Rhasspy ever does anything
+    a Task/Job is work Jarvis tracks/executes; a Commitment is an
+    obligation that exists whether or not Jarvis ever does anything
     about it. `project_id` is optional (a commitment need not belong to
     any project)."""
 
@@ -922,6 +922,10 @@ class WorldModelStore(ABC):
     @abstractmethod
     def save_preference(self, preference: Preference) -> None:
         """Persist every mutable field of an existing Preference."""
+
+    @abstractmethod
+    def delete_preference(self, preference_id: str) -> bool:
+        """Remove a Preference. True if it existed."""
 
     # -- Relationships: TaskLink ----------------------------------------
 

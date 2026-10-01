@@ -25,3 +25,7 @@ pywin32==312
 # in-memory screenshot (pyautogui.screenshot() also needs it). See
 # app/observation/screen.py: a capture is never written to disk.
 pillow==12.3.0
+
+# Scheduling (see app/scheduling/): the time-zone database zoneinfo needs on Windows. Free, no runtime service. Time-zone and
+# daylight-saving rules come from here; nothing is fetched at runtime.
+tzdata==2026.4
