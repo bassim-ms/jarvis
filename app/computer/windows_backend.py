@@ -42,7 +42,9 @@ from app.computer.base import (
     MouseButton,
     ScreenInfo,
     WindowInfo,
+    is_switchable,
     normalize_key_input,
+    validate_window_query,
     validate_coordinates,
     validate_scroll_amount,
     validate_text,
@@ -154,6 +156,24 @@ def _find_window_for_executable(executable: str) -> int | None:
 
     win32gui.EnumWindows(visit, None)
     return found[0] if found else None
+
+
+def _list_switchable_windows() -> list[tuple[int, str, str]]:
+    """(hwnd, title, process) of every visible, titled, non-cloaked top-level window a `switch_window` may target,
+    topmost first (EnumWindows walks the Z-order). Credential / shell / system windows are filtered out here."""
+    found: list[tuple[int, str, str]] = []
+
+    def visit(hwnd: int, _extra: object) -> bool:
+        if win32gui.IsWindowVisible(hwnd) and not _is_cloaked(hwnd):
+            title = win32gui.GetWindowText(hwnd)
+            if title:
+                process = WindowsComputerBackend._resolve_process_name(hwnd)
+                if is_switchable(title, process):
+                    found.append((hwnd, title, process))
+        return True
+
+    win32gui.EnumWindows(visit, None)
+    return found
 
 
 def _foreground_window() -> int:
@@ -280,6 +300,20 @@ class WindowsComputerBackend(ComputerBackend):
                 f"Opened {url!r}, but Windows did not let {executable} become "
                 "the active window."
             )
+
+    def switch_window(self, title: str) -> WindowInfo:
+        """Composes the helpers `open_url` already uses (`_bring_to_foreground`, `_foreground_window`): the topmost
+        matching local window is activated, and success is only claimed once Windows really made it foreground."""
+        query = validate_window_query(title).lower()
+        matches = [w for w in _list_switchable_windows() if query in w[1].lower()]
+        if not matches:
+            raise ComputerControlError(f"No visible window title contains {title!r}.")
+        hwnd, window_title, process = matches[0]
+        if _foreground_window() != hwnd:
+            _bring_to_foreground(hwnd)
+        if _foreground_window() != hwnd:
+            raise ComputerControlError(f"Windows did not let '{window_title}' become the active window.")
+        return WindowInfo(title=window_title, process_name=process, is_maximized=self._is_maximized(hwnd))
 
     def type_text(self, text: str) -> None:
         validate_text(text)

@@ -66,8 +66,12 @@ from app.handle_this.intake import HandleThisIntake
 
 logger = logging.getLogger("jarvis.handle_this")
 
-#: The families a Job may be handed. COMPUTER_WORKFLOW is deliberately absent.
-HANDOFF_FAMILIES = frozenset({GoalFamily.RESEARCH, GoalFamily.ANALYSIS, GoalFamily.ORGANIZATION})
+#: The families a Job may be handed. COMPUTER_WORKFLOW is included (Slice 5) - but being handed on grants nothing: the
+#: intake has already refused any objective whose computer actions are not all available as tools, and the Planner
+#: only ever sees the Job registry's own allowlist.
+HANDOFF_FAMILIES = frozenset(
+    {GoalFamily.RESEARCH, GoalFamily.ANALYSIS, GoalFamily.ORGANIZATION, GoalFamily.COMPUTER_WORKFLOW}
+)
 
 _ADDRESSES = ("Sir", "Boss")
 
@@ -113,6 +117,7 @@ _STARTED = {
     GoalFamily.RESEARCH: "I'll do the research and come back with what I find.",
     GoalFamily.ANALYSIS: "I'll work through that and come back with my analysis.",
     GoalFamily.ORGANIZATION: "I'll get that organised and let you know when it's done.",
+    GoalFamily.COMPUTER_WORKFLOW: "I'll take care of that on this computer and tell you what I find.",
     GoalFamily.MIXED: "I'll work through all of that and come back to you.",
 }
 
@@ -183,7 +188,7 @@ class HandleThisService:
         if request.status is not HandleThisStatus.READY:  # nothing else may fall through to a Job
             return HandleThisOutcome(OutcomeKind.FAILED, f"{who}, {_FAILURE_DEFAULT}")
         if not set(request.required_families) <= HANDOFF_FAMILIES:
-            return self._unsupported(request)  # e.g. a computer workflow: never handed to a Job
+            return self._unsupported(request)  # a family that is not handed to a Job
 
         logger.info("handle_this start_job request=%s family=%s", request.id, request.goal_family.value)
         return HandleThisOutcome(

@@ -67,7 +67,7 @@ import re
 from dataclasses import dataclass
 from enum import Enum
 
-from app.handle_this.signals import is_informational, is_purchase_oriented, mentions_product
+from app.handle_this.signals import is_computer_workflow, is_informational, is_purchase_oriented, mentions_product
 from app.morning_brief.recognition import is_morning_brief_request
 
 MAX_MESSAGE_CHARS = 4000
@@ -92,6 +92,7 @@ class ObjectiveReason(Enum):
     NO_SUBSTANTIVE_ACTION = "no_substantive_action"
     NOT_A_REQUEST = "not_a_request"
     READ_ONLY_REVIEW = "read_only_review"
+    COMPUTER_WORKFLOW = "computer_workflow"
 
 
 @dataclass(frozen=True)
@@ -244,6 +245,13 @@ def detect_objective(message: object) -> ObjectiveRoutingDecision:
 
     present = tuple(name for name, pattern in _KINDS if pattern.search(text))
     kinds = set(present)
+    if is_computer_workflow(text):
+        # "Open my browser and go to example.com", "Open X and scroll to Y": operating the computer is a delegated
+        # objective. Entering Handle This grants nothing - whether each action asked for is actually available is
+        # the capability boundary's decision, and an unavailable one (a click, typing) is declined there.
+        return _decision(
+            ObjectiveRoute.HANDLE_THIS, ObjectiveReason.COMPUTER_WORKFLOW, message, present + ("computer",)
+        )
     if _DELEGATE_START.match(text):
         return _decision(
             ObjectiveRoute.HANDLE_THIS, ObjectiveReason.DELEGATED_OBJECTIVE, message, present or ("delegate",)

@@ -61,8 +61,10 @@ _DECLARED_TOOLS: dict[GoalFamily, frozenset[str]] = {
     GoalFamily.COMPUTER_WORKFLOW: frozenset(
         {
             "get_active_window",
+            "switch_window",
             "observe_page",
             "verify_observation",
+            "observe_screen",
             "get_screen_info",
             "get_screen_size",
             "open_application",
@@ -75,6 +77,26 @@ _DECLARED_TOOLS: dict[GoalFamily, frozenset[str]] = {
             "scroll",
         }
     ),
+}
+
+
+#: For each kind of computer action (app/handle_this/signals.py `detect_computer_actions`), the tools a Job needs to do
+#: it - ALL of them. The only way an action is "available" is that every one of its tools is actually offered to the
+#: Planner, so wording alone (or a recognised COMPUTER_WORKFLOW) can never make a click, a typed word or an
+#: application launch possible: `form` needs click_mouse AND type_text, and those are not offered. `tab` and `close`
+#: name tools that do not exist yet, so they are never available.
+COMPUTER_ACTION_TOOLS: dict[str, tuple[str, ...]] = {
+    "navigate": ("open_url",),
+    "scroll": ("scroll",),
+    "switch_window": ("switch_window",),
+    "click": ("click_mouse",),
+    "type": ("type_text",),
+    "key": ("press_key",),
+    "mouse": ("move_mouse",),
+    "launch_app": ("open_application",),
+    "form": ("click_mouse", "type_text"),
+    "tab": ("switch_tab",),
+    "close": ("close_window",),
 }
 
 
@@ -125,6 +147,19 @@ class CapabilityBoundary:
             elif offered is not None and not (self._tools[family] & offered):
                 unavailable.append(family)
         return BoundaryAssessment(unavailable=tuple(unavailable))
+
+
+    def assess_actions(self, actions: Iterable[str], available_tools: Iterable[str] | None) -> tuple[str, ...]:
+        """The computer actions that cannot be done with the tools the Planner would be offered. An unknown kind is
+        always missing (fail closed); `None` (no availability information) checks nothing."""
+        if available_tools is None:
+            return ()
+        offered = frozenset(available_tools)
+        return tuple(
+            action
+            for action in actions
+            if not (action in COMPUTER_ACTION_TOOLS and set(COMPUTER_ACTION_TOOLS[action]) <= offered)
+        )
 
 
 DEFAULT_BOUNDARY = CapabilityBoundary()

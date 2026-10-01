@@ -33,6 +33,7 @@ from app.tools.analyze import AnalyzeTool
 from app.tools.registry import ToolRegistry
 from test_job_data_flow import ScriptedProvider, _Unused, ref, step
 
+PUBLIC_DNS = lambda host: ["93.184.216.34"]  # noqa: E731 - every host "resolves" to a public address
 START = "https://example.test/start"
 SECOND = "https://example.test/more"
 START_PAGE = (
@@ -109,7 +110,7 @@ class World:
         self.web = Web(pages if pages is not None else {START: START_PAGE, SECOND: "<title>Second Page</title><body><p>Details.</p></body>"})
         self.observer = ObservationEngine(fetcher=self.web, backend=self.backend)
         self.registry = ToolRegistry()
-        register_job_computer_tools(self.registry, self.backend)
+        register_job_computer_tools(self.registry, self.backend, resolver=PUBLIC_DNS)
         register_observation_tools(self.registry, self.observer)
         self.registry.register(AnalyzeTool(provider=self.provider))
         self.registry.register(CreateJobTool(store=self.jobs, context_provider=self.memory.get_facts))
@@ -296,11 +297,12 @@ def test_a_page_link_followed_by_the_plan_still_goes_through_open_url_validation
 def test_plan_validation_is_the_gate_the_input_tools_and_screen_capture_are_not_plannable():
     world = World([[]])
     retry = RetryPolicy(max_attempts=1, delay_seconds=0)
-    for tool in ("type_text", "press_key", "click_mouse", "double_click", "move_mouse", "open_application", "observe_screen"):
+    for tool in ("type_text", "press_key", "click_mouse", "double_click", "move_mouse", "open_application"):
         with pytest.raises(PlanValidationError, match="unavailable tool"):
             validate_plan([{"id": "s1", "tool": tool, "arguments": {}}], world.registry, max_steps=20, default_retry=retry)
     for tool, arguments in (("observe_page", {"url": START}), ("open_url", {"url": START}), ("scroll", {"amount": -300}),
-                            ("get_active_window", {}), ("verify_observation", {"check": "window_process_is", "value": "x.exe"})):
+                            ("get_active_window", {}), ("verify_observation", {"check": "window_process_is", "value": "x.exe"}),
+                            ("switch_window", {"title": "Example"}), ("observe_screen", {})):
         assert validate_plan([{"id": "s1", "tool": tool, "arguments": arguments}], world.registry, max_steps=20, default_retry=retry)
 
 
@@ -316,8 +318,8 @@ def test_an_expectation_is_accepted_on_observation_but_never_on_an_action():
 
 
 def test_the_job_allowlists_are_exactly_what_was_decided():
-    assert JOB_COMPUTER_TOOL_NAMES == {"open_url", "scroll", "get_active_window"}
-    assert JOB_OBSERVATION_TOOL_NAMES == {"observe_page", "verify_observation"}
+    assert JOB_COMPUTER_TOOL_NAMES == {"open_url", "scroll", "get_active_window", "switch_window"}
+    assert JOB_OBSERVATION_TOOL_NAMES == {"observe_page", "verify_observation", "observe_screen"}
     world = World([[]])
     assert {t.name for t in world.registry.list_tools()} >= JOB_COMPUTER_TOOL_NAMES | JOB_OBSERVATION_TOOL_NAMES
     assert all(not t.automatable for t in world.registry.list_tools() if t.name in JOB_COMPUTER_TOOL_NAMES | JOB_OBSERVATION_TOOL_NAMES)
@@ -351,7 +353,7 @@ def test_an_authenticated_pc_request_reaches_core_runs_the_job_observes_verifies
     backend, web = Browser(), None
     web = Web({START: START_PAGE, SECOND: "<title>Second Page</title><body><p>Details.</p></body>"})
     observer = ObservationEngine(fetcher=web, backend=backend)
-    register_job_computer_tools(chain.registry, backend)
+    register_job_computer_tools(chain.registry, backend, resolver=PUBLIC_DNS)
     register_observation_tools(chain.registry, observer)
     chain.registry.register(AnalyzeTool(provider=provider))
     chain.registry.register(CreateJobTool(store=chain.jobs, context_provider=chain.memory.get_facts))

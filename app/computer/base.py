@@ -217,6 +217,46 @@ MAX_TEXT_LENGTH = 1000
 MAX_SCROLL_AMOUNT = 2000
 
 
+#: `switch_window` is bounded: the query is a short plain-text title fragment...
+MAX_WINDOW_QUERY_CHARS = 100
+
+#: ...and a window is never a switch target if its process is a credential store, a login / elevation prompt, a
+#: shell or a system-management tool (switching there is "arbitrary process manipulation" territory) - or if its
+#: title looks like a credential / sign-in window. A fixed, reviewable deny-list, not a permission system.
+SWITCH_BLOCKED_PROCESSES = frozenset(
+    {
+        "keepass.exe", "keepassxc.exe", "1password.exe", "bitwarden.exe", "lastpass.exe", "dashlane.exe", "enpass.exe",
+        "roboform.exe", "credentialuibroker.exe", "consent.exe", "logonui.exe", "winlogon.exe", "lockapp.exe",
+        "cmd.exe", "powershell.exe", "pwsh.exe", "windowsterminal.exe", "wt.exe", "conhost.exe", "regedit.exe",
+        "taskmgr.exe", "mmc.exe", "services.exe",
+    }
+)
+SWITCH_BLOCKED_TITLE_WORDS = (
+    "password", "passcode", "credential", "keychain", "vault", "authenticator", "sign in", "sign-in", "log in",
+    "login", "two-factor", "2fa", "private key", "wallet", "user account control",
+)
+
+
+def validate_window_query(query: str) -> str:
+    """The only validation `switch_window` applies to its argument: a non-empty, short, printable title fragment."""
+    if not isinstance(query, str) or not query.strip():
+        raise ComputerControlError("window title must be a non-empty string.")
+    cleaned = " ".join(query.split())
+    if len(cleaned) > MAX_WINDOW_QUERY_CHARS:
+        raise ComputerControlError(f"window title exceeds the maximum length of {MAX_WINDOW_QUERY_CHARS} characters.")
+    if not cleaned.isprintable():
+        raise ComputerControlError("window title must be plain printable text.")
+    return cleaned
+
+
+def is_switchable(title: str, process_name: str) -> bool:
+    """Whether a window with this title / process may ever be a `switch_window` target."""
+    lowered = (title or "").lower()
+    if (process_name or "").lower() in SWITCH_BLOCKED_PROCESSES:
+        return False
+    return not any(word in lowered for word in SWITCH_BLOCKED_TITLE_WORDS)
+
+
 def validate_url(url: str) -> str:
     """The only validation `open_url` ever applies: `url` must be a
     string with an http/https scheme and a host. Every other scheme
@@ -403,6 +443,13 @@ class ComputerBackend(ABC):
         as the active window. Raises ComputerControlError if that can't be
         established, so a following scroll/click/type is never run against
         whichever window happened to have focus instead."""
+
+    def switch_window(self, title: str) -> WindowInfo:
+        """Make the topmost VISIBLE, local, titled window whose title contains `title` (already validated by
+        `validate_window_query`) the active window, and return it. Never a credential / system / shell window
+        (`is_switchable`). Raises ComputerControlError if nothing matches or Windows will not activate it. Not
+        abstract: a backend that cannot switch windows simply refuses, so every other backend keeps working."""
+        raise ComputerControlError("this backend cannot switch windows.")
 
     @abstractmethod
     def type_text(self, text: str) -> None:

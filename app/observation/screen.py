@@ -13,6 +13,7 @@ answer is UNTRUSTED candidate data.
 
 from __future__ import annotations
 
+import base64
 import secrets
 import time
 from abc import ABC, abstractmethod
@@ -21,6 +22,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from app.observation.base import (
+    FINGERPRINT_SIDE,
+    SCREEN_CHANGED_THRESHOLD,
     MAX_SCREENSHOT_BYTES,
     MAX_SCREENSHOT_EDGE,
     MAX_STORED_SCREENSHOTS,
@@ -40,6 +43,33 @@ class CapturedImage:
     height: int
     screen_width: int
     screen_height: int
+    fingerprint: str = ""
+
+
+def compute_fingerprint(image) -> str:
+    """The FINGERPRINT_SIDE x FINGERPRINT_SIDE grayscale thumbnail of a PIL image, urlsafe-base64."""
+    from PIL import Image
+
+    small = image.convert("L").resize((FINGERPRINT_SIDE, FINGERPRINT_SIDE), Image.BILINEAR)
+    return base64.urlsafe_b64encode(small.tobytes()).decode("ascii")
+
+
+def fingerprint_distance(first: str, second: str) -> float | None:
+    """Mean absolute grey difference of two fingerprints, 0.0-1.0, or None if either is not a valid fingerprint."""
+    try:
+        a, b = base64.urlsafe_b64decode(first.encode("ascii")), base64.urlsafe_b64decode(second.encode("ascii"))
+    except (ValueError, UnicodeError, AttributeError):
+        return None
+    size = FINGERPRINT_SIDE * FINGERPRINT_SIDE
+    if len(a) != size or len(b) != size:
+        return None
+    return sum(abs(x - y) for x, y in zip(a, b)) / (size * 255)
+
+
+def screen_changed(baseline: str, current: str) -> tuple[bool, float | None]:
+    """(whether the screen differs from `baseline` by at least SCREEN_CHANGED_THRESHOLD, the measured difference)."""
+    distance = fingerprint_distance(baseline, current)
+    return (distance is not None and distance >= SCREEN_CHANGED_THRESHOLD), distance
 
 
 @dataclass(frozen=True)
@@ -76,6 +106,7 @@ class PyAutoGuiScreenCapturer(ScreenCapturer):
 
             shot = pyautogui.screenshot()
             screen_width, screen_height = shot.size
+            fingerprint = compute_fingerprint(shot)
             shot.thumbnail((MAX_SCREENSHOT_EDGE, MAX_SCREENSHOT_EDGE))
             buffer = io.BytesIO()
             shot.save(buffer, format="PNG", optimize=True)
@@ -89,7 +120,7 @@ class PyAutoGuiScreenCapturer(ScreenCapturer):
         data = buffer.getvalue()
         if len(data) > MAX_SCREENSHOT_BYTES:
             raise ObservationError("the screenshot is too large to handle")
-        return CapturedImage(data, mime, shot.width, shot.height, screen_width, screen_height)
+        return CapturedImage(data, mime, shot.width, shot.height, screen_width, screen_height, fingerprint)
 
 
 class ScreenshotStore:

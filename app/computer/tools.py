@@ -32,6 +32,7 @@ constructed and exercised directly (e.g. in tests), against either
 WindowsComputerBackend or a fake backend.
 """
 
+from collections.abc import Callable
 from typing import Any
 
 from app.computer.base import (
@@ -44,6 +45,7 @@ from app.computer.base import (
     validate_scroll_amount,
     validate_text,
     validate_url,
+    validate_window_query,
 )
 from app.tools.base import PermissionLevel, Tool, ToolArgumentError, ToolParameter, ToolResult
 
@@ -195,6 +197,125 @@ class OpenUrlTool(Tool):
             return ToolResult.error(str(exc))
 
         return ToolResult.success(message=f"Opened '{url}'.")
+
+
+class JobOpenUrlTool(OpenUrlTool):
+    """`open_url` as a Job (and so a page-influenced plan) may use it: the same tool, name and permission, plus the
+    PUBLIC-HOST guard the page observer already applies to every fetch (app/observation/page.py) - a URL that is
+    not a public http(s) host (localhost, a private / link-local address, credentials in the URL, an odd port) is
+    refused, so a link found on an untrusted page can never steer the browser at the local network. Interactive
+    chat keeps the plain OpenUrlTool. Redirects happen inside the browser and are not re-checked here."""
+
+    automatable = False
+    description = (
+        "Open a public http/https URL in the user's default browser. Only open a URL the user gave or that an "
+        "observation returned - never guess or invent one. To go to a named section of a page, prefer the same-page "
+        "link's href from observe_page (it keeps its #anchor, e.g. https://site/#workflow) over scrolling. A #anchor is "
+        "refused unless observe_page already exposed that exact anchor for that page (see its `anchors`): never invent "
+        "one from a label. Localhost, private addresses and URLs with credentials are refused. Verify the result "
+        "afterwards (verify_observation with window_title_contains)."
+    )
+
+    def __init__(
+        self,
+        backend: ComputerBackend,
+        resolver: Callable[[str], list[str]] | None = None,
+        anchors: Callable[[str], tuple[str, ...] | None] | None = None,
+    ):
+        super().__init__(backend)
+        self._resolver = resolver
+        #: `anchors(url)` -> the section anchors an observation of that page exposed, or None if it was never observed
+        #: (or its entry expired). Without one, no #fragment can be opened at all.
+        self._anchors = anchors
+
+    def _check_public(self, url: str) -> None:
+        from urllib.parse import urlsplit
+
+        from app.observation.base import ObservationError, safe_anchor
+        from app.observation.page import _resolve, validate_fetch_url
+
+        try:
+            validate_fetch_url(url, self._resolver or _resolve)
+        except ObservationError as exc:
+            raise ComputerControlError(f"open_url refused: {exc}") from exc
+        fragment = urlsplit(url).fragment
+        if not fragment:
+            return
+        if safe_anchor(fragment) != fragment:
+            raise ComputerControlError(
+                "open_url refused: a #fragment may only be a simple section anchor (letters, digits, '-' and '_')."
+            )
+        observed = self._anchors(url) if self._anchors is not None else None
+        if observed is None:
+            raise ComputerControlError(
+                f"open_url refused: '#{fragment}' cannot be opened because that page has not been observed (or the "
+                "observation expired). Use observe_page on it first, or open the page without a #fragment."
+            )
+        if fragment not in observed:
+            listed = ", ".join(observed) if observed else "none"
+            raise ComputerControlError(
+                f"open_url refused: '#{fragment}' was not observed on that page. Anchors it exposed: {listed}. Use one "
+                "of those, or open the page without a #fragment."
+            )
+
+    def validate_arguments(self, url: str) -> None:
+        try:
+            validate_url(url)
+            self._check_public(url)
+        except ComputerControlError as exc:
+            raise ToolArgumentError(str(exc)) from exc
+
+    def execute(self, url: str) -> ToolResult:
+        try:
+            validate_url(url)
+            self._check_public(url)
+        except ComputerControlError as exc:
+            return ToolResult.error(str(exc))
+        return super().execute(url)
+
+
+class SwitchWindowTool(Tool):
+    """Brings an existing, visible, local window to the front by a fragment of its title. SAFE_ACTION: bounded
+    (`validate_window_query`), never a credential / shell / system window (`is_switchable`, enforced by the backend),
+    never launches or closes anything. Success is only reported once the backend confirmed that window is active.
+    The title shown back is scrubbed: a window title is untrusted text."""
+
+    name = "switch_window"
+    description = (
+        "Switch to an already open, visible window whose title contains the given text (e.g. 'Example Domain'). It "
+        "never opens, closes or starts anything and refuses password-manager, sign-in, shell and system windows. "
+        "Verify it afterwards with verify_observation (window_title_contains / window_process_is)."
+    )
+    permission = PermissionLevel.SAFE_ACTION
+    automatable = False
+
+    def __init__(self, backend: ComputerBackend):
+        self.backend = backend
+
+    @property
+    def parameters(self) -> list[ToolParameter]:
+        return [
+            ToolParameter(
+                name="title", type="string", description="Text the target window's title contains", free_text=True
+            )
+        ]
+
+    def validate_arguments(self, title: str) -> None:
+        try:
+            validate_window_query(title)
+        except ComputerControlError as exc:
+            raise ToolArgumentError(str(exc)) from exc
+
+    def execute(self, title: str) -> ToolResult:
+        from app.observation.base import scrub
+
+        try:
+            query = validate_window_query(title)
+            window = self.backend.switch_window(query)
+        except ComputerControlError as exc:
+            return ToolResult.error(str(exc))
+        shown = {"title": scrub(window.title, 120), "process_name": scrub(window.process_name, 60)}
+        return ToolResult.success(data=shown, message=f"Switched to '{shown['title']}' ({shown['process_name']}).")
 
 
 class TypeTextTool(Tool):
@@ -449,7 +570,12 @@ class ScrollTool(Tool):
     magnitude (see `validate_scroll_amount`/`MAX_SCROLL_AMOUNT`)."""
 
     name = "scroll"
-    description = "Scroll up (positive) or down (negative) at the current cursor position."
+    description = (
+        "Scroll up (positive) or down (negative) at the current cursor position, by at most 2000 per call (use "
+        "several steps for more). To reach a named section prefer open_url with that section's #anchor link from "
+        "observe_page: scrolling is blind. It does not say what is now visible: check it afterwards (observe_screen "
+        "before, then verify_observation check=screen_changed)."
+    )
     permission = PermissionLevel.SAFE_ACTION
     automatable = False  # Slice 4: Jobs may use this tool; a scheduled automation never does
 

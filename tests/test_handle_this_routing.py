@@ -130,7 +130,9 @@ NOT_OBJECTIVES = [
 def test_a_delegated_multi_step_objective_is_detected(message):
     decision = detect_objective(message)
     assert decision.route is ObjectiveRoute.HANDLE_THIS and decision.is_high_level_objective
-    assert decision.reason in (ObjectiveReason.MULTI_STEP_OBJECTIVE, ObjectiveReason.DELEGATED_OBJECTIVE)
+    assert decision.reason in (
+        ObjectiveReason.MULTI_STEP_OBJECTIVE, ObjectiveReason.DELEGATED_OBJECTIVE, ObjectiveReason.COMPUTER_WORKFLOW
+    )  # (Slice 5: computer wording is recognised as a delegated objective too)
     assert decision.original_request == message and decision.evidence
 
 

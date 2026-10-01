@@ -31,6 +31,7 @@ import httpx
 
 from app.observation.base import (
     FETCH_TIMEOUT_SECONDS,
+    MAX_ANCHORS_PER_PAGE,
     MAX_CONTROLS,
     MAX_FETCH_BYTES,
     MAX_LABEL_CHARS,
@@ -41,9 +42,11 @@ from app.observation.base import (
     Control,
     Observation,
     ObservationError,
+    safe_anchor,
     safe_url,
     scrub,
 )
+
 
 ALLOWED_PORTS = frozenset({80, 443, 8080, 8443})
 USER_AGENT = "Jarvis-Observer/1.0 (read-only page observation)"
@@ -201,6 +204,7 @@ class _PageParser(HTMLParser):
         self.title_parts: list[str] = []
         self.text_parts: list[str] = []
         self.links: list[Control] = []
+        self.anchors: list[str] = []
         self.controls: list[Control | dict] = []
         self._labels: dict[str, str] = {}  # <label for=id> -> text
         self._stack: list[tuple[str, bool]] = []  # (tag, hides content)
@@ -210,6 +214,19 @@ class _PageParser(HTMLParser):
         self._label_for: str | None = None
 
     # --- helpers ---
+    def _is_same_page(self, url: str) -> bool:
+        """Whether `url` is this very page (same scheme, host, port, path and query): only then may its #fragment be
+        kept, as a same-page section anchor. A link to any other page loses its fragment, as before."""
+        try:
+            a, b = urlsplit(url), urlsplit(self.base_url)
+            return (
+                (a.scheme, a.hostname, a.port) == (b.scheme, b.hostname, b.port)
+                and (a.path or "/") == (b.path or "/")
+                and a.query == b.query
+            )
+        except ValueError:
+            return False
+
     @property
     def _visible(self) -> bool:
         return not any(hides for _tag, hides in self._stack)
@@ -232,7 +249,13 @@ class _PageParser(HTMLParser):
         if hides or not was_visible:
             return
         if tag == "a" and attrs.get("href"):
-            href = safe_url(urljoin(self.base_url, attrs["href"].strip()))
+            resolved = urljoin(self.base_url, attrs["href"].strip())
+            same_page = self._is_same_page(resolved)
+            href = safe_url(resolved, keep_safe_anchor=same_page)
+            if same_page:
+                anchor = safe_anchor(urlsplit(resolved).fragment)
+                if anchor and anchor not in self.anchors and len(self.anchors) < MAX_ANCHORS_PER_PAGE:
+                    self.anchors.append(anchor)
             self._link = {"href": href, "label": attrs.get("aria-label") or attrs.get("title") or "", "parts": []}
         elif tag == "button":
             self._button = {"label": attrs.get("aria-label") or attrs.get("title") or "", "parts": [], "type": attrs.get("type", "")}
@@ -335,6 +358,7 @@ def parse_page(html: str, url: str) -> Observation:
         title=title,
         text=scrub(text, MAX_TEXT_CHARS),
         controls=tuple(parser.links) + tuple(controls),
+        anchors=tuple(parser.anchors),
         truncated=truncated
         or len(parser.links) >= MAX_LINKS
         or len(parser.controls) >= MAX_CONTROLS,

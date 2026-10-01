@@ -1,10 +1,9 @@
 """
 Default observation wiring: build the engine, and say exactly which registry gets which observation tool.
 
-`register_observation_tools` is for the JOB-facing registry (`core.tools`): the two READ tools a plan may use to
-observe and verify. `register_interactive_observation_tools` is for the isolated interactive computer registry:
-screen capture is never offered to a Job. Neither adds a permission rule, a loop or an executor - the tools run
-through ToolRegistry like every other tool.
+`register_observation_tools` registers the three READ tools onto the JOB-facing registry (`core.tools`): observe a page,
+verify a state, and take one bounded in-memory screen fingerprint. It adds no permission rule, loop or executor - the
+tools run through ToolRegistry like every other tool.
 """
 
 from __future__ import annotations
@@ -18,7 +17,7 @@ from app.observation.tools import ObservePageTool, ObserveScreenTool, VerifyObse
 from app.tools.registry import ToolRegistry
 
 #: The observation tools a Job plan may use.
-JOB_OBSERVATION_TOOL_NAMES = frozenset({"observe_page", "verify_observation"})
+JOB_OBSERVATION_TOOL_NAMES = frozenset({"observe_page", "verify_observation", "observe_screen"})
 
 
 def create_default_observation_engine(
@@ -37,7 +36,4 @@ def create_default_observation_engine(
 def register_observation_tools(registry: ToolRegistry, engine: ObservationEngine) -> None:
     registry.register(ObservePageTool(engine))
     registry.register(VerifyObservationTool(engine))
-
-
-def register_interactive_observation_tools(registry: ToolRegistry, engine: ObservationEngine) -> None:
     registry.register(ObserveScreenTool(engine))

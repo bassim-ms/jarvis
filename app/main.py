@@ -36,7 +36,6 @@ from app.computer.defaults import create_computer_tools_registry, register_job_c
 from app.computer.factory import create_default_computer_backend
 from app.observation.defaults import (
     create_default_observation_engine,
-    register_interactive_observation_tools,
     register_observation_tools,
 )
 from app.config import settings
@@ -344,16 +343,17 @@ morning_brief_service = MorningBriefService(
 core.morning_brief = morning_brief_service
 core.tools.register(MorningBriefTool(morning_brief_service))
 
-# Observation + the narrow set of computer tools a Job may use (Slice 4, see app/observation/): the observe ->
+# Observation + the narrow set of computer tools a Job may use (Slices 4-5, see app/observation/): the observe ->
 # act -> observe -> verify loop runs on the EXISTING Planner / JobEngine / ToolRegistry, so the JOB-facing registry
-# (`core.tools`) gets exactly this allowlist and nothing else from the computer package: open_url, scroll and
-# get_active_window (app/computer/defaults.py: JOB_COMPUTER_TOOL_NAMES), plus the READ tools observe_page and
-# verify_observation. Input tools (type_text, press_key, click_mouse, double_click, move_mouse, open_application)
-# and screen capture stay in the isolated interactive registry below. Registered BEFORE Handle This is built so
-# the COMPUTER_WORKFLOW family sees them. One shared backend; observation only ever calls its READ methods.
+# (`core.tools`) gets exactly this allowlist from the computer package and nothing else: open_url (public hosts
+# only), scroll, get_active_window and switch_window (app/computer/defaults.py: JOB_COMPUTER_TOOL_NAMES), plus the
+# READ tools observe_page, verify_observation and observe_screen (bounded, in-memory). Input tools (type_text,
+# press_key, click_mouse, double_click, move_mouse, open_application) stay in the isolated interactive registry
+# below. Registered BEFORE Handle This is built so the COMPUTER_WORKFLOW family sees them. One shared backend;
+# observation only ever calls its READ methods.
 _computer_backend = create_default_computer_backend()
-register_job_computer_tools(core.tools, _computer_backend)
 observation_engine = create_default_observation_engine(_computer_backend)
+register_job_computer_tools(core.tools, _computer_backend, anchors=observation_engine.anchors.observed)
 register_observation_tools(core.tools, observation_engine)
 
 # Context-Aware Reasoning (M16.3) - wired onto `core` the same way M16.2
@@ -456,8 +456,6 @@ core.self_development_engine = create_default_self_development_engine(
 # because of a permission check, but because that object simply doesn't
 # exist in their scope.
 core.computer_tools = create_computer_tools_registry(_computer_backend)
-# Screen capture (one bounded, in-memory screenshot) is interactive-only: it lives here, never in `core.tools`.
-register_interactive_observation_tools(core.computer_tools, observation_engine)
 
 
 @asynccontextmanager

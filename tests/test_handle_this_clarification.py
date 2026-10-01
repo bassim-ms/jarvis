@@ -1109,7 +1109,7 @@ def test_a_waiting_job_is_refused_by_name_when_there_is_no_way_to_wait(tmp_path)
     "objective",
     [
         {**_objective(), "tools": ["shell"]},
-        _objective(goal_family="computer_workflow", required_families=["computer_workflow"]),
+        _objective(goal_family="hardware_control", required_families=["hardware_control"]),
         _objective(interpreted_goal="two\nlines"),
         {"original_request": REQUEST},
     ],

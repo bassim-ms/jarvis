@@ -486,20 +486,36 @@ def test_a_mixed_objective_needing_a_computer_workflow_fails_closed():
     assert job_id is None and world.jobs.list() == [] and world.planner.calls == []
 
 
-def test_even_if_a_deployments_job_registry_offered_computer_tools_they_are_not_handed_on():
-    """Belt and braces: Slice 1's boundary would call this supported; the
-    hand-off to a Job still refuses it."""
-    intake = HandleThisIntake(available_tools=lambda: ["open_url", "web_search", "analyze", "save_note"])
-    outcome = HandleThisService(intake).handle("Plan to open Chrome and go to example.com", "c1")
-    assert outcome.kind is OutcomeKind.UNSUPPORTED and outcome.job_params is None
-    assert GoalFamily.COMPUTER_WORKFLOW not in HANDOFF_FAMILIES
+def test_a_computer_workflow_is_handed_on_only_when_every_action_it_asks_for_is_offered():
+    """Slice 5: COMPUTER_WORKFLOW may be handed to a Job - but being recognised grants nothing. Each action the wording
+    asks for needs ITS tools on offer; an unavailable one makes the whole objective unsupported."""
+    assert GoalFamily.COMPUTER_WORKFLOW in HANDOFF_FAMILIES
+    offered = ["open_url", "scroll", "web_search", "analyze", "save_note"]
+    service = HandleThisService(HandleThisIntake(available_tools=lambda: offered))
+
+    assert service.handle("Plan to open Chrome and go to example.com", "c1").kind is OutcomeKind.START_JOB
+    assert service.handle("Open example.com and scroll to the pricing section", "c1").kind is OutcomeKind.START_JOB
+    for refused in (
+        "Open example.com and click the Join button",
+        "Open example.com and fill out the form",
+        "Open example.com and type my email address into the box",
+        "Open example.com and press enter",
+        "Open Notepad",
+    ):
+        outcome = service.handle(refused, "c1")
+        assert outcome.kind is OutcomeKind.UNSUPPORTED and outcome.job_params is None, refused
+
+    without_open_url = HandleThisService(HandleThisIntake(available_tools=lambda: ["web_search", "analyze"]))
+    assert without_open_url.handle("Plan to open Chrome and go to example.com", "c1").kind is OutcomeKind.UNSUPPORTED
 
 
-def test_create_job_itself_refuses_an_objective_naming_the_computer_family():
+def test_create_job_accepts_the_computer_family_and_still_refuses_anything_else_unknown():
     world = World()
-    bad = {**_valid_objective(), "goal_family": "computer_workflow", "required_families": ["computer_workflow"]}
-    result = world.registry.execute("create_job", {"goal": "x", "objective": bad})
-    assert result.status.value == "error" and world.jobs.list() == []
+    ok = {**_valid_objective(), "goal_family": "computer_workflow", "required_families": ["computer_workflow"]}
+    assert world.registry.execute("create_job", {"goal": "x", "objective": ok}).status.value == "success"
+    bad = {**_valid_objective(), "goal_family": "hardware_control", "required_families": ["hardware_control"]}
+    result = world.registry.execute("create_job", {"goal": "y", "objective": bad})
+    assert result.status.value == "error" and len(world.jobs.list()) == 1
 
 
 # --- MIXED ------------------------------------------------------------------------------------------------------------------------------------
@@ -823,7 +839,7 @@ def test_the_orchestration_schema_mirrors_the_handle_this_vocabulary():
     from app.handle_this.base import CONSTRAINT_TOPICS, ConstraintSource as Source
 
     assert orchestration_tools._OBJECTIVE_FAMILIES == {f.value for f in HANDOFF_FAMILIES}
-    assert orchestration_tools._OBJECTIVE_FAMILIES == {f.value for f in SUPPORTED_FAMILIES} - {"computer_workflow"}
+    assert orchestration_tools._OBJECTIVE_FAMILIES == {f.value for f in SUPPORTED_FAMILIES}
     assert orchestration_tools._OBJECTIVE_CONSTRAINT_TOPICS == {t.value for t in CONSTRAINT_TOPICS}
     assert orchestration_tools._OBJECTIVE_ASSUMPTION_TOPICS == {t.value for t in Topic}
     assert orchestration_tools._OBJECTIVE_SOURCES == {s.value for s in Source}

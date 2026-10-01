@@ -69,6 +69,97 @@ _COMPUTER = _rx(
 )
 
 
+# --- computer actions ------------------------------------------------------------------------------------------------------
+#
+# WHICH computer actions the wording asks for - not whether they are allowed. What is allowed is decided by the capability
+# boundary against the tools a Job is actually offered (app/handle_this/boundary.py); this only names the kinds so the boundary
+# can compare. Fixed patterns, no AI, never a tool name here.
+
+_URLISH = (
+    r"(?:https?://\S+|www\.\S+|\b[\w-]+(?:\.[\w-]+)*\.(?:com|org|net|io|app|dev|ai|co|me|edu|gov|info|biz|xyz|site|"
+    r"online|tech|cloud|page|ae|uk|us|de|fr|in)\b(?:/\S*)?)"
+)
+_NAVIGATE = _rx(
+    r"\b(?:open|visit|go\s+to|navigate\s+to|browse\s+to|load|pull\s+up|head\s+to)\s+(?:(?:the|my|this)\s+)?"
+    rf"(?:{_URLISH}|(?:web\s?)?(?:site|page)\b|browser\b)"
+)
+_HAS_URL = _rx(_URLISH)
+_LAUNCH_APP = _rx(
+    r"\b(?:open|launch|start)\s+(?:(?:the|my|a)\s+)?(?:app(?:lication)?|notepad|calculator|(?:file\s+)?explorer|paint|"
+    r"chrome|edge|firefox|browser|word|excel|outlook|spotify|terminal|settings)\b"
+)
+_SCROLL = _rx(r"\bscroll(?:ing|ed)?\b")
+_SWITCH_WINDOW = _rx(
+    r"\bswitch\s+(?:to|over\s+to|between)\s+[\w\s\-'\"]{0,40}?(?:window|app|application|program)s?\b|\bswitch\s+windows?\b|"
+    r"\balt[-\s]?tab\b|\b(?:bring|pull)\s+up\s+(?:the\s+)?[\w\s\-]{0,30}?window\b"
+)
+_TAB = _rx(
+    r"\b(?:switch|change|go)\s+(?:to|between|over\s+to)\s+(?:the\s+)?(?:\w+\s+)?tabs?\b|"
+    r"\b(?:new|next|previous|other|another|second|first)\s+tab\b"
+)
+_CLOSE = _rx(r"\bclose\s+(?:the\s+|this\s+|that\s+|my\s+)?(?:tab|window|browser|app|application)s?\b")
+_CLICK = _rx(
+    r"\b(?:double[-\s]|right[-\s])?click(?:ing|ed)?\b|\btap\s+(?:on|the)\b|\bpress\s+(?:the\s+)?[\w\s]{0,20}?button\b"
+)
+_TYPE = _rx(
+    r"\btype\s+(?:in|into|out|the\s+following|this|that|my|your|\"|“|')|"
+    r"\benter\s+(?:my|your|the|a|an|this|that)\b[^.,;]{0,40}?\b(?:in|into|on)\b"
+)
+_KEY = _rx(
+    r"\bpress\s+(?:the\s+)?(?:\w+\s+)?(?:key|enter|tab|escape|esc|ctrl|control|alt|shift|f\d{1,2})\b|"
+    r"\bhit\s+(?:the\s+)?(?:enter|return|tab|escape|esc)\b|\bkeyboard\s+shortcut\b"
+)
+_MOUSE = _rx(r"\bmove\s+(?:the\s+)?(?:mouse|cursor)\b|\bdrag\b|\bhover\b")
+_FORM = _rx(
+    r"\bfill\s+(?:in|out)\b|\bsubmit\b|\bsign\s?(?:up|in)\b|\blog\s?in(?:to)?\b|\bjoin\s+(?:the\s+)?wait\s?list\b|\bregister\b|"
+    r"\bcheck\s?out\b"
+)
+_OPEN_VERB = _rx(r"\b(?:open|launch|visit|go\s+to|navigate\s+to|browse\s+to)\b")
+
+#: Kinds, in a fixed order. `form` is a click-and-type workflow and is only treated as computer wording next to an
+#: open/visit verb, because "submit", "register" and "log in" are ordinary words in non-computer requests.
+_STRONG_COMPUTER_KINDS = ("navigate", "scroll", "switch_window", "tab", "close", "click", "type", "key", "mouse", "launch_app")
+
+
+def detect_computer_actions(message: str) -> tuple[str, ...]:
+    """The kinds of computer action the wording asks for, in a fixed order: navigate, scroll, switch_window, tab,
+    close, click, type, key, mouse, launch_app, form. A launch of a browser/app is `launch_app` only when no URL or
+    site is named (with one, opening it IS navigation)."""
+    kinds: list[str] = []
+    has_url = bool(_HAS_URL.search(message))
+    if _NAVIGATE.search(message):
+        kinds.append("navigate")
+    if _SCROLL.search(message):
+        kinds.append("scroll")
+    if _SWITCH_WINDOW.search(message):
+        kinds.append("switch_window")
+    if _TAB.search(message):
+        kinds.append("tab")
+    if _CLOSE.search(message):
+        kinds.append("close")
+    if _CLICK.search(message):
+        kinds.append("click")
+    if _TYPE.search(message):
+        kinds.append("type")
+    if _KEY.search(message):
+        kinds.append("key")
+    if _MOUSE.search(message):
+        kinds.append("mouse")
+    if _LAUNCH_APP.search(message) and not has_url:
+        kinds.append("launch_app")
+    if _FORM.search(message):
+        kinds.append("form")
+    return tuple(kinds)
+
+
+def is_computer_workflow(message: str) -> bool:
+    """Whether the wording is a request to operate the computer / a browser (as opposed to merely mentioning one)."""
+    kinds = detect_computer_actions(message)
+    if any(k in _STRONG_COMPUTER_KINDS for k in kinds):
+        return True
+    return "form" in kinds and bool(_OPEN_VERB.search(message))
+
+
 def detect_families(message: str) -> tuple[GoalFamily, ...]:
     """The supported families the wording points at, in a fixed order (empty
     when there is no signal). Comparing candidates counts as RESEARCH when a
@@ -81,7 +172,7 @@ def detect_families(message: str) -> tuple[GoalFamily, ...]:
         found.append(GoalFamily.ANALYSIS)
     if _ORGANIZATION.search(message):
         found.append(GoalFamily.ORGANIZATION)
-    if _COMPUTER.search(message):
+    if _COMPUTER.search(message) or is_computer_workflow(message):
         found.append(GoalFamily.COMPUTER_WORKFLOW)
     return tuple(found)
 
@@ -313,7 +404,18 @@ _CRITERIA: tuple[tuple[re.Pattern, str], ...] = (
 )
 
 
+#: What "done" means for each computer action: never "the command ran" - the resulting state is OBSERVED and verified.
+#: Fixed phrases (no user text); they reach the Planner as part of the objective, which is data about the request.
+_COMPUTER_CRITERIA = {
+    "navigate": "The requested page is confirmed open by observing the window or page afterwards, not assumed",
+    "scroll": "After scrolling (at most 2000 per step) the screen is confirmed to have changed: capture it before, verify it after",
+    "switch_window": "The requested window is confirmed to be the active one afterwards",
+}
+
+
 def derive_success_criteria(message: str) -> tuple[str, ...]:
     """What the wording says "done" looks like - fixed phrases keyed to the
     deliverable words the user used, never the user's text itself."""
-    return tuple(text for pattern, text in _CRITERIA if pattern.search(message))[:8]
+    general = [text for pattern, text in _CRITERIA if pattern.search(message)]
+    computer = [_COMPUTER_CRITERIA[k] for k in detect_computer_actions(message) if k in _COMPUTER_CRITERIA]
+    return tuple((general[: 8 - len(computer)] + computer)[:8])

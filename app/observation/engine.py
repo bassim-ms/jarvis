@@ -33,6 +33,7 @@ from app.observation.base import (
     ObservationError,
     scrub,
 )
+from app.observation.anchors import AnchorCache
 from app.observation.page import PageFetcher, parse_page
 from app.observation.screen import CapturedImage, ScreenCapturer, ScreenshotStore, VisionCandidate, VisionInterpreter
 
@@ -73,6 +74,7 @@ class ObservationEngine:
         self._captures = _RateLimit(MAX_SCREEN_CAPTURES_PER_MINUTE, clock)
         self._vision_calls = _RateLimit(MAX_VISION_CALLS_PER_MINUTE, clock)
         self.screenshots = ScreenshotStore(clock)
+        self.anchors = AnchorCache(clock)
 
     # --- the three sources -----------------------------------------------------------------------------------
 
@@ -80,7 +82,11 @@ class ObservationEngine:
         """Structured observation of a public page: URL, title, visible text, links, buttons, fields."""
         self._observations.take("observation")
         fetched = self._fetcher.fetch(url)
-        return replace(parse_page(fetched.html, fetched.url), note=PAGE_SOURCE_NOTE)
+        observation = replace(parse_page(fetched.html, fetched.url), note=PAGE_SOURCE_NOTE)
+        # Remember which section anchors this page really exposed (under the URL asked for AND the one it ended at), so a
+        # later Job step may open `page#anchor` only for an anchor that was actually seen - see anchors.py.
+        self.anchors.remember([url, fetched.url], observation.anchors)
+        return observation
 
     def observe_window(self) -> Observation:
         """The active window's application and title (OS metadata). READ-only."""
@@ -105,15 +111,22 @@ class ObservationEngine:
         image = self._capturer.capture()
         handle = self.screenshots.put(image)
         if self._vision is None:
-            return Observation(source="screen", screenshot_ref=handle, note="captured; no vision interpreter is configured")
+            return Observation(
+                source="screen", screenshot_ref=handle, fingerprint=image.fingerprint,
+                note="captured; no vision interpreter is configured",
+            )
         self._vision_calls.take("vision")
         try:
             candidates = self._vision.interpret(image, scrub(question, 200) or _DEFAULT_QUESTION)
         except Exception as exc:  # noqa: BLE001 - a vision failure is "no candidates", never a crash
-            return Observation(source="screen", screenshot_ref=handle, note=f"vision unavailable ({type(exc).__name__})")
+            return Observation(
+                source="screen", screenshot_ref=handle, fingerprint=image.fingerprint,
+                note=f"vision unavailable ({type(exc).__name__})",
+            )
         return Observation(
             source="screen",
             screenshot_ref=handle,
+            fingerprint=image.fingerprint,
             controls=tuple(self._candidates(candidates, image)),
             note="candidates come from a vision model: untrusted suggestions, not facts or permissions",
         )

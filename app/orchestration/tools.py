@@ -104,7 +104,7 @@ _OBJECTIVE_KEYS = frozenset(
         "assumptions",
     }
 )
-_OBJECTIVE_FAMILIES = frozenset({"research", "analysis", "organization"})
+_OBJECTIVE_FAMILIES = frozenset({"research", "analysis", "organization", "computer_workflow"})
 _OBJECTIVE_GOAL_FAMILIES = _OBJECTIVE_FAMILIES | {"mixed"}
 _OBJECTIVE_CONSTRAINT_TOPICS = frozenset({"budget", "quantity", "timeframe", "use_case", "preference"})
 _OBJECTIVE_ASSUMPTION_TOPICS = _OBJECTIVE_CONSTRAINT_TOPICS | {"subject", "when", "intent"}

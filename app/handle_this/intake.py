@@ -53,6 +53,7 @@ from app.handle_this.base import (
 from app.handle_this.boundary import DEFAULT_BOUNDARY, CapabilityBoundary
 from app.handle_this.clarification import apply_policy
 from app.handle_this.context import ContextSource, ContextUnavailableError, categories_for
+from app.handle_this.signals import detect_computer_actions
 from app.handle_this.interpretation import (
     DeterministicGoalInterpreter,
     GoalInterpreter,
@@ -138,6 +139,23 @@ class HandleThisIntake:
                 meta,
                 UnsupportedReason(UnsupportedCategory.UNAVAILABLE_CAPABILITY, tuple(unavailable)),
             )
+
+        if GoalFamily.COMPUTER_WORKFLOW in interpretation.required_families:
+            # A recognised computer workflow does NOT grant every computer capability: each action the wording asks
+            # for needs its own tools actually on offer to the Planner. One that is not (a click, typing, filling a
+            # form, launching an application) makes the whole objective unsupported - never a partial plan that
+            # quietly does less than was asked.
+            missing = self.boundary.assess_actions(
+                detect_computer_actions(message),
+                self.available_tools() if self.available_tools is not None else None,
+            )
+            if missing:
+                return self._unsupported(
+                    message,
+                    interpretation,
+                    meta,
+                    UnsupportedReason(UnsupportedCategory.UNAVAILABLE_CAPABILITY, (GoalFamily.COMPUTER_WORKFLOW,)),
+                )
 
         context = self._context(message, interpretation)
         if context is None:

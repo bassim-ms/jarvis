@@ -50,7 +50,9 @@ from app.computer.tools import (
     OpenUrlTool,
     PressKeyTool,
     ScrollTool,
+    SwitchWindowTool,
     TypeTextTool,
+    JobOpenUrlTool,
 )
 from app.tools.registry import ToolRegistry
 
@@ -76,21 +78,28 @@ def register_computer_tools(
     registry.register(ClickMouseTool(backend=backend))
     registry.register(DoubleClickTool(backend=backend))
     registry.register(ScrollTool(backend=backend))
+    registry.register(SwitchWindowTool(backend=backend))
 
 
 #: The ONLY computer tools a Job plan may use (Slice 4): opening a page, scrolling it, and reading which window is
 #: active. Everything that types, presses keys, moves or clicks the mouse, or launches an application stays in the
 #: isolated interactive registry. This is a plain, reviewable list - not a permission system; ToolRegistry still
 #: decides whether and how each of these runs.
-JOB_COMPUTER_TOOL_NAMES = frozenset({"open_url", "scroll", "get_active_window"})
+JOB_COMPUTER_TOOL_NAMES = frozenset({"open_url", "scroll", "get_active_window", "switch_window"})
 
 
-def register_job_computer_tools(registry: ToolRegistry, backend: ComputerBackend | None = None) -> None:
-    """Register ONLY `JOB_COMPUTER_TOOL_NAMES` onto `registry` (the Job-facing one), sharing `backend`."""
+def register_job_computer_tools(
+    registry: ToolRegistry, backend: ComputerBackend | None = None, *, resolver=None, anchors=None
+) -> None:
+    """Register ONLY `JOB_COMPUTER_TOOL_NAMES` onto `registry` (the Job-facing one), sharing `backend`. The Job's
+    `open_url` is the public-host-guarded variant (`resolver` is the DNS lookup it uses; tests inject one). `anchors` is
+    the observed-anchor lookup (ObservationEngine.anchors.observed): the Job's `open_url` opens a #fragment only if
+    that exact anchor was observed for that page."""
     backend = backend or create_default_computer_backend()
     registry.register(GetActiveWindowTool(backend=backend))
-    registry.register(OpenUrlTool(backend=backend))
+    registry.register(JobOpenUrlTool(backend=backend, resolver=resolver, anchors=anchors))
     registry.register(ScrollTool(backend=backend))
+    registry.register(SwitchWindowTool(backend=backend))
 
 
 def create_computer_tools_registry(backend: ComputerBackend | None = None) -> ToolRegistry:

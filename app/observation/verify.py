@@ -12,10 +12,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from app.observation.base import Observation, scrub
+from app.observation.screen import screen_changed
 
 PAGE_CHECKS = frozenset({"url_contains", "title_contains", "text_contains"})
 WINDOW_CHECKS = frozenset({"window_title_contains", "window_process_is"})
-CHECKS = PAGE_CHECKS | WINDOW_CHECKS
+SCREEN_CHECKS = frozenset({"screen_changed"})
+CHECKS = PAGE_CHECKS | WINDOW_CHECKS | SCREEN_CHECKS
 
 MAX_EXPECTED_CHARS = 200
 
@@ -41,6 +43,12 @@ def _observed_for(check: str, observation: Observation) -> str:
 def check_observation(observation: Observation, check: str, expected: str) -> Verification:
     """Whether `observation` satisfies `check` against `expected` (case-insensitive; `window_process_is` compares
     the whole process name, e.g. "chrome.exe"). Unknown checks and empty expectations never verify."""
+    if check == "screen_changed":
+        # `expected` is the BASELINE fingerprint (from an earlier observe_screen); verified only if the screen now
+        # differs from it by a real margin. Never scrubbed (it is a thumbnail, not text) and never shown back.
+        changed, distance = screen_changed(expected, observation.fingerprint)
+        measured = "unmeasurable" if distance is None else f"{distance * 100:.2f}% difference"
+        return Verification(changed, check, "a changed screen", measured)
     expected = scrub(expected, MAX_EXPECTED_CHARS)
     observed = _observed_for(check, observation) if check in CHECKS else ""
     if check not in CHECKS or not expected:
