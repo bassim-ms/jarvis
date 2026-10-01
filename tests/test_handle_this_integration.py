@@ -844,10 +844,9 @@ def test_the_real_application_is_wired_with_handle_this_and_keeps_the_isolation(
     from app.handle_this.factory import planner_tool_names
 
     offered = planner_tool_names(live_app.core.tools)
-    assert "web_search" in offered and "open_url" not in offered
-    # a computer workflow, asked of the real application, is declined before anything else happens
-    outcome = live_app.core.handle_this.handle("Plan to open Chrome and go to example.com", "c1")
-    assert outcome.kind is OutcomeKind.UNSUPPORTED and outcome.job_params is None
+    # Slice 4: the narrow Job allowlist is offered; no input tool ever is
+    assert "web_search" in offered and "open_url" in offered and "observe_page" in offered
+    assert not {"type_text", "press_key", "click_mouse", "move_mouse", "double_click", "open_application"} & set(offered)
     # and there is still exactly one planner: the JobEngine's
     assert not hasattr(live_app.core.handle_this, "planner") and not hasattr(live_app.core.handle_this.intake, "planner")
 

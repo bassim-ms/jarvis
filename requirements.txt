@@ -20,3 +20,8 @@ openwakeword==0.6.0
 # used with shell=True - see app/computer/windows_backend.py.
 pyautogui==0.9.54
 pywin32==312
+
+# Observation (Slice 4) - Pillow is only used to downscale/encode a bounded,
+# in-memory screenshot (pyautogui.screenshot() also needs it). See
+# app/observation/screen.py: a capture is never written to disk.
+pillow==12.3.0

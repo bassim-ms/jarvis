@@ -32,7 +32,13 @@ from pydantic import BaseModel
 
 from app.automation.factory import create_default_automation_store
 from app.calendar.factory import create_default_calendar_provider
-from app.computer.defaults import create_computer_tools_registry
+from app.computer.defaults import create_computer_tools_registry, register_job_computer_tools
+from app.computer.factory import create_default_computer_backend
+from app.observation.defaults import (
+    create_default_observation_engine,
+    register_interactive_observation_tools,
+    register_observation_tools,
+)
 from app.config import settings
 from app.context_engine.factory import create_default_context_engine
 from app.context_planning.factory import create_default_context_planner
@@ -338,6 +344,18 @@ morning_brief_service = MorningBriefService(
 core.morning_brief = morning_brief_service
 core.tools.register(MorningBriefTool(morning_brief_service))
 
+# Observation + the narrow set of computer tools a Job may use (Slice 4, see app/observation/): the observe ->
+# act -> observe -> verify loop runs on the EXISTING Planner / JobEngine / ToolRegistry, so the JOB-facing registry
+# (`core.tools`) gets exactly this allowlist and nothing else from the computer package: open_url, scroll and
+# get_active_window (app/computer/defaults.py: JOB_COMPUTER_TOOL_NAMES), plus the READ tools observe_page and
+# verify_observation. Input tools (type_text, press_key, click_mouse, double_click, move_mouse, open_application)
+# and screen capture stay in the isolated interactive registry below. Registered BEFORE Handle This is built so
+# the COMPUTER_WORKFLOW family sees them. One shared backend; observation only ever calls its READ methods.
+_computer_backend = create_default_computer_backend()
+register_job_computer_tools(core.tools, _computer_backend)
+observation_engine = create_default_observation_engine(_computer_backend)
+register_observation_tools(core.tools, observation_engine)
+
 # Context-Aware Reasoning (M16.3) - wired onto `core` the same way M16.2
 # just was, immediately above: `core.context_reasoner` defaults to `None`
 # (see JarvisCore.__init__), so this is what actually ACTIVATES M16.3 for
@@ -437,7 +455,9 @@ core.self_development_engine = create_default_self_development_engine(
 # unreachable from M15 Job planning/execution and from automations - not
 # because of a permission check, but because that object simply doesn't
 # exist in their scope.
-core.computer_tools = create_computer_tools_registry()
+core.computer_tools = create_computer_tools_registry(_computer_backend)
+# Screen capture (one bounded, in-memory screenshot) is interactive-only: it lives here, never in `core.tools`.
+register_interactive_observation_tools(core.computer_tools, observation_engine)
 
 
 @asynccontextmanager

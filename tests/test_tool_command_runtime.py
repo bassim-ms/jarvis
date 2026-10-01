@@ -616,10 +616,11 @@ def test_m15_and_automation_engines_still_hold_no_computer_tool_in_the_real_app(
     assert live_app.job_engine.tools is live_app.core.tools
     assert live_app.automation_engine.tools is live_app.core.tools
     assert live_app.core.computer_tools is not live_app.core.tools
-    for name in COMPUTER_TOOL_NAMES:
-        assert live_app.core.tools.has(name) is False
-        assert live_app.job_engine.tools.has(name) is False
-        assert live_app.automation_engine.tools.has(name) is False
+    from app.computer.defaults import JOB_COMPUTER_TOOL_NAMES
+
+    for name in COMPUTER_TOOL_NAMES:  # Slice 4: Jobs hold exactly the narrow allowlist (no input tool)
+        assert live_app.core.tools.has(name) is (name in JOB_COMPUTER_TOOL_NAMES)
+        assert live_app.job_engine.tools.has(name) is (name in JOB_COMPUTER_TOOL_NAMES)
         assert live_app.core.computer_tools.has(name) is True
 
 
@@ -642,7 +643,11 @@ def test_a_m15_plan_step_still_cannot_name_a_computer_tool():
 
     import app.main as live_app
 
+    from app.computer.defaults import JOB_COMPUTER_TOOL_NAMES
+
     for name in COMPUTER_TOOL_NAMES:
+        if name in JOB_COMPUTER_TOOL_NAMES:
+            continue  # Slice 4: the allowlist is plannable; every other computer tool is still rejected
         with pytest.raises(PlanValidationError, match="unavailable tool"):
             validate_plan(
                 [{"id": "s1", "tool": name, "arguments": {}}],
@@ -655,9 +660,13 @@ def test_a_m15_plan_step_still_cannot_name_a_computer_tool():
 def test_an_automation_cannot_run_a_computer_tool():
     import app.main as live_app
 
-    for name, params in (("open_url", {"url": "https://luniti.app"}), ("scroll", {"amount": -600})):
-        result = live_app.automation_engine.tools.execute(name, params=params)
-        assert "Unknown tool" in result.message
+    # Slice 4: open_url / scroll are Job-reachable now, so the automation boundary is the `automatable` flag that
+    # AutomationEngine and CreateAutomation read (never executed here - that would drive the real browser).
+    for name in ("open_url", "scroll", "get_active_window"):
+        assert live_app.automation_engine.tools.get(name).automatable is False
+    # every input tool is still simply unknown to an automation
+    for name, params in (("type_text", {"text": "x"}), ("click_mouse", {"x": 1, "y": 1}), ("press_key", {"key": "enter"})):
+        assert "Unknown tool" in live_app.automation_engine.tools.execute(name, params=params).message
 
 
 # --- 32: the actual /chat endpoint ------------------------------------------------------------

@@ -78,6 +78,21 @@ def register_computer_tools(
     registry.register(ScrollTool(backend=backend))
 
 
+#: The ONLY computer tools a Job plan may use (Slice 4): opening a page, scrolling it, and reading which window is
+#: active. Everything that types, presses keys, moves or clicks the mouse, or launches an application stays in the
+#: isolated interactive registry. This is a plain, reviewable list - not a permission system; ToolRegistry still
+#: decides whether and how each of these runs.
+JOB_COMPUTER_TOOL_NAMES = frozenset({"open_url", "scroll", "get_active_window"})
+
+
+def register_job_computer_tools(registry: ToolRegistry, backend: ComputerBackend | None = None) -> None:
+    """Register ONLY `JOB_COMPUTER_TOOL_NAMES` onto `registry` (the Job-facing one), sharing `backend`."""
+    backend = backend or create_default_computer_backend()
+    registry.register(GetActiveWindowTool(backend=backend))
+    registry.register(OpenUrlTool(backend=backend))
+    registry.register(ScrollTool(backend=backend))
+
+
 def create_computer_tools_registry(backend: ComputerBackend | None = None) -> ToolRegistry:
     """Build a fresh ToolRegistry populated with only the computer-control
     tools - lets a caller (a test, or a future dedicated integration)

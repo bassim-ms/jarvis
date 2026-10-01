@@ -37,7 +37,11 @@ from app.computer.base import (
     ScreenInfo,
     WindowInfo,
 )
-from app.computer.defaults import create_computer_tools_registry, register_computer_tools
+from app.computer.defaults import (
+    JOB_COMPUTER_TOOL_NAMES,
+    create_computer_tools_registry,
+    register_computer_tools,
+)
 from app.computer.tools import PressKeyTool
 from app.core import JarvisCore
 from app.memory.sqlite_store import SQLiteMemoryStore
@@ -312,9 +316,9 @@ def test_open_url_then_scroll_sequence_still_resolves_only_against_computer_tool
     ]
 
     for name in names:
-        assert live_app.core.tools.has(name) is False
-        assert live_app.job_engine.tools.has(name) is False
-        assert live_app.automation_engine.tools.has(name) is False
+        # Slice 4: both are on the Job allowlist - but never automatable, and still in the interactive registry.
+        assert live_app.job_engine.tools.has(name) is True
+        assert live_app.automation_engine.tools.get(name).automatable is False
         assert live_app.core.computer_tools.has(name) is True
 
 
@@ -414,11 +418,17 @@ def test_the_real_app_gives_job_engine_and_automation_engine_only_core_tools():
     assert live_app.automation_engine.tools is live_app.core.tools
     assert live_app.core.computer_tools is not live_app.core.tools
 
+    # Slice 4: Jobs hold EXACTLY the narrow allowlist of computer tools - never an input tool.
     for name in COMPUTER_TOOL_NAMES:
-        assert live_app.core.tools.has(name) is False
-        assert live_app.job_engine.tools.has(name) is False
-        assert live_app.automation_engine.tools.has(name) is False
+        in_jobs = name in JOB_COMPUTER_TOOL_NAMES
+        assert live_app.core.tools.has(name) is in_jobs
+        assert live_app.job_engine.tools.has(name) is in_jobs
         assert live_app.core.computer_tools.has(name) is True
+    for name in ("type_text", "press_key", "move_mouse", "click_mouse", "double_click", "open_application"):
+        assert live_app.job_engine.tools.has(name) is False
+    # ...and an automation never runs any of them (AutomationEngine / CreateAutomation read `automatable`).
+    for name in JOB_COMPUTER_TOOL_NAMES:
+        assert live_app.automation_engine.tools.get(name).automatable is False
 
 
 def test_get_screen_size_resolves_through_the_real_apps_chat_capability_path():

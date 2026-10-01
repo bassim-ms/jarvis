@@ -824,12 +824,16 @@ def test_with_the_needed_tools_on_offer_the_same_objective_is_supported():
 
 def test_the_real_job_facing_registry_reports_computer_workflows_as_unavailable():
     """Jobs cannot reach the computer-control registry (M15 isolation), and
-    Handle This does not quietly route around that."""
+    Handle This does not quietly route around that. (Slice 4 gives Jobs only a narrow
+    allowlist - checked against the real app, never an input tool; the declining itself is
+    shown against a Job registry with no computer tool at all.)"""
     import app.main as live_app
+    from app.tools.defaults import create_default_registry
 
     available = planner_tool_names(live_app.core.tools)
-    assert "web_search" in available and "open_url" not in available
-    intake = create_default_intake(tools=live_app.core.tools)
+    assert "web_search" in available and "open_url" in available
+    assert not {"type_text", "press_key", "click_mouse", "move_mouse", "double_click", "open_application"} & set(available)
+    intake = create_default_intake(tools=create_default_registry())
     assert request_of(intake, "Research the latest Arduino boards").status in (
         HandleThisStatus.READY, HandleThisStatus.NEEDS_CLARIFICATION,
     )

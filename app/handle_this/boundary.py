@@ -61,6 +61,8 @@ _DECLARED_TOOLS: dict[GoalFamily, frozenset[str]] = {
     GoalFamily.COMPUTER_WORKFLOW: frozenset(
         {
             "get_active_window",
+            "observe_page",
+            "verify_observation",
             "get_screen_info",
             "get_screen_size",
             "open_application",

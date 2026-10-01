@@ -55,6 +55,7 @@ class GetActiveWindowTool(Tool):
     name = "get_active_window"
     description = "Get the title, owning process, and maximized state of the active window."
     permission = PermissionLevel.READ
+    automatable = False  # Slice 4: Jobs may use this tool; a scheduled automation never does
 
     def __init__(self, backend: ComputerBackend):
         self.backend = backend
@@ -171,6 +172,7 @@ class OpenUrlTool(Tool):
     name = "open_url"
     description = "Open a URL (http/https only) in the default browser."
     permission = PermissionLevel.SAFE_ACTION
+    automatable = False  # Slice 4: Jobs may use this tool; a scheduled automation never does
 
     def __init__(self, backend: ComputerBackend):
         self.backend = backend
@@ -449,6 +451,7 @@ class ScrollTool(Tool):
     name = "scroll"
     description = "Scroll up (positive) or down (negative) at the current cursor position."
     permission = PermissionLevel.SAFE_ACTION
+    automatable = False  # Slice 4: Jobs may use this tool; a scheduled automation never does
 
     def __init__(self, backend: ComputerBackend):
         self.backend = backend

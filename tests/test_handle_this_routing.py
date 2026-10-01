@@ -594,10 +594,15 @@ def test_the_real_application_routes_objectives_and_leaves_everything_else_alone
 
 def test_the_real_application_declines_a_routed_computer_workflow_before_anything_else():
     import app.main as live_app
+    from app.handle_this.factory import create_default_intake
+    from app.handle_this.service import HandleThisService
+    from app.tools.defaults import create_default_registry
 
     message = "Open Chrome, search Google for the best printer, compare the results, and save them."
     assert live_app.core.capability_router.route(message).capability is Capability.TASK
-    outcome = live_app.core.handle_this.handle(message, "c1")
+    # Slice 4 offers Jobs a narrow computer allowlist, so the decline is shown against a Job registry that has none
+    service = HandleThisService(create_default_intake(tools=create_default_registry()))
+    outcome = service.handle(message, "c1")
     assert outcome.job_params is None and "capability" in outcome.reply
 
 

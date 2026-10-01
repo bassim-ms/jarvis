@@ -258,8 +258,13 @@ def test_every_declared_tool_is_a_real_existing_tool():
     computer = {t.name for t in live_app.core.computer_tools.list_tools()}
     for family in (GoalFamily.RESEARCH, GoalFamily.ANALYSIS, GoalFamily.ORGANIZATION):
         assert DEFAULT_BOUNDARY.declared_tools(family) <= ordinary, family
-    assert DEFAULT_BOUNDARY.declared_tools(GoalFamily.COMPUTER_WORKFLOW) <= computer
-    assert not DEFAULT_BOUNDARY.declared_tools(GoalFamily.COMPUTER_WORKFLOW) & ordinary  # the isolation is real
+    declared = DEFAULT_BOUNDARY.declared_tools(GoalFamily.COMPUTER_WORKFLOW)
+    assert declared <= computer | ordinary
+    # Slice 4: exactly the narrow allowlist (+ observation) is Job-reachable; the isolation of the rest is real
+    from app.computer.defaults import JOB_COMPUTER_TOOL_NAMES
+    from app.observation.defaults import JOB_OBSERVATION_TOOL_NAMES
+
+    assert declared & ordinary == JOB_COMPUTER_TOOL_NAMES | JOB_OBSERVATION_TOOL_NAMES
 
 
 def test_assess_reports_only_families_with_nothing_on_offer():
