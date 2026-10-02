@@ -126,6 +126,20 @@ class Settings(BaseSettings):
     schedule_grace_seconds: int = 600
     schedule_min_interval_minutes: int = 15
 
+    # Scheduled Jobs (see app/scheduled_jobs/): a Job created from a Schedule, once per occurrence, while Jarvis is running.
+    # `scheduled_jobs_enabled` is the kill switch - OFF by default, and nothing in this foundation consults it yet. The rest are
+    # the V1 limits: the shortest gap between runs of a NEW repeating Scheduled Job, how long a recurring one stays active after
+    # the user approves it (renewal needs fresh approval), how late a missed occurrence may still be caught up (ONCE, never a
+    # replay), how many may exist / run per day / run at the same time, and how many failed runs in a row pause one.
+    scheduled_jobs_enabled: bool = False
+    scheduled_job_min_interval_minutes: int = 60
+    scheduled_job_lifetime_days: int = 90
+    scheduled_job_catch_up_window_seconds: int = 21600
+    scheduled_job_max_active: int = 10
+    scheduled_job_max_runs_per_day: int = 10
+    scheduled_job_max_concurrent: int = 2
+    scheduled_job_breaker_failures: int = 3
+
     # Google Calendar (OAuth 2.0 desktop/localhost flow, see
     # app/calendar/) - client_id/client_secret come from a Google Cloud
     # "Desktop app" OAuth client; no default and no key is hard-coded

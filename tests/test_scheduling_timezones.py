@@ -207,7 +207,7 @@ def test_app_scheduling_is_pure_it_reads_no_clock_no_environment_no_files_no_net
         r"apscheduler|croniter|dateutil",
     ]
     files = sorted(root.glob("*.py"))
-    assert {f.name for f in files} == {"__init__.py", "runs.py", "schedule.py", "timezones.py"}
+    assert {f.name for f in files} == {"__init__.py", "builder.py", "runs.py", "schedule.py", "timezones.py"}
     for path in files:
         text = path.read_text(encoding="utf-8")
         for pattern in forbidden:

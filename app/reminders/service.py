@@ -26,27 +26,26 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, time, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 
 from app.notifications.text import clean_text
-from app.reminders.base import Recurrence, RecurrenceUnit, Reminder, ReminderStatus, ReminderStore
-from app.reminders.language import ClockSpec, MAX_TEXT_CHARS, WEEKDAY_NUMBERS
+from app.reminders.base import Reminder, ReminderStatus, ReminderStore
+from app.reminders.language import ClockSpec, MAX_TEXT_CHARS
 from app.reminders.occurrences import effective_schedule, parse_instant
-from app.reminders.timefmt import clock_text, local_phrase
-from app.scheduling.schedule import (
-    DEFAULT_MIN_INTERVAL,
-    Schedule,
-    ScheduleError,
-    interval_delta,
-    next_due,
-    resolve_once,
+from app.reminders.timefmt import local_phrase
+from app.scheduling.builder import (  # noqa: F401 - ask_meridiem / needs_meridiem stay importable from here
+    MAX_HORIZON,
+    REMINDER_WORDING,
+    ScheduleSpec,
+    ScheduleSpecError,
+    ask_meridiem,
+    build_schedule,
+    needs_meridiem,
 )
-from app.scheduling.timezones import UTC, TimezoneUnavailableError, ZoneChoice, load_zone, local_to_utc, resolve_timezone
+from app.scheduling.schedule import DEFAULT_MIN_INTERVAL, Schedule, ScheduleError, next_due
+from app.scheduling.timezones import UTC, TimezoneUnavailableError, ZoneChoice, resolve_timezone
 
 MAX_ACTIVE_REMINDERS = 100
-MAX_HORIZON = timedelta(days=800)
-MAX_DAY_OFFSET = 365
-_UNITS = {unit.value: unit for unit in RecurrenceUnit}
 
 
 class ReminderRequestError(ValueError):
@@ -68,6 +67,11 @@ class ReminderRequest:
     every: tuple[str, int] | None = None
     first_in: timedelta | None = None
 
+    @property
+    def spec(self) -> ScheduleSpec:
+        """The WHEN part of the request, as the shared schedule builder (app/scheduling/builder.py) reads it."""
+        return ScheduleSpec(self.clock, self.day, self.repeat, self.weekdays, self.every, self.first_in)
+
 
 @dataclass(frozen=True)
 class Created:
@@ -81,20 +85,6 @@ class Created:
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
-
-
-def needs_meridiem(clock: ClockSpec | None, day: str | None, repeat: str | None, every: tuple[str, int] | None = None) -> bool:
-    """Whether the request can only be honoured once the user says AM or PM: a bare 12-hour time together with an explicit day
-    or a repetition. (A bare time alone is read as the next upcoming one - see the module docstring.)"""
-    return clock is not None and clock.ambiguous and (day is not None or repeat is not None)
-
-
-def ask_meridiem(clock: ClockSpec) -> str:
-    first, second = clock.candidates[0], clock.candidates[1]
-    return (
-        f"Do you mean {clock_text(first)} or {clock_text(second)}? Say AM or PM, or give the time as 24-hour, like "
-        f"{second.hour:02d}:{second.minute:02d}."
-    )
 
 
 class ReminderService:
@@ -179,107 +169,13 @@ class ReminderService:
 
     def _schedule_for(self, request: ReminderRequest, tz: str, now: datetime) -> tuple[Schedule, datetime, bool]:
         try:
-            if request.every is not None:
-                return self._interval(request, tz, now)
-            if request.repeat is not None:
-                return self._repeating(request, tz, now)
-            return self._one_time(request, tz, now)
+            return build_schedule(request.spec, tz, now, min_interval=self.min_interval(), wording=REMINDER_WORDING)
+        except ScheduleSpecError as exc:
+            raise ReminderRequestError(str(exc)) from None
         except TimezoneUnavailableError as exc:
             raise ReminderRequestError(str(exc)) from None
         except ScheduleError as exc:
             raise ReminderRequestError(f"I couldn't set that reminder: {exc}.") from None
-
-    def _interval(self, request: ReminderRequest, tz: str, now: datetime) -> tuple[Schedule, datetime, bool]:
-        if request.clock is not None or request.day is not None or request.repeat is not None:
-            raise ReminderRequestError("A reminder that repeats every so often can't also have a fixed time or day.")
-        unit, count = request.every
-        if unit not in _UNITS:
-            raise ReminderRequestError(f"I can repeat a reminder every N minutes, hours, days or weeks, not '{unit}'.")
-        recurrence = Recurrence(_UNITS[unit], int(count))
-        anchor = now.replace(microsecond=0) + (request.first_in if request.first_in is not None else interval_delta(recurrence))
-        schedule = Schedule.every(tz, recurrence, anchor, min_interval=self.min_interval())
-        return schedule, anchor, False
-
-    def _repeating(self, request: ReminderRequest, tz: str, now: datetime) -> tuple[Schedule, datetime, bool]:
-        if request.day is not None:
-            raise ReminderRequestError("A repeating reminder can't also be for one particular day.")
-        if request.clock is None:
-            raise ReminderRequestError("What time should it repeat at? For example: every day at 7 PM.")
-        if request.clock.ambiguous:
-            raise ReminderRequestError(ask_meridiem(request.clock))
-        at = request.clock.exact
-        if request.repeat == "daily":
-            schedule = Schedule.daily(tz, at)
-        elif request.repeat == "weekdays":
-            schedule = Schedule.weekdays(tz, at)
-        elif request.repeat == "weekly":
-            days = tuple(sorted({d for d in request.weekdays if isinstance(d, int) and 1 <= d <= 7}))
-            if not days:
-                raise ReminderRequestError("Which day of the week should it repeat on? For example: every Monday at 5 PM.")
-            schedule = Schedule.weekly(tz, at, days)
-        else:
-            raise ReminderRequestError("I can repeat a reminder daily, on weekdays, or on chosen days of the week.")
-        return schedule, next_due(schedule, now), False
-
-    def _one_time(self, request: ReminderRequest, tz: str, now: datetime) -> tuple[Schedule, datetime, bool]:
-        if request.clock is None:
-            raise ReminderRequestError("What time should I remind you? For example: tomorrow at 7 PM.")
-        if request.day is None:
-            # No day given: the next time the clock reads that (morning or evening, whichever comes first), never in the past.
-            options = [resolve_once(candidate, now, tz) for candidate in request.clock.candidates]
-            schedule, rolled = min(options, key=lambda option: next_due(option[0], now))
-            return schedule, next_due(schedule, now), rolled
-        if request.clock.ambiguous:
-            raise ReminderRequestError(ask_meridiem(request.clock))
-        at = request.clock.exact
-        zone = load_zone(tz)
-        local_today = now.astimezone(zone).date()
-        day = self._resolve_day(request.day, at, now, local_today, zone)
-        schedule = Schedule.once(tz, datetime.combine(day, at))
-        due = next_due(schedule, now)
-        if due is None:
-            when = "today" if request.day in ("today", "tonight") else "that date"
-            raise ReminderRequestError(f"{clock_text(at)} has already passed {when}. Tell me a time that is still ahead.")
-        return schedule, due, False
-
-    @staticmethod
-    def _resolve_day(day: str, at: time, now: datetime, today, zone):
-        value = day.strip().lower()
-        if value in ("today", "tonight"):
-            return today
-        if value == "tomorrow":
-            return today + timedelta(days=1)
-        if value.startswith("+") and value[1:].isdigit():
-            offset = int(value[1:])
-            if not 1 <= offset <= MAX_DAY_OFFSET:
-                raise ReminderRequestError("I can set reminders up to a year ahead this way - give me a date instead.")
-            return today + timedelta(days=offset)
-        strictly_after = value.startswith("next ")
-        name = value[5:] if strictly_after else value
-        if name in WEEKDAY_NUMBERS:
-            target = WEEKDAY_NUMBERS[name]
-            for ahead in range(0 if not strictly_after else 1, 8):
-                candidate = today + timedelta(days=ahead)
-                if candidate.isoweekday() == target and local_to_utc(datetime.combine(candidate, at), zone) > now:
-                    return candidate
-            raise ReminderRequestError("I couldn't work out which day that is.")
-        parts = value.split("-")
-        try:
-            if len(parts) == 3:
-                return datetime(int(parts[0]), int(parts[1]), int(parts[2])).date()
-            if len(parts) == 2:
-                month, dom = int(parts[0]), int(parts[1])
-                for year in (today.year, today.year + 1):
-                    try:
-                        candidate = datetime(year, month, dom).date()
-                    except ValueError:
-                        continue
-                    if local_to_utc(datetime.combine(candidate, at), zone) > now:
-                        return candidate
-                raise ValueError
-        except ValueError:
-            pass
-        raise ReminderRequestError(f"I couldn't understand the day '{day}'.")
 
     # -- pausing, resuming, deleting --------------------------------------------------------------------------------------------
 

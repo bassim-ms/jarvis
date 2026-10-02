@@ -160,6 +160,13 @@ jarvis/
       timefmt.py           - (V2) plain-words local times
       tools.py             - CreateReminderTool/ListRemindersTool/CompleteReminderTool/CancelReminderTool
       factory.py           - builds the default ReminderStore/Notifier/ReminderScheduler from config
+    scheduling/
+      schedule.py / runs.py / timezones.py - the pure Schedule value, run planning (`plan_run`), occurrence identity, time zones
+      builder.py           - (Scheduled Jobs Slice 1) build_schedule: the request -> Schedule rules, moved out of ReminderService unchanged and shared
+    scheduled_jobs/        - (Scheduled Jobs V1, Slice 1 - FOUNDATION ONLY; nothing runs, nothing is wired in)
+      base.py              - ScheduledJob, the state machine (ALLOWED_TRANSITIONS), the occurrence ledger types, the ScheduledJobStore contract
+      policy.py            - pure decisions: lifetime, new-schedule limits, missed-run (run-once catch-up), admission caps, circuit breaker
+      sqlite_store.py      - SQLiteScheduledJobStore: the record + ledger; `record_run` writes the ledger row and the Job in ONE transaction
     automation/
       base.py             - Automation/AutomationStatus/Trigger/Condition/AutomationStore interface, AutomationExecution
       sqlite_store.py      - SQLiteAutomationStore: SQLite implementation of AutomationStore
@@ -242,6 +249,11 @@ jarvis/
     test_reminders_v2_scheduler.py - (V2) missed-run collapsing, restart, duplicate prevention, attention/notification path, hostile text
     test_reminders_v2_door.py      - (V2) asking in plain words through JarvisCore, the questions it may ask, the boundaries
     test_reminders_v2_tools.py     - (V2) the reminder tools and the Planner / Handle This boundary
+    test_scheduling_builder.py     - the shared request -> Schedule builder (same rules as Reminder V2; only the noun in a refusal varies)
+    test_scheduled_jobs_base.py    - (Scheduled Jobs) the state machine, exactly which moves exist
+    test_scheduled_jobs_policy.py  - (Scheduled Jobs) lifetime, new-schedule limits, missed runs, caps, circuit breaker, DST identity
+    test_scheduled_jobs_store.py   - (Scheduled Jobs) store + ledger: one occurrence -> at most one Job, atomicity, races, restart, schema CHECKs
+    test_scheduled_jobs_boundaries.py - (Scheduled Jobs) the foundation cannot run/plan/notify/call tools and is not wired in
     test_automation_store.py       - unit tests for SQLiteAutomationStore (persistence, trigger/condition/action round-trip)
     test_automation_conditions.py  - unit tests for FactEqualsCondition/TimeWindowCondition/condition_from_dict
     test_automation_engine.py      - unit tests for AutomationEngine (triggers, conditions, permissions, restart recovery, failure isolation)
@@ -1280,6 +1292,34 @@ scheduler, no new thread, no new notification path):
   reminder loads and behaves as before. `PAUSED` is a new, non-terminal status. "Delete" is the existing cancel.
 - **Limits.** At most 100 active reminders, 300 characters of text, about two years ahead, and new repeating reminders
   at least `JARVIS_SCHEDULE_MIN_INTERVAL_MINUTES` (15) apart.
+
+## Scheduled Jobs V1 - Slice 1: the foundation (nothing runs yet)
+
+A *Scheduled Job* is a standing, **approved intent** plus a Schedule: "every Monday at 6 PM, review my progress and prepare a
+summary." It is not a Job and not an Automation. Each time one of its occurrences comes due, a later slice creates **one ordinary,
+fresh Job** (planned by the existing Planner, validated, and run by the existing JobEngine through the ToolRegistry); the Scheduled
+Job itself owns no plan and runs nothing. This slice adds only the foundation, in `app/scheduled_jobs/`, and is **not wired into the
+application** - no scheduler, no Job creation, no chat path, no notification.
+
+- **Concepts.** Task (something to do) / Reminder (tell the user at a time) / Schedule (when) / Job (one execution) / Scheduled Job
+  (a Job created from a Schedule, once per occurrence) / Automation (one fixed tool call on a trigger; untouched).
+- **State machine.** `PROPOSED -> ACTIVE <-> PAUSED`, `-> COMPLETED | CANCELLED`, `PROPOSED -> EXPIRED`. Exactly the moves in
+  `ALLOWED_TRANSITIONS` exist (a test enumerates every combination). Every change is a compare-and-set on `version`.
+- **One occurrence -> at most one Job.** `scheduled_job_runs` has `UNIQUE(schedule_id, occurrence)` and `UNIQUE(job_id)`;
+  `record_run` writes the ledger row, advances the schedule and inserts the Job (supplied by the caller as a callable) in a single
+  transaction, so a duplicate poll, a race, a second process or a restart cannot create a second Job. The store never touches
+  the `jobs` table itself.
+- **Lifetime.** 90 days from **approval** for a recurring one (`expires_at`); "every Monday for two years" is understood and activated
+  for the first period, with `renewal_required` set so the user can be told. Renewal needs fresh approval. A one-time one has no
+  lifetime (only the existing ~800-day horizon).
+- **Missed runs (one policy).** Never replayed. Within the grace window it just runs; otherwise at most ONE catch-up run for the
+  most recent missed occurrence if it is no older than the catch-up window (6 h), else it is skipped; then on to the next future
+  occurrence.
+- **Limits** (settings, `JARVIS_SCHEDULED_JOB_*`): minimum interval for NEW repeating ones 60 min, at most 10 open, 10 runs per rolling
+  24 h, 2 at once, 3 failed runs in a row pause one (the circuit breaker). `JARVIS_SCHEDULED_JOBS_ENABLED` is the kill switch
+  (default off; nothing reads it yet).
+- **Shared builder.** `app/scheduling/builder.py` holds the request -> Schedule rules Reminder V2 introduced, moved out of
+  `ReminderService` with no behaviour change, so reminders and Scheduled Jobs are created by the same rules.
 
 ## Persistent Automation Engine (M8)
 
