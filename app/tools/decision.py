@@ -328,7 +328,14 @@ class ToolCallBuilder:
             return ToolCall(tool_name=tool_name, parameters={})
 
         leftover = _leftover_text(message, tool_name)
-        if len(required) == 1 and required[0].type == "string" and leftover:
+        # A tool that declares `natural_language_arguments` takes prose that the AI extractor splits into its
+        # parameters (create_reminder: the text AND when), so its one required string is never just "the rest".
+        if (
+            len(required) == 1
+            and required[0].type == "string"
+            and leftover
+            and not tool.natural_language_arguments
+        ):
             return ToolCall(tool_name=tool_name, parameters={required[0].name: leftover})
 
         if not leftover:

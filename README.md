@@ -152,7 +152,12 @@ jarvis/
       base.py             - Reminder/ReminderStatus/Recurrence/ReminderStore interface, ReminderExecution, parse_recurrence/advance_by_recurrence (shared with automation)
       sqlite_store.py      - SQLiteReminderStore: SQLite implementation of ReminderStore
       notifier.py          - Notifier interface, WindowsToastNotifier (powershell.exe toast), ConsoleNotifier
-      scheduler.py         - ReminderScheduler: background poller that triggers due reminders
+      scheduler.py         - ReminderScheduler: background poller that triggers due reminders (V2 reminders: one catch-up for missed runs, via app/scheduling; pre-V2 reminders unchanged)
+      service.py           - ReminderService (V2): the one place a structured request becomes a stored reminder; pause / resume / delete
+      language.py          - (V2) pure grammar: clock rule + whole-message reminder phrasing (no model, no clock, no storage)
+      operations.py        - (V2) ReminderOperations: the chat door ("remind me ...", "what reminders do I have?", "pause my ... reminder")
+      occurrences.py       - (V2) which Schedule governs a stored reminder (its own, or one derived from a legacy recurrence)
+      timefmt.py           - (V2) plain-words local times
       tools.py             - CreateReminderTool/ListRemindersTool/CompleteReminderTool/CancelReminderTool
       factory.py           - builds the default ReminderStore/Notifier/ReminderScheduler from config
     automation/
@@ -232,6 +237,11 @@ jarvis/
     test_reminders_scheduler.py   - unit tests for ReminderScheduler (ticking, recurrence, restart recovery)
     test_reminders_tools.py       - unit tests for the reminder Tools, through the Tool Registry
     test_reminders_integration.py - default-registry wiring + end-to-end Core TOOL dispatch onto reminders
+    test_reminders_v2_language.py  - (V2) the clock rule and the reminder grammar
+    test_reminders_v2_service.py   - (V2) one-time / daily / weekday / weekly / interval, zones, DST, pause/resume/delete, duplicates, persistence, old databases
+    test_reminders_v2_scheduler.py - (V2) missed-run collapsing, restart, duplicate prevention, attention/notification path, hostile text
+    test_reminders_v2_door.py      - (V2) asking in plain words through JarvisCore, the questions it may ask, the boundaries
+    test_reminders_v2_tools.py     - (V2) the reminder tools and the Planner / Handle This boundary
     test_automation_store.py       - unit tests for SQLiteAutomationStore (persistence, trigger/condition/action round-trip)
     test_automation_conditions.py  - unit tests for FactEqualsCondition/TimeWindowCondition/condition_from_dict
     test_automation_engine.py      - unit tests for AutomationEngine (triggers, conditions, permissions, restart recovery, failure isolation)
@@ -1205,9 +1215,9 @@ ReminderScheduler (background thread, polls every JARVIS_REMINDER_POLL_INTERVAL_
   branching anywhere in `JarvisCore`. `complete_reminder`/`cancel_reminder`
   each take one required string parameter (`reminder_id`), so
   `ToolCallBuilder` fills it deterministically from trailing message text,
-  zero AI calls - `create_reminder` has multiple required parameters, so
-  it goes through `ToolCallBuilder`'s existing Gemini-assisted fallback,
-  same as any other multi-parameter tool. `create_reminder`/
+  zero AI calls - `create_reminder` takes prose arguments
+  (`natural_language_arguments`), so it goes through `ToolCallBuilder`'s
+  existing Gemini-assisted fallback, same as any other prose-argument tool. `create_reminder`/
   `complete_reminder`/`cancel_reminder` are `SAFE_ACTION` (each only ever
   adds a new reminder or changes that one reminder's own status);
   `list_reminders` is `READ`.
@@ -1223,6 +1233,53 @@ Configuration:
   Defaults to `jarvis_reminders.db`.
 - `JARVIS_REMINDER_POLL_INTERVAL_SECONDS` - how often the background
   scheduler polls for due reminders, in seconds. Defaults to `30`.
+
+### Reminder V2 (everyday reminders)
+
+Reminders now work the way a person says them, built on the pure `app/scheduling/` foundation (no second
+scheduler, no new thread, no new notification path):
+
+```
+"Remind me tomorrow at 7 PM to study."          one time, local date and time
+"Remind me every day at 7 PM to study."         daily
+"Remind me every weekday at 6 PM to ..."        Monday to Friday
+"Remind me every Monday at 5 PM about ..."      chosen weekdays
+"Remind me in 10 minutes ..." / "every 2 hours" the existing interval forms
+"What reminders do I have?"   "Pause / Resume / Delete my study reminder"
+```
+
+- **Time zone.** A new reminder is created in `JARVIS_TIMEZONE`, else the system zone when it can be determined
+  reliably, else it fails with a clear message (nothing is created that might fire at the wrong time). The zone is
+  stored with the reminder and never changes; "7 PM" stays 7 PM across daylight saving (a time inside the
+  spring-forward gap becomes the first valid minute after it; a time that happens twice is its first occurrence).
+- **Asking, not guessing.** "Remind me to study" asks *when*. A bare "at 7" alone means the next time the clock reads 7
+  (and the reply says which); with an explicit day or a repetition it asks *AM or PM*. A pause / resume / delete that
+  matches several reminders lists them and asks which ONE; "delete all my reminders" is declined. One question at a
+  time, held in memory for a few minutes; anything that is not an answer simply drops it.
+- **Missed reminders.** What came due while Jarvis was off is NOT replayed. A run up to `JARVIS_SCHEDULE_GRACE_SECONDS`
+  (10 minutes) late is announced normally; later than that, ONE catch-up announcement stands for every missed
+  occurrence ("...I missed while I was offline (it came due 3 times; the last was ...)") and the reminder jumps to its
+  next future occurrence. Pausing never replays either: resuming goes to the next future occurrence. A NEW
+  "every N minutes/hours/days/weeks" reminder (chat, or `create_reminder` with `due_in_minutes` + a recurrence) is stored as a
+  V2 interval schedule, so it gets this rule too. Reminders that already exist from before V2 (stored with a legacy
+  recurrence and no schedule) are NOT changed, migrated or rewritten: they keep their original behaviour, including replaying
+  what was missed one occurrence per poll.
+- **Duplicates.** An occurrence is identified by the UTC instant it resolved to; the update that records "handled" is a
+  compare-and-set, and an occurrence is recorded as delivered at most once, so two polls (or two processes) cannot
+  announce it twice. Creating an identical reminder twice returns the existing one.
+- **Notification.** A due reminder is a normal `REMINDER` event (never urgent, never important from its words) handed to
+  the existing attention-gated router, exactly as before; the event key is unchanged, so the Morning Brief still
+  recognises it.
+- **Boundary.** Reminders remain reminders: a reminder carries only text and a schedule, and becoming due only ever
+  produces a notification - no Job, no Planner, no tool, no automation, no memory or world-model write. The chat door
+  reads a fixed grammar (no model), acts only through the registered reminder tools, and only on a whole-message request
+  on the ordinary conversation path; a multi-step goal that merely contains a reminder still goes to Handle This.
+  `pause_reminder` / `resume_reminder` are not plannable and not automatable. The reminder's own words are always data.
+- **Storage.** The `reminders` table gains a nullable `schedule` column (the schedule as JSON, including its time zone)
+  and the execution log a nullable `occurrence` column; a database from before V2 is upgraded in place and every old
+  reminder loads and behaves as before. `PAUSED` is a new, non-terminal status. "Delete" is the existing cancel.
+- **Limits.** At most 100 active reminders, 300 characters of text, about two years ahead, and new repeating reminders
+  at least `JARVIS_SCHEDULE_MIN_INTERVAL_MINUTES` (15) apart.
 
 ## Persistent Automation Engine (M8)
 

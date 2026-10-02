@@ -254,6 +254,7 @@ class JarvisCore:
         escalation_surface=None,
         morning_brief=None,
         device_operations=None,
+        reminder_operations=None,
     ):
         self.provider = provider or create_default_ai_provider_manager()
         self.memory = memory or SQLiteMemoryStore(settings.memory_db_path)
@@ -337,6 +338,11 @@ class JarvisCore:
         # ("what devices do you have?", "is my phone connected?", "revoke my phone" - the last one only
         # ASKS, through the existing confirmation). `None` (every existing caller/test): ordinary chat.
         self.device_operations = device_operations
+        # The user-facing reminder operations (app/reminders/operations.py): a duck-typed object with
+        # `command_reply(message, conversation_id)` that answers a whole-message reminder request ("remind me tomorrow at
+        # 7 PM to study", "what reminders do I have?", "pause my study reminder"). It acts only through the reminder
+        # tools on `self.tools`. `None` (every existing caller/test): such a message is ordinary conversation.
+        self.reminder_operations = reminder_operations
         self.router = router or SearchRouter()
         # Reuses self.provider by default, so injecting a fake AIProvider
         # into Core (as tests do) covers the SEARCH path's answer
@@ -678,6 +684,22 @@ class JarvisCore:
                     else self.device_operations.command_reply(message, conversation_id)
                 )
             except Exception:  # noqa: BLE001 - a fault here is "not a device request"
+                memory_reply = None
+        # Reminders are read the same way: a whole-message request only, on the ordinary conversation path (DIRECT, or
+        # SEARCH when only a freshness word like "tomorrow" put it there - never an explicit search, tool, task, status
+        # or self-development request, and never a multi-step goal, which Handle This receives as a TASK).
+        if (
+            memory_reply is None
+            and self.reminder_operations is not None
+            and interaction_reply is None
+            and (
+                decision.capability is Capability.DIRECT
+                or (decision.capability is Capability.SEARCH and not is_explicit_search_request(message))
+            )
+        ):
+            try:
+                memory_reply = self.reminder_operations.command_reply(message, conversation_id)
+            except Exception:  # noqa: BLE001 - a fault here is "not a reminder request"
                 memory_reply = None
         if (
             memory_reply is None

@@ -30,6 +30,10 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # annotation only: app.scheduling.schedule itself imports Recurrence from this module
+    from app.scheduling.schedule import Schedule
 
 
 class ReminderStatus(Enum):
@@ -44,14 +48,20 @@ class ReminderStatus(Enum):
       ReminderStore.record_trigger).
     COMPLETED - the user explicitly marked it done; for a recurring
       reminder this stops all future occurrences, not just one.
-    CANCELLED - the user explicitly cancelled it, before or after it first
-      fired.
+    CANCELLED - the user explicitly cancelled (deleted) it, before or after
+      it first fired.
+    PAUSED - the user paused it. Not terminal: `ReminderStore.resume` makes
+      it PENDING again. A paused reminder is never due (`list_due` only
+      returns PENDING ones), and nothing that comes due while it is paused
+      is ever replayed afterwards - resuming jumps to the next FUTURE
+      occurrence.
     """
 
     PENDING = "pending"
     TRIGGERED = "triggered"
     COMPLETED = "completed"
     CANCELLED = "cancelled"
+    PAUSED = "paused"
 
 
 #: Terminal states a reminder can never leave - excluded from every
@@ -150,6 +160,17 @@ class Reminder:
     `recurrence` each time it fires (see ReminderStore.record_trigger).
     `due_at`/`created_at`/`updated_at` are ISO 8601 UTC strings, the same
     convention SQLiteMemoryStore/SQLiteSearchCache already use.
+
+    Reminder V2: `schedule` (app/scheduling/schedule.py) is the optional,
+    richer description of WHEN - local wall-clock time in the reminder's
+    own, persisted time zone (a one-time date and time, every day, every
+    weekday, chosen weekdays, or an elapsed interval). When it is present
+    it is the source of truth for every occurrence after the first and
+    `recurrence` stays None; `due_at` remains the next occurrence as a UTC
+    instant, exactly as before. A reminder created before V2 has no
+    schedule and behaves as it always did. `schedule_invalid` is True when
+    a stored schedule could not be read back: such a reminder is listed
+    but never fired, rather than guessed at.
     """
 
     id: str
@@ -159,6 +180,13 @@ class Reminder:
     recurrence: Recurrence | None
     created_at: str
     updated_at: str
+    schedule: "Schedule | None" = None
+    schedule_invalid: bool = False
+
+    @property
+    def timezone(self) -> str | None:
+        """The IANA zone this reminder's schedule was created in (None for a pre-V2 reminder)."""
+        return self.schedule.tz if self.schedule is not None else None
 
 
 @dataclass
@@ -180,9 +208,14 @@ class ReminderStore(ABC):
 
     @abstractmethod
     def create(
-        self, text: str, due_at: str, recurrence: Recurrence | None = None
+        self,
+        text: str,
+        due_at: str,
+        recurrence: Recurrence | None = None,
+        schedule: "Schedule | None" = None,
     ) -> Reminder:
-        """Create and persist a new PENDING reminder, returning it."""
+        """Create and persist a new PENDING reminder, returning it. `schedule` (Reminder V2) is persisted with
+        the reminder, including the time zone it was created in; `due_at` is its first occurrence."""
 
     @abstractmethod
     def get(self, reminder_id: str) -> Reminder | None:
@@ -208,9 +241,21 @@ class ReminderStore(ABC):
         success: bool,
         detail: str = "",
         next_due_at: str | None = None,
-    ) -> None:
-        """Record that `reminder_id` came due and was handled. Always
-        appends a ReminderExecution row, regardless of `success`.
+        occurrence: str | None = None,
+        expected_due_at: str | None = None,
+    ) -> bool:
+        """Record that `reminder_id` came due and was handled. Appends a
+        ReminderExecution row regardless of `success` (unless one of the
+        duplicate guards below refuses it).
+
+        Duplicate prevention (Reminder V2). `expected_due_at` makes the
+        update a compare-and-set: it applies only while the reminder's
+        `due_at` still IS that value, so two pollers that both saw the same
+        occurrence can never both advance (and so never both announce) it.
+        `occurrence` (app/scheduling/runs.py `occurrence_key`) names the
+        occurrence being handled; the store refuses to record the SAME
+        occurrence as successfully delivered twice. In either case nothing
+        is changed and False is returned. Returns True when recorded.
 
         On a *successful* notification (`success=True`): `next_due_at`
         given advances `due_at` to it and leaves the reminder PENDING (a
@@ -223,6 +268,15 @@ class ReminderStore(ABC):
         the next scheduler poll retries it - a delivery failure is never
         silently treated as "handled".
         """
+
+    @abstractmethod
+    def pause(self, reminder_id: str) -> bool:
+        """PENDING -> PAUSED. False if the reminder doesn't exist or isn't PENDING."""
+
+    @abstractmethod
+    def resume(self, reminder_id: str, next_due_at: str) -> bool:
+        """PAUSED -> PENDING, with `due_at` moved to `next_due_at` (the caller computes the next FUTURE
+        occurrence, so nothing missed while paused is replayed). False if it isn't PAUSED."""
 
     @abstractmethod
     def get_executions(self, reminder_id: str) -> list[ReminderExecution]:

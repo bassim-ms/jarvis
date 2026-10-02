@@ -50,11 +50,14 @@ from app.orchestration.tools import (
 )
 from app.reminders.base import ReminderStore
 from app.reminders.factory import create_default_reminder_store
+from app.reminders.service import ReminderService
 from app.reminders.tools import (
     CancelReminderTool,
     CompleteReminderTool,
     CreateReminderTool,
     ListRemindersTool,
+    PauseReminderTool,
+    ResumeReminderTool,
 )
 from app.search.cached import CachedSearchProvider
 from app.search.factory import (
@@ -152,10 +155,15 @@ def register_default_tools(
     reminder_store = reminder_store or create_default_reminder_store(
         settings.reminders_db_path
     )
-    registry.register(CreateReminderTool(store=reminder_store))
-    registry.register(ListRemindersTool(store=reminder_store))
+    # One ReminderService (app/reminders/service.py) behind every reminder tool: creating, pausing and resuming a
+    # reminder - from a Planner step, an explicit command or the chat door - is one implementation.
+    reminder_service = ReminderService(reminder_store)
+    registry.register(CreateReminderTool(store=reminder_store, service=reminder_service))
+    registry.register(ListRemindersTool(store=reminder_store, service=reminder_service))
     registry.register(CompleteReminderTool(store=reminder_store))
     registry.register(CancelReminderTool(store=reminder_store))
+    registry.register(PauseReminderTool(store=reminder_store, service=reminder_service))
+    registry.register(ResumeReminderTool(store=reminder_store, service=reminder_service))
 
     automation_store = automation_store or create_default_automation_store(
         settings.automations_db_path

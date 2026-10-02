@@ -42,6 +42,8 @@ from app.config import settings
 from app.context_engine.factory import create_default_context_engine
 from app.context_planning.factory import create_default_context_planner
 from app.context_reasoning.factory import create_default_context_reasoner
+from app.handle_this.base import GoalFamily
+from app.handle_this.boundary import DEFAULT_BOUNDARY
 from app.handle_this.continuation import ObjectiveContinuer, plausible_input_answer
 from app.handle_this.dialogue import ClarificationDialogue
 from app.memory_policy.confirmation import SensitiveWriteConfirmer
@@ -61,7 +63,7 @@ from app.orchestration.factory import (
 from app.orchestration.interaction_lifecycle import InteractionLifecycle
 from app.orchestration.notification_events import still_relevant
 from app.orchestration.interaction_resolver import InteractionResolver
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from app.devices.base import DeviceAuthenticationError, DeviceContext
 from app.devices.gateway import DeviceGateway
@@ -91,6 +93,7 @@ from app.reminders.factory import (
     create_default_reminder_store,
     create_default_scheduler,
 )
+from app.reminders.operations import ReminderOperations
 from app.search.factory import create_default_search_provider
 from app.tasks.factory import create_default_task_store
 from app.tools.defaults import register_default_tools
@@ -177,7 +180,10 @@ automation_engine = register_default_tools(
 )
 
 reminder_scheduler = create_default_scheduler(
-    _reminder_store, settings.reminder_poll_interval_seconds, router=_gated_router
+    _reminder_store,
+    settings.reminder_poll_interval_seconds,
+    router=_gated_router,
+    grace=timedelta(seconds=max(0, settings.schedule_grace_seconds)),
 )
 
 # JobEngine (M15) isn't built by register_default_tools itself (see that
@@ -307,6 +313,15 @@ device_operations = DeviceOperations(
     DeviceRevocationConfirmer(_interaction_store, mark_surfaced=core.interaction_resolver.mark_surfaced),
 )
 core.device_operations = device_operations
+
+# Reminders (see app/reminders/): "remind me tomorrow at 7 PM to study", "what reminders do I have?", "pause my study
+# reminder" ride the ordinary chat path as a whole-message hook. It reads a fixed grammar (no model, no Planner, no Job)
+# and acts only through the reminder tools already on `core.tools`, so their permission checks apply. Multi-step goals
+# that merely contain a reminder still go to Handle This.
+core.reminder_operations = ReminderOperations(
+    core.tools,
+    family_on_offer=lambda names: DEFAULT_BOUNDARY.assess((GoalFamily.ORGANIZATION,), names).supported,
+)
 core.tools.register(CommitDeviceRevocationTool(device_operations))
 # The Context Engine may show reasoning a confident staged candidate - labelled
 # UNCONFIRMED, in its own field, never as a fact.

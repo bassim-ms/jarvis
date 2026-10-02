@@ -10,10 +10,17 @@ Backed by a plain local file, so reminders - and whether they've already
 fired - survive a Jarvis restart with no special recovery code: a new
 SQLiteReminderStore pointed at the same db_path just sees the same rows
 `list_due` already knows how to query.
+
+Reminder V2 adds, ADDITIVELY, a nullable `schedule` column (the Schedule as
+JSON, which carries the reminder's own time zone) and a nullable
+`occurrence` column on the execution log. A database created before V2 is
+upgraded in place by adding those two columns; every existing row keeps
+loading exactly as before (schedule NULL = the original behaviour).
 """
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 import uuid
@@ -28,6 +35,7 @@ from app.reminders.base import (
     ReminderStore,
     TERMINAL_STATUSES,
 )
+from app.scheduling.schedule import Schedule, ScheduleError
 
 
 def _now() -> str:
@@ -67,7 +75,19 @@ class SQLiteReminderStore(ReminderStore):
                 );
                 """
             )
+            self._add_column_if_missing("reminders", "schedule", "TEXT")
+            self._add_column_if_missing("reminder_executions", "occurrence", "TEXT")
+            # One occurrence of one reminder is recorded as delivered at most once, whatever calls this store.
+            self._conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ux_reminder_occurrence_delivered "
+                "ON reminder_executions (reminder_id, occurrence) WHERE success = 1 AND occurrence IS NOT NULL"
+            )
             self._conn.commit()
+
+    def _add_column_if_missing(self, table: str, column: str, declaration: str) -> None:
+        existing = {row["name"] for row in self._conn.execute(f"PRAGMA table_info({table})")}
+        if column not in existing:
+            self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
 
     @staticmethod
     def _row_to_reminder(row: sqlite3.Row) -> Reminder:
@@ -77,6 +97,12 @@ class SQLiteReminderStore(ReminderStore):
                 unit=RecurrenceUnit(row["recurrence_unit"]),
                 interval=row["recurrence_interval"],
             )
+        schedule, schedule_invalid = None, False
+        if row["schedule"] is not None:
+            try:
+                schedule = Schedule.from_dict(json.loads(row["schedule"]))
+            except (ValueError, ScheduleError):  # a damaged stored schedule: loadable, listed, never fired
+                schedule_invalid = True
         return Reminder(
             id=row["id"],
             text=row["text"],
@@ -85,11 +111,19 @@ class SQLiteReminderStore(ReminderStore):
             recurrence=recurrence,
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+            schedule=schedule,
+            schedule_invalid=schedule_invalid,
         )
 
     def create(
-        self, text: str, due_at: str, recurrence: Recurrence | None = None
+        self,
+        text: str,
+        due_at: str,
+        recurrence: Recurrence | None = None,
+        schedule: Schedule | None = None,
     ) -> Reminder:
+        if schedule is not None and recurrence is not None:
+            raise ValueError("a reminder has either a schedule or a legacy recurrence, never both")
         reminder_id = uuid.uuid4().hex
         now = _now()
         with self._lock:
@@ -97,8 +131,8 @@ class SQLiteReminderStore(ReminderStore):
                 """
                 INSERT INTO reminders (
                     id, text, due_at, status, recurrence_unit,
-                    recurrence_interval, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    recurrence_interval, created_at, updated_at, schedule
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     reminder_id,
@@ -109,6 +143,7 @@ class SQLiteReminderStore(ReminderStore):
                     recurrence.interval if recurrence else None,
                     now,
                     now,
+                    json.dumps(schedule.to_dict(), separators=(",", ":")) if schedule is not None else None,
                 ),
             )
             self._conn.commit()
@@ -120,6 +155,7 @@ class SQLiteReminderStore(ReminderStore):
             recurrence=recurrence,
             created_at=now,
             updated_at=now,
+            schedule=schedule,
         )
 
     def get(self, reminder_id: str) -> Reminder | None:
@@ -159,32 +195,58 @@ class SQLiteReminderStore(ReminderStore):
         success: bool,
         detail: str = "",
         next_due_at: str | None = None,
-    ) -> None:
+        occurrence: str | None = None,
+        expected_due_at: str | None = None,
+    ) -> bool:
         with self._lock:
-            if success:
-                if next_due_at is not None:
-                    self._conn.execute(
-                        "UPDATE reminders SET due_at = ?, status = ?, "
-                        "updated_at = ? WHERE id = ?",
-                        (
-                            next_due_at,
-                            ReminderStatus.PENDING.value,
-                            triggered_at,
-                            reminder_id,
-                        ),
-                    )
-                else:
-                    self._conn.execute(
-                        "UPDATE reminders SET status = ?, updated_at = ? "
-                        "WHERE id = ?",
-                        (ReminderStatus.TRIGGERED.value, triggered_at, reminder_id),
-                    )
-            self._conn.execute(
-                "INSERT INTO reminder_executions "
-                "(reminder_id, triggered_at, success, detail) VALUES (?, ?, ?, ?)",
-                (reminder_id, triggered_at, int(success), detail),
+            try:
+                if success:
+                    guard, guard_args = "", ()
+                    if expected_due_at is not None:
+                        # compare-and-set: only the poller that still sees this occurrence may advance it
+                        guard = " AND due_at = ? AND status = ?"
+                        guard_args = (expected_due_at, ReminderStatus.PENDING.value)
+                    if next_due_at is not None:
+                        cursor = self._conn.execute(
+                            "UPDATE reminders SET due_at = ?, status = ?, updated_at = ? WHERE id = ?" + guard,
+                            (next_due_at, ReminderStatus.PENDING.value, triggered_at, reminder_id, *guard_args),
+                        )
+                    else:
+                        cursor = self._conn.execute(
+                            "UPDATE reminders SET status = ?, updated_at = ? WHERE id = ?" + guard,
+                            (ReminderStatus.TRIGGERED.value, triggered_at, reminder_id, *guard_args),
+                        )
+                    if expected_due_at is not None and cursor.rowcount == 0:
+                        self._conn.rollback()
+                        return False
+                self._conn.execute(
+                    "INSERT INTO reminder_executions "
+                    "(reminder_id, triggered_at, success, detail, occurrence) VALUES (?, ?, ?, ?, ?)",
+                    (reminder_id, triggered_at, int(success), detail, occurrence),
+                )
+                self._conn.commit()
+            except sqlite3.IntegrityError:  # this occurrence was already recorded as delivered
+                self._conn.rollback()
+                return False
+        return True
+
+    def pause(self, reminder_id: str) -> bool:
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE reminders SET status = ?, updated_at = ? WHERE id = ? AND status = ?",
+                (ReminderStatus.PAUSED.value, _now(), reminder_id, ReminderStatus.PENDING.value),
             )
             self._conn.commit()
+        return cursor.rowcount > 0
+
+    def resume(self, reminder_id: str, next_due_at: str) -> bool:
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE reminders SET status = ?, due_at = ?, updated_at = ? WHERE id = ? AND status = ?",
+                (ReminderStatus.PENDING.value, next_due_at, _now(), reminder_id, ReminderStatus.PAUSED.value),
+            )
+            self._conn.commit()
+        return cursor.rowcount > 0
 
     def get_executions(self, reminder_id: str) -> list[ReminderExecution]:
         with self._lock:

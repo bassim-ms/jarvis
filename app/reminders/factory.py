@@ -5,6 +5,7 @@ app/search/factory.py plays for the default search provider/cache chain.
 """
 
 import platform
+from datetime import timedelta
 
 from app.reminders.base import ReminderStore
 from app.reminders.notifier import ConsoleNotifier, Notifier, WindowsToastNotifier
@@ -26,11 +27,18 @@ def create_default_reminder_store(db_path: str) -> ReminderStore:
 
 
 def create_default_scheduler(
-    store: ReminderStore, poll_interval_seconds: float, router=None
+    store: ReminderStore,
+    poll_interval_seconds: float,
+    router=None,
+    grace: timedelta | None = None,
 ) -> ReminderScheduler:
+    """`grace` is how late a due occurrence may be and still simply run (settings.schedule_grace_seconds); later than
+    that it is announced once as a catch-up. None: the scheduler's own default."""
+    extra = {} if grace is None else {"grace": grace}
     return ReminderScheduler(
         store=store,
         notifier=create_default_notifier(),
         poll_interval_seconds=poll_interval_seconds,
         router=router,
+        **extra,
     )
