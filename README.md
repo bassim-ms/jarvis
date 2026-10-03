@@ -167,6 +167,11 @@ jarvis/
       base.py              - ScheduledJob, the state machine (ALLOWED_TRANSITIONS), the occurrence ledger types, the ScheduledJobStore contract
       policy.py            - pure decisions: lifetime, new-schedule limits, missed-run (run-once catch-up), admission caps, circuit breaker
       sqlite_store.py      - SQLiteScheduledJobStore: the record + ledger; `record_run` writes the ledger row and the Job in ONE transaction
+    scheduled_execution/   - (Scheduled Jobs V1, Slice 2 - the execution adapter; INVOKED, never wakes up; not wired in)
+      occurrence.py        - ScheduledOccurrence: one due occurrence, built from the Slice 1 policy's RUN / RUN_LATE decision
+      context.py           - FreshContextBuilder: the run's context, read anew every time from the existing Context Engine + memory facts
+      adapter.py           - ScheduledExecutionAdapter: occurrence -> ONE ordinary PENDING Job, atomically with its ledger row
+    orchestration/profiles.py - (Slice 2) run profiles: `unattended_v1`, a READ-only REDUCTION of what a Job may use (grants nothing)
     automation/
       base.py             - Automation/AutomationStatus/Trigger/Condition/AutomationStore interface, AutomationExecution
       sqlite_store.py      - SQLiteAutomationStore: SQLite implementation of AutomationStore
@@ -254,6 +259,9 @@ jarvis/
     test_scheduled_jobs_policy.py  - (Scheduled Jobs) lifetime, new-schedule limits, missed runs, caps, circuit breaker, DST identity
     test_scheduled_jobs_store.py   - (Scheduled Jobs) store + ledger: one occurrence -> at most one Job, atomicity, races, restart, schema CHECKs
     test_scheduled_jobs_boundaries.py - (Scheduled Jobs) the foundation cannot run/plan/notify/call tools and is not wired in
+    test_run_profiles.py           - (Slice 2) the READ-only unattended profile and per-run deadline, as the existing JobEngine enforces them
+    test_scheduled_execution_adapter.py - (Slice 2) occurrence -> Job: fresh context, atomic one-occurrence invariant (races, restart), failure, memory
+    test_scheduled_execution_boundaries.py - (Slice 2) the adapter has no scheduler/thread/notification/memory-write/tool-execution and is not wired in
     test_automation_store.py       - unit tests for SQLiteAutomationStore (persistence, trigger/condition/action round-trip)
     test_automation_conditions.py  - unit tests for FactEqualsCondition/TimeWindowCondition/condition_from_dict
     test_automation_engine.py      - unit tests for AutomationEngine (triggers, conditions, permissions, restart recovery, failure isolation)
@@ -1320,6 +1328,35 @@ application** - no scheduler, no Job creation, no chat path, no notification.
   (default off; nothing reads it yet).
 - **Shared builder.** `app/scheduling/builder.py` holds the request -> Schedule rules Reminder V2 introduced, moved out of
   `ReminderService` with no behaviour change, so reminders and Scheduled Jobs are created by the same rules.
+
+### Slice 2: the execution adapter and the READ-only unattended profile (still not wired in)
+
+`Approved Scheduled Job -> Scheduled Occurrence -> Execution Adapter -> fresh context -> READ-only profile -> ordinary Job -> the existing
+JobEngine -> Planner -> ToolRegistry -> Tools -> Verify.` Slice 2 builds everything up to "an ordinary Job exists"; it is **invoked**
+(by a test, or by the scheduler a later slice adds). There is no scheduler, polling, background thread, notification, chat flow or memory write.
+
+- **The existing capability boundary is re-run at run time.** Before a Job is built, the adapter applies the existing Handle This
+  `DEFAULT_BOUNDARY` (`assess` on the stored objective's `required_families`; `assess_actions` for computer workflows) against the
+  profile-filtered, live tool set the Planner would be offered. It can only refuse: a family with no tool on offer, an action with a
+  missing tool, or a family that cannot be read fails closed with `ExecutionRefused`, and nothing is written (no Job, no ledger row,
+  `due_at` unchanged). How a refusal is represented is Slice 3's decision.
+- **Fresh context, every run.** `FreshContextBuilder` reads the existing Context Engine (`build_request_context` + `build_snapshot`) and
+  memory facts when the occurrence runs; nothing runtime is stored on the Scheduled Job, and no run sees another run's context.
+- **`unattended_v1` is a reduction, never a grant** (`app/orchestration/profiles.py`). A Job names a profile (`Job.run_profile`, default
+  `interactive` = every existing Job). The Planner is offered only the profile's tools that the live registry still has as plannable
+  READ tools (`web_search`, `observe_page`, `verify_observation`, `analyze`, `list_tasks`, `list_notes`, `list_events`,
+  `list_reminders`); `validate_plan` rejects any other (`allowed_tool_names`); and JobEngine refuses, just before running, any step
+  the profile forbids - checked against the live registry, never parked for a confirmation nobody could give. Plans are bounded tighter
+  (6 steps, 9 total, 1 replan). The ToolRegistry still executes every step with its own permission checks; autonomy is ASSISTED with no
+  auto-approved permissions. Writes, messages, computer control, screen capture and every CONFIRM / DANGEROUS tool are outside it.
+- **Per-run deadline** (`Job.deadline_at`, from `JARVIS_SCHEDULED_JOB_RUN_DEADLINE_SECONDS`, default 900). Checked by the existing JobEngine
+  loop between steps (before planning, each pass, each step, and before a replan): past it the Job is FAILED with `TIMED_OUT_ERROR`
+  and nothing more is planned, retried or run. It cannot interrupt a tool call already in flight (each tool's own timeouts bound that).
+- **Cancellation** is the existing mechanism: `cancel_job` bumps the Job's version, and the engine's next save (before every step) is
+  refused, so the next step never runs and the Job stays CANCELLED.
+- **One occurrence -> one Job** is unchanged from Slice 1 (the ledger's UNIQUE constraint; the Job and its row are one transaction).
+- **Schema.** `jobs` gains `run_profile TEXT NOT NULL DEFAULT 'interactive'` and `deadline_at TEXT` (additive; fixed at creation, never
+  rewritten by a save). Existing rows are ordinary Jobs with no deadline.
 
 ## Persistent Automation Engine (M8)
 

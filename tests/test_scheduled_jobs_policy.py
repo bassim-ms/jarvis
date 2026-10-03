@@ -52,6 +52,7 @@ def test_the_approved_v1_defaults():
     assert LIMITS.catch_up_window == timedelta(hours=6)
     assert LIMITS.grace == timedelta(minutes=10)
     assert LIMITS.horizon == timedelta(days=800)
+    assert LIMITS.run_deadline == timedelta(minutes=15)
     assert (LIMITS.max_open, LIMITS.max_runs_per_day, LIMITS.max_concurrent, LIMITS.breaker_failures) == (10, 10, 2, 3)
 
 
@@ -65,13 +66,17 @@ def test_limits_come_from_settings_and_a_nonsense_value_is_clamped_not_trusted(m
     monkeypatch.setattr(settings, "scheduled_job_max_runs_per_day", 4)
     monkeypatch.setattr(settings, "scheduled_job_max_concurrent", 1)
     monkeypatch.setattr(settings, "scheduled_job_breaker_failures", 5)
+    monkeypatch.setattr(settings, "scheduled_job_run_deadline_seconds", 120)
     limits = Limits.from_settings()
+    assert limits.run_deadline == timedelta(minutes=2)
     assert (limits.min_interval, limits.lifetime, limits.catch_up_window) == (timedelta(hours=2), timedelta(days=30), timedelta(hours=1))
     assert (limits.max_open, limits.max_runs_per_day, limits.max_concurrent, limits.breaker_failures) == (3, 4, 1, 5)
     monkeypatch.setattr(settings, "scheduled_job_min_interval_minutes", 0)
     monkeypatch.setattr(settings, "scheduled_job_max_concurrent", -4)
     monkeypatch.setattr(settings, "scheduled_job_breaker_failures", 0)
+    monkeypatch.setattr(settings, "scheduled_job_run_deadline_seconds", 0)
     clamped = Limits.from_settings()
+    assert clamped.run_deadline == timedelta(seconds=1)
     assert clamped.min_interval == timedelta(minutes=1) and clamped.max_concurrent == 1 and clamped.breaker_failures == 1
 
 

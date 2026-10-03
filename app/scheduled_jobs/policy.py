@@ -61,6 +61,7 @@ class Limits:
     catch_up_window: timedelta = timedelta(hours=6)  # how late the ONE catch-up run may still be
     grace: timedelta = DEFAULT_GRACE  # how late an occurrence may be and still simply run
     horizon: timedelta = MAX_HORIZON  # how far ahead a one-time Scheduled Job may be set
+    run_deadline: timedelta = timedelta(minutes=15)  # how long ONE run may take, from its Job's creation
     max_open: int = 10
     max_runs_per_day: int = 10
     max_concurrent: int = 2
@@ -75,6 +76,7 @@ class Limits:
             lifetime=timedelta(days=max(1, int(settings.scheduled_job_lifetime_days))),
             catch_up_window=timedelta(seconds=max(0, int(settings.scheduled_job_catch_up_window_seconds))),
             grace=timedelta(seconds=max(0, int(settings.schedule_grace_seconds))),
+            run_deadline=timedelta(seconds=max(1, int(settings.scheduled_job_run_deadline_seconds))),
             max_open=max(1, int(settings.scheduled_job_max_active)),
             max_runs_per_day=max(1, int(settings.scheduled_job_max_runs_per_day)),
             max_concurrent=max(1, int(settings.scheduled_job_max_concurrent)),

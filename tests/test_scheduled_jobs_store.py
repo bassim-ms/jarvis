@@ -862,11 +862,11 @@ def test_the_store_creates_only_its_own_tables_and_never_needs_the_jobs_table(tm
     assert names == {"scheduled_jobs", "scheduled_job_runs", "sqlite_sequence"}
 
 
-def test_it_shares_the_job_stores_database_without_disturbing_the_jobs_table(rig):
+def test_it_shares_the_job_stores_database_and_an_ordinary_job_is_unchanged(rig):
     with rig.jobs.lock:
         tables = {r[0] for r in rig.jobs.connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
-        columns = [r[1] for r in rig.jobs.connection.execute("PRAGMA table_info(jobs)")]
     assert {"jobs", "scheduled_jobs", "scheduled_job_runs"} <= tables
-    assert "run_profile" not in columns and "deadline_at" not in columns  # the Job table is untouched in this slice
-    job = rig.jobs.create("an ordinary job")
-    assert rig.jobs.get(job.id).goal == "an ordinary job" and rig.job_count() == 1
+    job = rig.jobs.create("an ordinary job")  # (Slice 2 adds run_profile / deadline_at to `jobs`; an ordinary Job keeps the defaults)
+    stored = rig.jobs.get(job.id)
+    assert stored.goal == "an ordinary job" and rig.job_count() == 1
+    assert stored.run_profile == "interactive" and stored.deadline_at is None

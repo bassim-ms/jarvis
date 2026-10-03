@@ -684,7 +684,15 @@ def test_handle_this_is_imported_only_by_the_application_wiring():
             r"^\s*(from|import) app\.handle_this", path.read_text(encoding="utf-8"), re.MULTILINE
         ):
             importers.append(str(path.relative_to(root)).replace("\\", "/"))
-    assert importers == ["main.py"]
+    # Scheduled Jobs V1 / Slice 2: the execution adapter re-runs the EXISTING capability boundary at run time, so it is the one other
+    # importer - and it may read only the boundary, the family enum and the wording detector that boundary is applied with.
+    assert importers == ["main.py", "scheduled_execution/adapter.py"]
+    adapter = (root / "scheduled_execution" / "adapter.py").read_text(encoding="utf-8")
+    assert set(re.findall(r"^\s*from (app\.handle_this[\w.]*) import", adapter, re.MULTILINE)) == {
+        "app.handle_this.base",
+        "app.handle_this.boundary",
+        "app.handle_this.signals",
+    }
 
 
 class RecordingRegistry(ToolRegistry):

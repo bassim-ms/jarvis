@@ -64,6 +64,8 @@ from app.orchestration.base import (
     OBJECTIVE_KEY,
     DECLINED_STEP_ERROR,
     EXPIRED_STEP_ERROR,
+    INTERACTIVE_PROFILE,
+    TIMED_OUT_ERROR,
     EVALUATION_INSUFFICIENT,
     EVALUATION_SUFFICIENT,
     EVALUATION_UNAVAILABLE,
@@ -104,6 +106,7 @@ from app.orchestration.references import (
     resolve_reference,
     validate_reference,
 )
+from app.orchestration.profiles import RunProfile, UnknownProfileError, permitted_tools, profile_for
 from app.orchestration.validator import (
     PlanValidationError,
     validate_plan,
@@ -211,6 +214,7 @@ class JobEngine:
         notification_router: NotificationRouter | None = None,
         notify_on_completion: bool = True,
         objective_continuer=None,
+        clock: Callable[[], datetime] | None = None,
     ):
         self.store = store
         self.tools = tools
@@ -262,6 +266,9 @@ class JobEngine:
         # objective is planned exactly as before. It is pure and never called
         # for a Job that has no resolved Handle This question to fold in.
         self.objective_continuer = objective_continuer
+        # An aware-datetime callable, used ONLY to compare a Job's own `deadline_at` against "now". None (every existing caller) is
+        # the real clock; tests inject one so a deadline can be crossed without waiting.
+        self._clock = clock
         # Callables run at the end of every tick (see `add_tick_hook`).
         self._tick_hooks: list[Callable[[], None]] = []
         self._sleep = sleep
@@ -421,6 +428,21 @@ class JobEngine:
             pass
 
     def _process(self, job: Job) -> None:
+        try:
+            self._profile_of(job)
+        except UnknownProfileError as exc:
+            # A Job naming a profile this system does not define is refused, never run as if it had none.
+            job.status = JobStatus.FAILED
+            job.error = f"This run cannot start: {exc}"
+            self._log(job, "profile_unknown", detail=job.error)
+            job.updated_at = _now()
+            self.store.save(job)
+            return
+        if self._enforce_deadline(job):
+            job.updated_at = _now()
+            self.store.save(job)
+            return
+
         self._recover_interrupted_steps(job)
 
         if job.status in (JobStatus.PENDING, JobStatus.PLANNING):
@@ -1143,13 +1165,86 @@ class JobEngine:
             return job.context
         return {**job.context, CLARIFICATIONS_KEY: answers}
 
-    def _plannable_tools(self):
+    def _plannable_tools(self, job: Job | None = None):
         """The tools the planner may be offered: everything registered
         except Jarvis-control tools (`Tool.plannable is False`). Execution
         itself is untouched - `validate_plan` enforces the same rule on
         whatever the planner returns, so a hallucinated step naming a
-        hidden tool is rejected rather than run."""
-        return [tool for tool in self.tools.list_tools() if tool.plannable]
+        hidden tool is rejected rather than run.
+
+        For a Job under a run profile (`job` given) this is NARROWED to the
+        profile's tools that the live registry still has as plannable,
+        read-only tools - the profile only ever removes tools from this list."""
+        if job is None:
+            return [tool for tool in self.tools.list_tools() if tool.plannable]
+        try:
+            profile = self._profile_of(job)
+        except UnknownProfileError:
+            return []  # fail closed: nothing is offered to a run whose profile is unknown
+        if profile is None:
+            return [tool for tool in self.tools.list_tools() if tool.plannable]
+        return permitted_tools(profile, self.tools)
+
+    # -- run profiles and the per-run deadline -------------------------------------------------
+    #
+    # Both only ever REDUCE what a Job may do or how long it may take. An ordinary Job (profile
+    # "interactive", no deadline) goes through none of this.
+
+    @staticmethod
+    def _profile_of(job: Job) -> RunProfile | None:
+        """The Job's run profile, or None for an ordinary Job. Raises UnknownProfileError for a name this system does not define."""
+        return profile_for(job.run_profile)
+
+    def _limits(self, job: Job) -> tuple[int, int, int]:
+        """(max_steps, max_total_steps, max_replans) for this Job: the engine's own, narrowed by its profile - the smaller wins."""
+        profile = self._profile_of(job)
+        if profile is None:
+            return self.max_steps, self.max_total_steps, self.max_replans
+        return (
+            min(self.max_steps, profile.max_steps),
+            min(self.max_total_steps, profile.max_total_steps),
+            min(self.max_replans, profile.max_replans),
+        )
+
+    def _profile_denial(self, job: Job, step: PlanStep) -> str | None:
+        """Why this Job's profile forbids running `step` (checked against the LIVE registry), or None if it does not - which is
+        always the case for an ordinary Job. A profile can only say no; it never makes a step runnable."""
+        try:
+            profile = self._profile_of(job)
+        except UnknownProfileError:
+            return "This run's profile is unknown."
+        if profile is None:
+            return None
+        return profile.denial(step.tool_name, self.tools.get(step.tool_name))
+
+    def _now_dt(self) -> datetime:
+        return (self._clock() if self._clock is not None else datetime.now(timezone.utc)).astimezone(timezone.utc)
+
+    def _past_deadline(self, job: Job) -> bool:
+        if not job.deadline_at:
+            return False
+        try:
+            deadline = datetime.fromisoformat(job.deadline_at)
+        except ValueError:
+            return True  # an unreadable deadline is treated as passed: fail closed
+        if deadline.tzinfo is None:
+            deadline = deadline.replace(tzinfo=timezone.utc)
+        return self._now_dt() >= deadline
+
+    def _enforce_deadline(self, job: Job) -> bool:
+        """If this Job is still active and past its own `deadline_at`, mark it FAILED (TIMED_OUT_ERROR) in memory and return True -
+        the caller persists. Called only BETWEEN steps, inside the existing loop: it cannot interrupt a tool call already in flight.
+        Nothing is retried and nothing further is planned or run."""
+        if job.status in TERMINAL_JOB_STATUSES or not self._past_deadline(job):
+            return False
+        for step in job.plan.steps if job.plan else []:
+            if step.status == StepStatus.RUNNING:  # only possible from a process that died mid-step
+                step.status = StepStatus.FAILED
+                step.error = "Interrupted: the run timed out."
+        job.status = JobStatus.FAILED
+        job.error = TIMED_OUT_ERROR
+        self._log(job, "job_timed_out", detail=f"deadline {job.deadline_at}")
+        return True
 
     def _plan(self, job: Job) -> None:
         job.status = JobStatus.PLANNING
@@ -1157,7 +1252,17 @@ class JobEngine:
         self.store.save(job)
 
         self._refresh_context(job)
-        available_tools = self._plannable_tools()
+        available_tools = self._plannable_tools(job)
+        profiled = job.run_profile != INTERACTIVE_PROFILE
+        if profiled and not available_tools:
+            # Nothing this kind of run may use is available right now: do not even ask the planner.
+            job.status = JobStatus.FAILED
+            job.error = "Could not create a plan: no capability is available for this kind of run."
+            self._log(job, "planning_failed", detail=job.error)
+            job.updated_at = _now()
+            self.store.save(job)
+            return
+        max_steps = self._limits(job)[0]
         try:
             raw_steps = self.planner.plan(
                 job.goal,
@@ -1168,11 +1273,12 @@ class JobEngine:
             steps = validate_plan(
                 raw_steps,
                 self.tools,
-                max_steps=self.max_steps,
+                max_steps=max_steps,
                 default_retry=RetryPolicy(
                     max_attempts=self.max_retries_per_step,
                     delay_seconds=self.retry_delay_seconds,
                 ),
+                allowed_tool_names=frozenset(t.name for t in available_tools) if profiled else None,
             )
         except (PlanningError, PlanValidationError) as exc:
             job.status = JobStatus.FAILED
@@ -1197,6 +1303,10 @@ class JobEngine:
 
         while progressed and job.status == JobStatus.RUNNING:
             progressed = False
+
+            # The per-run deadline, checked between steps: past it the Job is FAILED (TIMED_OUT_ERROR) and nothing more runs.
+            if self._enforce_deadline(job):
+                break
 
             # A step that succeeded and explicitly asked to be evaluated
             # must get its verdict before anything can depend on it.
@@ -1223,10 +1333,19 @@ class JobEngine:
             # project's own Confirmation example) means auto steps in the
             # same ready batch as a gated one still run, and only the
             # gated ones actually pause the Job - never the whole batch.
-            auto_ready = [s for s in ready if not self._needs_confirmation(s, job)]
-            confirm_ready = [s for s in ready if self._needs_confirmation(s, job)]
+            # A step the Job's run profile forbids is never parked for a confirmation nobody is there to give: it goes straight
+            # to _run_step, which refuses it. (For an ordinary Job `blocked_ids` is empty and these lists are exactly as before.)
+            blocked_ids = {s.id for s in ready if self._profile_denial(job, s)}
+            auto_ready = [
+                s for s in ready if s.id in blocked_ids or not self._needs_confirmation(s, job)
+            ]
+            confirm_ready = [
+                s for s in ready if s.id not in blocked_ids and self._needs_confirmation(s, job)
+            ]
 
             for step in auto_ready:
+                if self._enforce_deadline(job):
+                    break
                 self._run_step(job, step)
                 progressed = True
                 if step.status == StepStatus.FAILED:
@@ -1497,6 +1616,17 @@ class JobEngine:
         return rendered if len(rendered) <= limit else rendered[:limit] + "...[truncated]"
 
     def _run_step(self, job: Job, step: PlanStep) -> None:
+        denial = self._profile_denial(job, step)
+        if denial is not None:
+            # The run profile forbids this tool (checked against the live registry, whatever the plan says): the tool is never
+            # called. It fails like any other step and the bounded failure/replan path decides what happens next.
+            step.status = StepStatus.FAILED
+            step.error = denial
+            self._log(job, "step_blocked_by_profile", step_id=step.id, detail=denial)
+            job.updated_at = _now()
+            self.store.save(job)
+            return
+
         try:
             arguments = self._resolve_step_arguments(job, step)
         except ReferenceError as exc:
@@ -1584,11 +1714,14 @@ class JobEngine:
         worth attempting (bounded by max_replans and max_total_steps) or
         the Job should simply fail - never an uncontrolled replanning
         loop."""
-        if job.replan_count >= self.max_replans:
+        if self._enforce_deadline(job):
+            return  # out of time: no replanning call is made
+        max_steps, max_total_steps, max_replans = self._limits(job)
+        if job.replan_count >= max_replans:
             job.status = JobStatus.FAILED
             job.error = (
                 f"Step '{step.id}' ({step.tool_name}) failed: {step.error} "
-                f"(replan limit of {self.max_replans} reached)."
+                f"(replan limit of {max_replans} reached)."
             )
             self._log(job, "job_failed", detail=job.error)
             return
@@ -1602,10 +1735,20 @@ class JobEngine:
         known_ids = frozenset(s.id for s in completed)
 
         self._refresh_context(job)  # a replan is a planning call too - see _refresh_context
+        available_tools = self._plannable_tools(job)
+        profiled = job.run_profile != INTERACTIVE_PROFILE
+        if profiled and not available_tools:
+            job.status = JobStatus.FAILED
+            job.error = (
+                f"Step '{step.id}' ({step.tool_name}) failed: {step.error}. "
+                "Replanning is not possible: no capability is available for this kind of run."
+            )
+            self._log(job, "replan_failed", detail=job.error)
+            return
         try:
             raw_new_steps = self.planner.plan(
                 job.goal,
-                available_tools=self._plannable_tools(),
+                available_tools=available_tools,
                 context=self._planning_context(job),
                 autonomy=job.autonomy,
                 replan_context=ReplanContext(
@@ -1615,20 +1758,21 @@ class JobEngine:
                     remaining_steps=remaining,
                 ),
             )
-            if len(completed) + len(raw_new_steps) > self.max_total_steps:
+            if len(completed) + len(raw_new_steps) > max_total_steps:
                 raise PlanValidationError(
                     f"Replan would exceed the total step safety limit of "
-                    f"{self.max_total_steps}."
+                    f"{max_total_steps}."
                 )
             new_steps = validate_plan(
                 raw_new_steps,
                 self.tools,
-                max_steps=self.max_steps,
+                max_steps=max_steps,
                 default_retry=RetryPolicy(
                     max_attempts=self.max_retries_per_step,
                     delay_seconds=self.retry_delay_seconds,
                 ),
                 known_step_ids=known_ids,
+                allowed_tool_names=frozenset(t.name for t in available_tools) if profiled else None,
             )
         except (PlanningError, PlanValidationError) as exc:
             job.status = JobStatus.FAILED

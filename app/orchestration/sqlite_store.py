@@ -27,6 +27,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.orchestration.base import (
+    INTERACTIVE_PROFILE,
     AutonomyLevel,
     Job,
     JobEvent,
@@ -166,7 +167,9 @@ class SQLiteJobStore(JobStore):
                     updated_at TEXT NOT NULL,
                     conversation_id TEXT,
                     autonomous_permissions TEXT NOT NULL DEFAULT '[]',
-                    version INTEGER NOT NULL DEFAULT 0
+                    version INTEGER NOT NULL DEFAULT 0,
+                    run_profile TEXT NOT NULL DEFAULT 'interactive',
+                    deadline_at TEXT
                 );
                 """
             )
@@ -174,6 +177,10 @@ class SQLiteJobStore(JobStore):
             self._migrate_add_column("conversation_id", "TEXT")
             self._migrate_add_column("autonomous_permissions", "TEXT NOT NULL DEFAULT '[]'")
             self._migrate_add_column("version", "INTEGER NOT NULL DEFAULT 0")
+            # Scheduled Jobs: the capability profile a Job runs under and its own deadline. Additive; every existing row is an
+            # ordinary ('interactive') Job with no deadline, exactly as before.
+            self._migrate_add_column("run_profile", "TEXT NOT NULL DEFAULT 'interactive'")
+            self._migrate_add_column("deadline_at", "TEXT")
 
     def _migrate_add_column(self, name: str, ddl_type: str) -> None:
         """Add a column to an already-existing `jobs` table from before it
@@ -221,10 +228,13 @@ class SQLiteJobStore(JobStore):
         conversation_id: str | None = None,
         autonomous_permissions: frozenset[str] | None = None,
         status: JobStatus = JobStatus.PENDING,
+        run_profile: str = INTERACTIVE_PROFILE,
+        deadline_at: str | None = None,
     ) -> Job:
         """A new in-memory Job (nothing persisted). `create` always passes the
         default PENDING; only an operation that inserts the Job in the same
-        transaction as the row that makes it wait may pass another status."""
+        transaction as the row that makes it wait may pass another status.
+        `run_profile` / `deadline_at` are set here, once, and never by `save`."""
         now = _now()
         return Job(
             id=str(uuid.uuid4()),
@@ -239,6 +249,8 @@ class SQLiteJobStore(JobStore):
             autonomous_permissions=parse_autonomous_permissions(
                 list(autonomous_permissions) if autonomous_permissions is not None else None
             ),
+            run_profile=run_profile,
+            deadline_at=deadline_at,
         )
 
     @staticmethod
@@ -251,8 +263,9 @@ class SQLiteJobStore(JobStore):
                 id, goal, status, priority, autonomy, plan, context,
                 replan_count, total_step_count, pending_step_ids,
                 confirmation_message, final_result, error, events,
-                created_at, updated_at, conversation_id, autonomous_permissions
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                created_at, updated_at, conversation_id, autonomous_permissions,
+                run_profile, deadline_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 job.id,
@@ -273,6 +286,8 @@ class SQLiteJobStore(JobStore):
                 job.updated_at,
                 job.conversation_id,
                 json.dumps(sorted(job.autonomous_permissions)),
+                job.run_profile,
+                job.deadline_at,
             ),
         )
 
@@ -393,4 +408,6 @@ class SQLiteJobStore(JobStore):
                 json.loads(row["autonomous_permissions"] or "[]")
             ),
             version=row["version"],
+            run_profile=row["run_profile"],
+            deadline_at=row["deadline_at"],
         )

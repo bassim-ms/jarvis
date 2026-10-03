@@ -189,6 +189,7 @@ def validate_plan(
     max_steps: int,
     default_retry: RetryPolicy,
     known_step_ids: frozenset[str] = frozenset(),
+    allowed_tool_names: frozenset[str] | None = None,
 ) -> list[PlanStep]:
     """Validate `raw_steps` (a planner's parsed-but-unchecked list of step
     dicts) against `registry` and return fully-populated PlanSteps, or
@@ -201,6 +202,11 @@ def validate_plan(
     dependencies, and retry configuration. `permission` on each returned
     PlanStep comes from the tool's own registered PermissionLevel - the
     only source of truth JobEngine ever gates confirmation on.
+
+    `allowed_tool_names` (None for an ordinary Job: no effect at all) is a run profile's
+    tool list (app/orchestration/profiles.py). It can only NARROW: a step naming a tool
+    outside it is rejected, on top of every check above - it never admits a tool the
+    checks above would refuse.
     """
     if not isinstance(raw_steps, list):
         raise PlanValidationError(f"Plan must be a list of steps, got: {type(raw_steps).__name__}")
@@ -296,6 +302,11 @@ def validate_plan(
             raise PlanValidationError(
                 f"Step '{entry['id']}' names tool '{entry['tool']}', which manages "
                 "Jarvis itself and cannot be used in a plan."
+            )
+        if allowed_tool_names is not None and entry["tool"] not in allowed_tool_names:
+            raise PlanValidationError(
+                f"Step '{entry['id']}' names tool '{entry['tool']}', which is not permitted "
+                "in this kind of run."
             )
         _validate_arguments(
             tool,

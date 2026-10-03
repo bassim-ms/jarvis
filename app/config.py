@@ -139,6 +139,9 @@ class Settings(BaseSettings):
     scheduled_job_max_runs_per_day: int = 10
     scheduled_job_max_concurrent: int = 2
     scheduled_job_breaker_failures: int = 3
+    # How long ONE run of a Scheduled Job may take, from the moment its Job is created (planning included). JobEngine fails the
+    # Job between steps once it is past; it cannot interrupt a tool call already in flight (each tool's own timeouts bound that).
+    scheduled_job_run_deadline_seconds: int = 900
 
     # Google Calendar (OAuth 2.0 desktop/localhost flow, see
     # app/calendar/) - client_id/client_secret come from a Google Cloud

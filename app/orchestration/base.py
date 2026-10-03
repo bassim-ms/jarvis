@@ -163,11 +163,20 @@ OBJECTIVE_KEY = "__objective__"
 #: shown to the planner.
 CLARIFICATION_STATE_KEY = "__clarification_state__"
 
+#: The `Job.run_profile` of every ordinary Job. A Job started by something other than a person's request (a Scheduled Job) names a
+#: REDUCE-ONLY profile instead (app/orchestration/profiles.py): it can narrow what the Job may do, never widen it.
+INTERACTIVE_PROFILE = "interactive"
+
 #: The error a gated step carries when the user said no / never answered.
 #: Shared so that "this Job failed because of the user's own decision" can be
 #: recognised (and not announced as a failure).
 DECLINED_STEP_ERROR = "Confirmation declined by user."
 EXPIRED_STEP_ERROR = "Confirmation expired - the step was not run."
+
+#: The error a Job carries when it ran past its own `deadline_at` and JobEngine stopped it between steps. Shared so that "this Job
+#: timed out" can be recognised without matching prose. The Job is FAILED (there is no separate timed-out state), like any other
+#: failure; it is never retried.
+TIMED_OUT_ERROR = "Timed out - the run exceeded its time limit and was stopped."
 
 #: Key under which JobEngine hands the planner the user's answers to
 #: questions Jarvis asked about this Job (its resolved INPUT interactions,
@@ -442,6 +451,11 @@ class Job:
     same object keeps working). A holder whose copy is stale gets
     `StaleJobError` instead of silently overwriting newer state.
 
+    `run_profile` names the capability profile the Job runs under (`INTERACTIVE_PROFILE` for every ordinary Job). A named profile
+    only REDUCES what the Job may use - see app/orchestration/profiles.py - and is fixed when the Job is created. `deadline_at`
+    (an ISO UTC time, or None for no deadline) is this run's own time limit: JobEngine fails the Job, between steps, once it has
+    passed. Both belong to the Job instance; the engine never changes them.
+
     `autonomous_permissions` is the configurable boundary
     AutonomyLevel.AUTONOMOUS actually checks (see
     `parse_autonomous_permissions` above) - a genuine per-Job setting,
@@ -470,6 +484,8 @@ class Job:
         default_factory=lambda: DEFAULT_AUTONOMOUS_PERMISSIONS
     )
     version: int = 0
+    run_profile: str = INTERACTIVE_PROFILE
+    deadline_at: str | None = None
 
 
 class StaleJobError(RuntimeError):
