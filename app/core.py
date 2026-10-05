@@ -255,6 +255,7 @@ class JarvisCore:
         morning_brief=None,
         device_operations=None,
         reminder_operations=None,
+        scheduled_job_operations=None,
     ):
         self.provider = provider or create_default_ai_provider_manager()
         self.memory = memory or SQLiteMemoryStore(settings.memory_db_path)
@@ -343,6 +344,11 @@ class JarvisCore:
         # 7 PM to study", "what reminders do I have?", "pause my study reminder"). It acts only through the reminder
         # tools on `self.tools`. `None` (every existing caller/test): such a message is ordinary conversation.
         self.reminder_operations = reminder_operations
+        # The user-facing Scheduled Job operations (app/scheduled_operations/operations.py): a duck-typed object with
+        # `command_reply(message, conversation_id, device_context=None)` that answers a whole-message request to schedule recurring or
+        # timed READ-ONLY work ("every morning at 8, research X"), or to list / pause / resume / cancel one. Creating one only ASKS
+        # (the existing confirmation); nothing runs until it is approved. `None` (every existing caller/test): ordinary chat.
+        self.scheduled_job_operations = scheduled_job_operations
         self.router = router or SearchRouter()
         # Reuses self.provider by default, so injecting a fake AIProvider
         # into Core (as tests do) covers the SEARCH path's answer
@@ -700,6 +706,25 @@ class JarvisCore:
             try:
                 memory_reply = self.reminder_operations.command_reply(message, conversation_id)
             except Exception:  # noqa: BLE001 - a fault here is "not a reminder request"
+                memory_reply = None
+        # Scheduled Jobs are read the same way, with one difference: a request to do something EVERY day / at a TIME is claimed
+        # here even when the router would otherwise have sent it to Handle This (TASK) or to search - otherwise "research X, compare
+        # Y and report every Monday at 8" would be started once, immediately, instead of being proposed. The door's own whole-message
+        # grammar (a timing AND an action verb) decides whether it is theirs; anything else is left exactly as routed. An explicit
+        # tool command, status, confirmation or self-development request never reaches it.
+        if (
+            memory_reply is None
+            and self.scheduled_job_operations is not None
+            and interaction_reply is None
+            and decision.capability in (Capability.DIRECT, Capability.SEARCH, Capability.TASK)
+        ):
+            try:
+                memory_reply = (
+                    self.scheduled_job_operations.command_reply(message, conversation_id, device_context=device_context)
+                    if device_context is not None
+                    else self.scheduled_job_operations.command_reply(message, conversation_id)
+                )
+            except Exception:  # noqa: BLE001 - a fault here is "not a scheduled job request"
                 memory_reply = None
         if (
             memory_reply is None

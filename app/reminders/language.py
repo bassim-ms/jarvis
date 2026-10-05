@@ -315,6 +315,16 @@ def split_when(rest: str) -> tuple[When, str]:
     return _finish(when), _tidy(rest, cut=False)
 
 
+def split_leading_when(rest: str) -> tuple[When, str]:
+    """Like `split_when`, but ONLY the timing words at the START are read; everything after them (and any "to"/"that"/"about") is the
+    text, whatever it ends with. For callers whose text is a whole instruction ("research X and summarize tomorrow"): its own closing
+    words must never be taken for a second timing."""
+    rest = re.sub(r"^for\s+", "", _END_PUNCT.sub("", rest.strip()), count=1, flags=_I)
+    when, rest = _consume(rest, When())
+    rest = _CONNECTIVE.sub("", rest, count=1).strip()
+    return _finish(when), _tidy(rest, cut=False)
+
+
 _DANGLING = re.compile(r"\s+(?:by|on|at|before|until|till|for|every|each)$", _I)
 
 

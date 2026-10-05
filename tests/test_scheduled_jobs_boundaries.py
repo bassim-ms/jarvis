@@ -100,9 +100,10 @@ def test_the_foundation_is_wired_only_through_main_and_nothing_else_reaches_it()
         if "scheduled_jobs" not in path.parts
         and re.search(r"^\s*(from|import) app\.scheduled_jobs", path.read_text(encoding="utf-8"), re.MULTILINE)
     )
+    # Slice 4 adds the creation/approval layer (app/scheduled_operations): it reads the store and the model, and is itself wired only by main.
     assert importers == [
         "main.py", "scheduled_execution/adapter.py", "scheduled_execution/context.py", "scheduled_execution/occurrence.py",
-        "scheduled_execution/scheduler.py",
+        "scheduled_execution/scheduler.py", "scheduled_operations/operations.py", "scheduled_operations/service.py",
     ]
 
 

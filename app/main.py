@@ -99,6 +99,10 @@ from app.reminders.factory import (
     create_default_scheduler,
 )
 from app.reminders.operations import ReminderOperations
+from app.orchestration.interactions import InteractionType, default_ttl_seconds
+from app.scheduled_operations.operations import ScheduledJobApprovalConfirmer, ScheduledJobOperations
+from app.scheduled_operations.service import ScheduledJobService, understander as scheduled_job_understander
+from app.scheduled_operations.tools import CommitScheduledJobApprovalTool
 from app.search.factory import create_default_search_provider
 from app.tasks.factory import create_default_task_store
 from app.tools.defaults import register_default_tools
@@ -336,23 +340,24 @@ core.context_engine.candidate_source = core.memory_writer.candidates_for_context
 # second loop, thread or timer - so it exists exactly while Jarvis runs. It decides which due occurrences become a Job and settles the
 # finished ones; the Job itself is an ordinary one that this same JobEngine plans and runs through `core.tools` (the Job-facing
 # registry) under the READ-only unattended profile. The kill switch (`scheduled_jobs_enabled`) is read on every tick; a device a
-# Scheduled Job was created from must still be TRUSTED in the existing device registry. Nothing here can create a Scheduled Job:
-# that (the approval flow) is a later slice, so until then the scheduler finds nothing due.
+# Scheduled Job was created from must still be TRUSTED in the existing device registry. A Scheduled Job only exists once the user
+# APPROVED it (the creation flow just below), so until then the scheduler finds nothing due.
 _scheduled_job_limits = ScheduledJobLimits.from_settings()
 _scheduled_job_store = SQLiteScheduledJobStore.for_job_store(_job_store)
+_scheduled_job_adapter = ScheduledExecutionAdapter(
+    scheduled_jobs=_scheduled_job_store,
+    tools=core.tools,
+    context_builder=FreshContextBuilder(
+        context_engine=core.context_engine,
+        snapshot_serializer=core._snapshot_to_job_context,
+        facts_provider=core.memory.get_facts,
+    ),
+    run_deadline=_scheduled_job_limits.run_deadline,
+)
 scheduled_job_scheduler = ScheduledJobScheduler(
     scheduled_jobs=_scheduled_job_store,
     jobs=_job_store,
-    adapter=ScheduledExecutionAdapter(
-        scheduled_jobs=_scheduled_job_store,
-        tools=core.tools,
-        context_builder=FreshContextBuilder(
-            context_engine=core.context_engine,
-            snapshot_serializer=core._snapshot_to_job_context,
-            facts_provider=core.memory.get_facts,
-        ),
-        run_deadline=_scheduled_job_limits.run_deadline,
-    ),
+    adapter=_scheduled_job_adapter,
     limits=_scheduled_job_limits,
     enabled=lambda: settings.scheduled_jobs_enabled,
     device_trusted=lambda device_id: (
@@ -360,6 +365,26 @@ scheduled_job_scheduler = ScheduledJobScheduler(
     ),
 )
 job_engine.add_tick_hook(scheduled_job_scheduler.tick)
+
+# Creating and managing Scheduled Jobs (see app/scheduled_operations/): "every morning at 8, research X" rides the ordinary chat path as a
+# whole-message hook. The request is understood by the EXISTING Handle This (this is the only place that may import it; the service gets
+# it as a callable), checked by the SAME adapter check every run applies (so a request an unattended read-only run could never carry out
+# is refused up front, never weakened), stored as a PROPOSAL and put to the user through the EXISTING confirmation machinery - only an
+# approved confirmation runs the CONFIRM-level, non-plannable `commit_scheduled_job_approval`, which activates it atomically. Approval
+# adds no capability: every run still goes through the READ-only profile, the ToolRegistry, Planner validation, device trust and audit.
+_scheduled_job_service = ScheduledJobService(
+    _scheduled_job_store,
+    limits=_scheduled_job_limits,
+    understand=scheduled_job_understander(lambda: core.handle_this),
+    check_objective=_scheduled_job_adapter.check_objective,
+    proposal_ttl=timedelta(seconds=default_ttl_seconds(InteractionType.CONFIRMATION)),
+)
+scheduled_job_operations = ScheduledJobOperations(
+    _scheduled_job_service,
+    ScheduledJobApprovalConfirmer(_interaction_store, mark_surfaced=core.interaction_resolver.mark_surfaced),
+)
+core.scheduled_job_operations = scheduled_job_operations
+core.tools.register(CommitScheduledJobApprovalTool(scheduled_job_operations))
 
 # The Morning Brief (app/morning_brief/): READS the existing calendar, task and reminder stores, the
 # Context Engine (World Model, memory, unconfirmed candidates), the Attention queue, Jobs and pending

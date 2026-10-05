@@ -172,6 +172,11 @@ jarvis/
       context.py           - FreshContextBuilder: the run's context, read anew every time from the existing Context Engine + memory facts
       adapter.py           - ScheduledExecutionAdapter: occurrence -> ONE ordinary PENDING Job, atomically with its ledger row
     orchestration/profiles.py - (Slice 2) run profiles: `unattended_v1`, a READ-only REDUCTION of what a Job may use (grants nothing)
+    scheduled_operations/  - (Scheduled Jobs V1, Slice 4 - creating, approving and managing them from chat; wired through main.py alone)
+      language.py          - the fixed grammar: "every morning at 8, research X" / "what scheduled jobs do I have?" (no model; timing words are the reminders')
+      service.py           - ScheduledJobService: propose -> (approval) -> ACTIVE, and pause / resume / cancel / look, all on the Slice 1 policy and store's CAS
+      operations.py        - the chat door (`command_reply`), the plain-words approval question, and the confirmer that ASKS through the existing confirmation
+      tools.py             - `commit_scheduled_job_approval`: CONFIRM-level, non-plannable, non-automatable; activates ONE confirmed proposal
     automation/
       base.py             - Automation/AutomationStatus/Trigger/Condition/AutomationStore interface, AutomationExecution
       sqlite_store.py      - SQLiteAutomationStore: SQLite implementation of AutomationStore
@@ -264,6 +269,9 @@ jarvis/
     test_scheduled_execution_boundaries.py - (Slices 2-3) the package has no loop/thread/timer/notification/memory-write/tool-execution; wired through main.py alone
     test_scheduled_job_scheduler.py - (Slice 3) the scheduler: due discovery, kill switch, overlap, breaker, caps, device trust, boundary, settlement, races, paused period
     test_scheduled_jobs_migration.py - (Slice 3) an OLD-schema ledger upgraded in place: rows, ids, constraints, new outcomes, rollback
+    test_scheduled_operations_language.py - (Slice 4) the grammar: what it claims and, above all, what it leaves to ordinary conversation
+    test_scheduled_operations.py   - (Slice 4) request -> proposal -> existing confirmation -> atomic approval -> scheduler -> ordinary Job; management; security
+    test_scheduled_operations_boundaries.py - (Slice 4) the layer cannot plan/run/launch/settle, imports no Handle This, adds no scheduler or store
     test_automation_store.py       - unit tests for SQLiteAutomationStore (persistence, trigger/condition/action round-trip)
     test_automation_conditions.py  - unit tests for FactEqualsCondition/TimeWindowCondition/condition_from_dict
     test_automation_engine.py      - unit tests for AutomationEngine (triggers, conditions, permissions, restart recovery, failure isolation)
@@ -1395,8 +1403,36 @@ deadline: it decides WHETHER an occurrence launches; the adapter makes the Job; 
   period has ended (`completed`, reason `lifetime_ended`) and `resume` is refused after that - only a fresh approval starts a new period.
 - **Schema migration.** The ledger's outcome `CHECK` cannot be altered in SQLite, so the store inspects the table it finds (the repo's
   convention; there is no schema-version table) and, only when it is behind, rebuilds `scheduled_job_runs` in one transaction (every row, id
-  and the id counter kept; index and constraints restored; rolled back whole on any failure). A current database is not touched.
+  and the id counter kept; index and constraints restored; rolled back whole on any failure). The table is inspected INSIDE `BEGIN IMMEDIATE`,
+  so two connections opening an old database cannot both rebuild it. A current database is not changed.
 - **Missed runs**: at most one catch-up run for the most recent missed occurrence, then the next future one (Slice 1 policy, unchanged).
+
+### Slice 4: creating and approving Scheduled Jobs from chat
+
+`user request -> understood -> checked -> PROPOSAL -> existing confirmation -> atomic approval -> ACTIVE -> (Slice 3) scheduler -> ordinary Job`
+
+- **Saying it never schedules it.** "Every morning at 8, research AI robotics news and give me a summary", "Every Monday at 6 PM, check my
+  upcoming calendar and summarize tomorrow", "Tomorrow at 5 PM, research X and report the findings" ride the ordinary chat path (a
+  whole-message hook after the reminder door; `app/scheduled_operations/`). The request is read by a fixed grammar - the timing words are
+  the reminders' own, and a message is only claimed when it has a repetition or a time of day AND an instruction, so ordinary conversation
+  is left alone - then understood by the **existing Handle This**, checked, and stored as a `proposed` Scheduled Job. A proposal has no due
+  time and the scheduler only ever reads `active` ones.
+- **The approval is the existing confirmation.** Jarvis answers in plain words - what it will do, when, how often, for how long (a
+  recurring one runs up to 90 days, then asks again), that it is **read-only**, and that every run still goes through the normal security
+  checks - and asks yes/no through the same waiting Job + interaction the memory policy and device revocation use. Only an *approved*
+  confirmation of that exact proposal runs `commit_scheduled_job_approval` (CONFIRM-level, non-plannable, non-automatable, refuses any call
+  not from the Job that asked), which re-validates everything against *now* and activates it with the store's compare-and-set - approval,
+  first run and lifetime in one update. A "no", an expiry, a restart, a duplicate approval or a racing cancel can never leave it half-live.
+- **Approval grants an intent, not authority.** At creation and again at approval the Slice 2 adapter's own check
+  (`ScheduledExecutionAdapter.check_objective`, the very check every run applies) must pass: if an unattended READ-only run could not carry
+  the request out, it is **refused aloud** - never trimmed to something smaller. A request that asks to *do* something ("send me...", "add
+  a task...", "buy...", "open...") is refused up front. What is stored is the user's words and the stable understanding of them - never a
+  plan, a tool, or world state (anything the understanding learned from the user's current context is dropped; every run builds its context
+  afresh).
+- **Managing them.** "What scheduled jobs do I have?", "show / pause / resume / cancel my AI news scheduled job" (never several at once; an
+  ambiguous one is listed and nothing changes). Resume goes to the next *future* run; a recurring one whose approved period has ended cannot
+  be resumed - only a fresh approval starts a new period. A one-time one has no lifetime of its own.
+- **Not here yet:** a notification/summary of what a run found (Slice 5), "run now", and renewal as its own gesture.
 
 ## Persistent Automation Engine (M8)
 

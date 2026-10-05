@@ -933,4 +933,7 @@ def test_only_the_expected_modules_use_the_interaction_modules():
         # asking the user before a device is revoked, through this same confirmation machinery
         # (like the memory policy): a consumer of it, not a mechanism of its own
         "devices/operations.py",
+        # asking the user before a Scheduled Job becomes live, through this same confirmation machinery (like
+        # the memory policy and the device revocation): a consumer of it, not a mechanism of its own
+        "scheduled_operations/operations.py",
     ])

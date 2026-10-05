@@ -37,7 +37,7 @@ from app.orchestration.base import (
     JobEvent,
     JobPriority,
 )
-from app.orchestration.profiles import PROFILES, permitted_tools
+from app.orchestration.profiles import PROFILES, RunProfile, permitted_tools
 from app.orchestration.sqlite_store import SQLiteJobStore
 from app.orchestration.tools import _validate_objective
 from app.scheduled_execution.context import FreshContextBuilder
@@ -117,6 +117,25 @@ class ScheduledExecutionAdapter:
     def _now(self) -> datetime:
         return (self._clock() if self._clock is not None else datetime.now(timezone.utc)).astimezone(timezone.utc)
 
+    def check_objective(self, objective: dict[str, Any], profile_name: str) -> RunProfile:
+        """Whether an unattended run of `objective` under `profile_name` could be made RIGHT NOW; returns the profile, or raises
+        ExecutionRefused. This is the ONE check, used both when a Scheduled Job is created (so one that could never run is refused
+        up front, never weakened) and again by every run (`build_request`): the profile must be one this system defines, the tools it
+        permits are re-read from the live registry (a tool that is gone, or no longer read-only, is simply not there), the objective goes
+        through the very check `create_job` applies, and the existing capability boundary is re-run against what the Planner would be
+        offered. It only ever refuses: it grants nothing and persists nothing."""
+        if profile_name not in KNOWN_PROFILES or profile_name not in PROFILES:
+            raise ExecutionRefused(f"Unknown capability profile '{profile_name}'.")
+        profile = PROFILES[profile_name]
+        permitted = permitted_tools(profile, self._tools)
+        if not permitted:
+            raise ExecutionRefused("No capability is available for an unattended run right now.")
+        problem = _validate_objective(objective)
+        if problem:
+            raise ExecutionRefused(f"The stored objective is not acceptable: {problem}")
+        self._reassess_boundary(objective, frozenset(tool.name for tool in permitted))
+        return profile
+
     # -- what the Job will be --------------------------------------------------------------------------------------------------
 
     def build_request(self, scheduled_job: ScheduledJob, occurrence: ScheduledOccurrence) -> ExecutionRequest:
@@ -129,22 +148,8 @@ class ScheduledExecutionAdapter:
         if scheduled_job.due_at != occurrence.expected_due_at:
             raise ExecutionRefused("That occurrence was decided for an earlier state of this Scheduled Job.")
 
-        # The profile must be one this system defines AND one the Scheduled Job was approved under; the tools it permits are
-        # re-read from the live registry now (a tool that is gone, or no longer read-only, is simply not there).
-        if scheduled_job.profile not in KNOWN_PROFILES or scheduled_job.profile not in PROFILES:
-            raise ExecutionRefused(f"Unknown capability profile '{scheduled_job.profile}'.")
-        profile = PROFILES[scheduled_job.profile]
-        permitted = permitted_tools(profile, self._tools)
-        if not permitted:
-            raise ExecutionRefused("No capability is available for an unattended run right now.")
-
-        # The stable intent goes through the very check `create_job` applies to an objective; nothing weaker.
-        problem = _validate_objective(scheduled_job.objective)
-        if problem:
-            raise ExecutionRefused(f"The stored objective is not acceptable: {problem}")
-
-        # The existing capability boundary, re-run NOW against what this run's Planner would actually be offered.
-        self._reassess_boundary(scheduled_job.objective, frozenset(tool.name for tool in permitted))
+        # The very check a NEW Scheduled Job passes at creation, applied again now to the live registry.
+        profile = self.check_objective(scheduled_job.objective, scheduled_job.profile)
 
         built = self._context.build(scheduled_job, occurrence)  # fresh, every time
         fingerprint = hashlib.sha256(occurrence.occurrence.encode("utf-8")).hexdigest()[:32]
