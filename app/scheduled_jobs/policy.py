@@ -8,7 +8,7 @@ Each function answers one question from plain values, so every rule can be teste
   validate_new_schedule  is this NEW schedule acceptable (not too frequent, not too far ahead, not beyond the first lifetime period)
   check_proposal_cap   may another Scheduled Job exist
   decide_due           an occurrence is due: run it, run it late ONCE, skip it, or the lifetime is over - and what comes next
-  admit                may a run start now (overlap, daily cap, concurrency cap)
+  admit                may a run start now (overlap, this Scheduled Job's 24-hour execution cap, the global daily cap, the global in-flight limit)
   breaker_decision     what a finished run does to the failure streak, and whether it pauses the Scheduled Job
   next_future_due      where a paused Scheduled Job resumes (never a replay)
 
@@ -47,6 +47,13 @@ from app.scheduling.schedule import Schedule, ScheduleKind, next_due
 #: "Runs today" is counted over a rolling 24 hours, so the cap needs no time zone and cannot be dodged by crossing midnight.
 DAILY_WINDOW = timedelta(hours=24)
 
+#: HARD safety ceilings, enforced here and not configurable past: a setting (or a caller building `Limits`) can make the system
+#: STRICTER than these, never looser. At most this many actual executions of ONE Scheduled Job in any rolling 24 hours, and this
+#: many failed runs in a row before the Scheduled Job is paused. (The GLOBAL daily cap across all Scheduled Jobs, `max_runs_per_day`,
+#: is a separate, older control from Slice 1 and keeps its own configuration.)
+HARD_MAX_RUNS_PER_SCHEDULE_PER_DAY = 10
+HARD_MAX_BREAKER_FAILURES = 3
+
 
 class ScheduledJobPolicyError(ScheduledJobError):
     """A request the V1 limits refuse. The message is plain and safe to tell the user."""
@@ -63,9 +70,17 @@ class Limits:
     horizon: timedelta = MAX_HORIZON  # how far ahead a one-time Scheduled Job may be set
     run_deadline: timedelta = timedelta(minutes=15)  # how long ONE run may take, from its Job's creation
     max_open: int = 10
-    max_runs_per_day: int = 10
-    max_concurrent: int = 2
-    breaker_failures: int = 3
+    max_runs_per_day: int = 10  # GLOBAL (Slice 1): actual executions across ALL Scheduled Jobs in a rolling 24 hours
+    max_runs_per_schedule_per_day: int = HARD_MAX_RUNS_PER_SCHEDULE_PER_DAY  # Slice 3: PER Scheduled Job (never above the hard ceiling)
+    max_concurrent: int = 2  # GLOBAL (Slice 1): runs in flight at once, across all Scheduled Jobs
+    breaker_failures: int = HARD_MAX_BREAKER_FAILURES  # consecutive failed runs of ONE Scheduled Job (never above the hard ceiling)
+
+    def __post_init__(self) -> None:
+        # The ceilings are part of the policy, not of configuration: however a Limits is built, it cannot exceed them.
+        object.__setattr__(
+            self, "max_runs_per_schedule_per_day", max(1, min(int(self.max_runs_per_schedule_per_day), HARD_MAX_RUNS_PER_SCHEDULE_PER_DAY))
+        )
+        object.__setattr__(self, "breaker_failures", max(1, min(int(self.breaker_failures), HARD_MAX_BREAKER_FAILURES)))
 
     @classmethod
     def from_settings(cls) -> "Limits":
@@ -79,6 +94,7 @@ class Limits:
             run_deadline=timedelta(seconds=max(1, int(settings.scheduled_job_run_deadline_seconds))),
             max_open=max(1, int(settings.scheduled_job_max_active)),
             max_runs_per_day=max(1, int(settings.scheduled_job_max_runs_per_day)),
+            max_runs_per_schedule_per_day=max(1, int(settings.scheduled_job_max_runs_per_schedule_per_day)),
             max_concurrent=max(1, int(settings.scheduled_job_max_concurrent)),
             breaker_failures=max(1, int(settings.scheduled_job_breaker_failures)),
         )
@@ -260,16 +276,38 @@ def next_future_due(schedule: Schedule, now: datetime, expires_at: datetime | No
 
 class Admission(Enum):
     ADMIT = "admit"
-    SKIP_OVERLAP = "skip_overlap"  # the previous run of this Scheduled Job has not finished: this occurrence is skipped, not queued
-    DEFER_DAILY_CAP = "defer_daily_cap"  # leave it due; if it stays blocked past its window it becomes a skipped occurrence
-    DEFER_CONCURRENCY = "defer_concurrency"  # likewise
+    SKIP_OVERLAP = "skip_overlap"  # the previous run of this Scheduled Job is still in flight: this occurrence is skipped, not queued
+    SKIP_CAP = "skip_cap"  # (Slice 3) THIS Scheduled Job already ran its maximum in the rolling 24 hours: skipped, never queued or replayed
+    DEFER_DAILY_CAP = "defer_daily_cap"  # (Slice 1) the GLOBAL daily cap is used: leave it due; if it stays blocked past its window it is skipped
+    DEFER_CONCURRENCY = "defer_concurrency"  # (Slice 1) the GLOBAL in-flight limit is reached: likewise
 
 
-def admit(*, previous_run_unsettled: bool, unsettled_total: int, runs_in_last_day: int, limits: Limits) -> Admission:
-    """Single-flight per Scheduled Job first, then the global caps. A deferral is not a decision to skip: the occurrence stays due and
-    the next poll decides again (and, once it is too late to catch up, `decide_due` turns it into a skip)."""
+def admit(
+    *,
+    previous_run_unsettled: bool,
+    unsettled_total: int,
+    runs_in_last_day: int,
+    limits: Limits,
+    schedule_runs_in_last_day: int = 0,
+) -> Admission:
+    """Single-flight per Scheduled Job first, then ITS execution cap, then the two GLOBAL caps.
+
+    "Unsettled" here means IN FLIGHT: a run whose Job is still being advanced by the JobEngine (pending, planning or running). A Job that
+    is paused, waiting for an answer or a confirmation, or finished is not in flight, so it can neither overlap the next occurrence nor
+    hold one of the global slots forever (the caller decides which Jobs those are; this function only counts what it is given).
+
+    * `schedule_runs_in_last_day` (Slice 3): actual executions of THIS Scheduled Job in the rolling 24 hours - only occurrences that made
+      a Job count, no skipped one ever does. At the cap the occurrence is SKIPPED (consumed, never queued or replayed); capacity returns
+      by itself as old executions leave the window.
+    * `runs_in_last_day` (Slice 1, unchanged): the same count across ALL Scheduled Jobs - an independent global ceiling on how much
+      unattended work Jarvis does in a day, which no per-Schedule cap replaces (ten Scheduled Jobs under a per-Schedule cap of ten could
+      otherwise run a hundred times). `unsettled_total` is the global in-flight limit.
+    A GLOBAL deferral is not a decision to skip: the occurrence stays due and the next poll decides again (and, once it is too late to
+    catch up, `decide_due` turns it into a skip)."""
     if previous_run_unsettled:
         return Admission.SKIP_OVERLAP
+    if schedule_runs_in_last_day >= limits.max_runs_per_schedule_per_day:
+        return Admission.SKIP_CAP
     if runs_in_last_day >= limits.max_runs_per_day:
         return Admission.DEFER_DAILY_CAP
     if unsettled_total >= limits.max_concurrent:

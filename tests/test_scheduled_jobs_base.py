@@ -79,7 +79,10 @@ def test_a_paused_one_comes_back_only_by_resuming_never_straight_to_completed_by
 
 def test_the_vocabularies_are_closed():
     assert {s.value for s in S} == {"proposed", "active", "paused", "completed", "cancelled", "expired"}
-    assert {o.value for o in RunOutcome} == {"created", "created_late", "skipped_missed", "skipped_overlap", "skipped_blocked"}
+    assert {o.value for o in RunOutcome} == {
+        "created", "created_late", "skipped_missed", "skipped_overlap", "skipped_blocked",
+        "skipped_disabled", "skipped_cap", "skipped_expired",  # Slice 3: the other reasons an occurrence is consumed without a Job
+    }
     assert JOB_OUTCOMES == {RunOutcome.CREATED, RunOutcome.CREATED_LATE}
     assert RESULT_STATES == {"completed", "failed", "cancelled"}
 

@@ -103,6 +103,9 @@ CREATE TABLE IF NOT EXISTS scheduled_jobs (
     CHECK (status NOT IN ('active', 'paused', 'completed') OR approved_at IS NOT NULL)
 );
 CREATE INDEX IF NOT EXISTS ix_scheduled_jobs_due ON scheduled_jobs (status, due_at);
+"""
+
+_RUNS_TABLE = f"""
 CREATE TABLE IF NOT EXISTS scheduled_job_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     schedule_id TEXT NOT NULL,
@@ -122,9 +125,10 @@ CREATE TABLE IF NOT EXISTS scheduled_job_runs (
     CHECK (result_state IS NULL OR job_id IS NOT NULL),
     UNIQUE (schedule_id, occurrence),
     UNIQUE (job_id)
-);
-CREATE INDEX IF NOT EXISTS ix_scheduled_job_runs_open ON scheduled_job_runs (result_state, job_id);
+)
 """
+_RUNS_INDEX = "CREATE INDEX IF NOT EXISTS ix_scheduled_job_runs_open ON scheduled_job_runs (result_state, job_id)"
+_SCHEMA = _SCHEMA + _RUNS_TABLE + ";\n" + _RUNS_INDEX + ";\n"
 
 
 def _utc(value: datetime | None = None) -> datetime:
@@ -214,6 +218,49 @@ class SQLiteScheduledJobStore(ScheduledJobStore):
         with self._lock:
             self._conn.executescript(_SCHEMA)
             self._conn.commit()
+            self._migrate_outcome_constraint()
+
+    def _migrate_outcome_constraint(self) -> None:
+        """Bring an EXISTING `scheduled_job_runs` table up to the current outcome vocabulary.
+
+        SQLite cannot alter a CHECK constraint, and `CREATE TABLE IF NOT EXISTS` leaves an old table exactly as it was, so a database made
+        before an outcome existed (Slice 3 added skipped_disabled / skipped_cap / skipped_expired) would REFUSE to record it. The repository's
+        convention is to look at what the table is NOW and apply only what is missing (`_migrate_add_column` in the Job store; there is no
+        schema-version table) - so this does the same: it reads the stored table definition and, only if any current outcome is absent from
+        its CHECK - read INSIDE `BEGIN IMMEDIATE`, so two connections cannot both decide to rebuild - rebuilds the table in that ONE transaction: rename the old one aside, create the current one, copy EVERY row across with its
+        id, drop the old one, restore the index and the id counter. Nothing is dropped before everything is copied, and any failure rolls
+        the whole thing back, leaving the old table untouched. A table that is already current is not touched at all, so this is
+        idempotent. The Scheduled Job table itself has no outcome constraint and needs nothing. Caller holds the lock."""
+        try:
+            # The write lock is taken FIRST and the table is inspected only once it is held. Inspecting before it would let two
+            # connections both read the old definition, both decide to rebuild, and the second would then rebuild (or fail on) a table the
+            # first had already upgraded. Under the lock the loser of that race sees the finished upgrade and does nothing.
+            self._conn.execute("BEGIN IMMEDIATE")
+            row = self._conn.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'scheduled_job_runs'").fetchone()
+            definition = (row[0] if row is not None else None) or ""
+            if all(f"'{outcome.value}'" in definition for outcome in RunOutcome):
+                self._conn.rollback()  # already current: nothing to write, release the lock
+                return
+            counter = self._conn.execute("SELECT seq FROM sqlite_sequence WHERE name = 'scheduled_job_runs'").fetchone()
+            old_sequence = counter[0] if counter is not None else None
+            self._conn.execute("DROP INDEX IF EXISTS ix_scheduled_job_runs_open")
+            self._conn.execute("ALTER TABLE scheduled_job_runs RENAME TO scheduled_job_runs__pre_migration")
+            self._conn.execute(_RUNS_TABLE)
+            self._conn.execute(
+                f"INSERT INTO scheduled_job_runs ({_RUN_COLUMNS}) SELECT {_RUN_COLUMNS} FROM scheduled_job_runs__pre_migration ORDER BY id"
+            )
+            self._conn.execute("DROP TABLE scheduled_job_runs__pre_migration")
+            self._conn.execute(_RUNS_INDEX)
+            if old_sequence is not None:  # ids are never reused, even those of rows that were deleted before the migration
+                updated = self._conn.execute(
+                    "UPDATE sqlite_sequence SET seq = MAX(seq, ?) WHERE name = 'scheduled_job_runs'", (old_sequence,)
+                ).rowcount
+                if not updated:
+                    self._conn.execute("INSERT INTO sqlite_sequence (name, seq) VALUES ('scheduled_job_runs', ?)", (old_sequence,))
+            self._conn.commit()
+        except BaseException:
+            self._conn.rollback()
+            raise
 
     @classmethod
     def for_job_store(cls, job_store) -> "SQLiteScheduledJobStore":
@@ -423,15 +470,21 @@ class SQLiteScheduledJobStore(ScheduledJobStore):
 
         return self._mutate(scheduled_job_id, expected_version, build)
 
-    def resume(self, scheduled_job_id: str, *, next_due_at: datetime, expected_version: int, via: str) -> ScheduledJob:
+    def resume(
+        self, scheduled_job_id: str, *, next_due_at: datetime, expected_version: int, via: str, now: datetime | None = None
+    ) -> ScheduledJob:
         valid_via(via)
         due = _utc(next_due_at)
-        moment = _utc()
+        moment = _utc(now)
 
         def build(current: ScheduledJob) -> dict[str, Any]:
             if current.status is not _S.PAUSED:
                 raise InvalidTransitionError(f"Only a paused Scheduled Job can be resumed; this one is {current.status.value}.")
             check_transition(current.status, _S.ACTIVE, None)
+            if current.expires_at is not None and moment >= current.expires_at:
+                # Pausing never stops the clock on the approved period: once it has ended there is nothing to resume - only a fresh
+                # approval (renewal) can start a new one.
+                raise ScheduledJobError("The approved period has ended, so this cannot be resumed - it needs a fresh approval.")
             if current.expires_at is not None and due >= current.expires_at:
                 raise ScheduledJobError("The next run would fall after the lifetime ends.")
             changes: dict[str, Any] = {
@@ -607,11 +660,14 @@ class SQLiteScheduledJobStore(ScheduledJobStore):
             rows = self._conn.execute(query + " ORDER BY id", params).fetchall()
         return [_run_from_row(r) for r in rows]
 
-    def count_runs_since(self, since: datetime) -> int:
+    def count_runs_since(self, since: datetime, schedule_id: str | None = None) -> int:
+        query = "SELECT COUNT(*) FROM scheduled_job_runs WHERE job_id IS NOT NULL AND created_at >= ?"
+        params: tuple = (_iso(since),)
+        if schedule_id is not None:
+            query += " AND schedule_id = ?"
+            params = (*params, schedule_id)
         with self._lock:
-            return self._conn.execute(
-                "SELECT COUNT(*) FROM scheduled_job_runs WHERE job_id IS NOT NULL AND created_at >= ?", (_iso(since),)
-            ).fetchone()[0]
+            return self._conn.execute(query, params).fetchone()[0]
 
     def settle_run(
         self, run_id: int, result_state: str, *, breaker_limit: int, via: str = "scheduler", now: datetime | None = None

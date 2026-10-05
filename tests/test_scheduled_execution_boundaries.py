@@ -7,6 +7,7 @@ no tool execution, and no second engine / registry / planner / permission system
 
 import ast
 import pathlib
+import re
 import threading
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -55,7 +56,7 @@ def identifiers(path):
 
 
 def test_the_package_is_what_we_expect():
-    assert {f.name for f in FILES} == {"__init__.py", "adapter.py", "context.py", "occurrence.py"}
+    assert {f.name for f in FILES} == {"__init__.py", "adapter.py", "context.py", "occurrence.py", "scheduler.py"}
 
 
 def test_it_imports_only_what_it_needs_and_nothing_that_could_run_plan_notify_or_write_memory():
@@ -78,13 +79,23 @@ def test_the_only_part_of_handle_this_it_reads_is_the_existing_capability_bounda
     assert not (identifiers(PACKAGE / "adapter.py") & {"CapabilityBoundary"})  # no second boundary is constructed
 
 
+#: The scheduler's ONE entry point, called by the JobEngine's own tick. It is the only name here that may mean "run periodically", and
+#: it is a plain method: the loop, the thread and the timer all stay the engine's.
+SCHEDULER_ENTRY_POINT = "tick"
+
+
 def test_there_is_no_scheduler_loop_thread_timer_or_polling_in_the_package():
     for path in FILES:
         tree = ast.parse(path.read_text(encoding="utf-8"))
         assert not [n for n in ast.walk(tree) if isinstance(n, (ast.While, ast.AsyncFunctionDef, ast.Await))], path.name
         for module in imports(path):
             assert module.split(".")[0] not in {"threading", "sched", "asyncio", "time", "signal", "subprocess", "multiprocessing", "socket"}, (path.name, module)
-        assert not (identifiers(path) & {"start", "stop", "tick", "poll", "run_forever", "schedule_every", "Thread", "Timer"}), path.name
+        forbidden = {"start", "stop", "tick", "poll", "run_forever", "schedule_every", "Thread", "Timer"}
+        if path.name == "scheduler.py":
+            forbidden -= {SCHEDULER_ENTRY_POINT}  # the one method the JobEngine's tick calls; nothing here waits, sleeps or loops
+        assert not (identifiers(path) & forbidden), path.name
+        if path.name != "scheduler.py":
+            assert SCHEDULER_ENTRY_POINT not in identifiers(path), path.name
 
 
 def test_the_adapter_never_runs_a_tool_plans_notifies_or_writes_memory():
@@ -97,14 +108,26 @@ def test_the_adapter_never_runs_a_tool_plans_notifies_or_writes_memory():
         assert needle not in used, needle
 
 
-def test_the_adapter_is_not_wired_into_the_application_so_nothing_can_invoke_it_on_its_own():
-    """DELIBERATE: Slice 2 is not wired in. The slice that adds the scheduler (Slice 3) removes this test on purpose."""
+def test_the_scheduler_is_wired_through_main_alone_onto_the_job_engines_own_tick():
+    """Slice 3 wires the scheduler in, through ONE place: main.py builds it and hangs `tick` on the existing JobEngine's tick hook.
+    Nothing else names it - not the core, the default tools, the engine, the factory, the orchestration tools or the profile - so no
+    chat message or tool can invoke the adapter, and the engine knows nothing of scheduling. (This replaces Slice 2's "not wired in".)"""
     for relative in (
-        "app/main.py", "app/core.py", "app/tools/defaults.py", "app/orchestration/engine.py", "app/orchestration/factory.py",
+        "app/core.py", "app/tools/defaults.py", "app/orchestration/engine.py", "app/orchestration/factory.py",
         "app/orchestration/tools.py", "app/orchestration/profiles.py", "app/capability.py",
     ):
         text = (ROOT / relative).read_text(encoding="utf-8")
         assert "scheduled_execution" not in text and "scheduled_jobs" not in text, relative
+    main = (ROOT / "app" / "main.py").read_text(encoding="utf-8")
+    assert "job_engine.add_tick_hook(scheduled_job_scheduler.tick)" in main
+    assert "scheduled_job_scheduler.start" not in main and "scheduled_job_scheduler.stop" not in main  # no loop of its own to run or stop
+    importers = sorted(
+        str(path.relative_to(ROOT / "app")).replace("\\", "/")
+        for path in (ROOT / "app").rglob("*.py")
+        if "scheduled_execution" not in path.parts
+        and re.search(r"^\s*(from|import) app\.scheduled_execution", path.read_text(encoding="utf-8"), re.MULTILINE)
+    )
+    assert importers == ["main.py"]
 
 
 def test_building_the_adapter_and_launching_an_occurrence_starts_no_thread():

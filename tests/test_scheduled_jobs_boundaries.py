@@ -88,14 +88,28 @@ def test_the_only_way_a_job_reaches_the_database_is_a_callable_the_caller_suppli
     assert "insert_job(self._conn)" in source  # the one place a Job is written, and it is the caller's code that does it
 
 
-def test_the_slice_is_not_wired_into_the_application_so_nothing_can_run():
-    """DELIBERATE: Slice 1 is not wired in. The slice that adds the scheduler (Slice 3) removes this test on purpose."""
-    for relative in ("app/main.py", "app/core.py", "app/tools/defaults.py", "app/orchestration/engine.py", "app/orchestration/factory.py"):
+def test_the_foundation_is_wired_only_through_main_and_nothing_else_reaches_it():
+    """Slice 3 wired the scheduler in - through ONE place, main.py, which builds it and hangs it on the JobEngine's tick. Nothing else
+    in the application (the core, the default tools, the engine, the factory) names it, so a chat message or a tool cannot reach a
+    Scheduled Job's store or ledger, and the engine itself still knows nothing of scheduling. (This replaces Slice 1's "not wired in".)"""
+    for relative in ("app/core.py", "app/tools/defaults.py", "app/orchestration/engine.py", "app/orchestration/factory.py"):
         assert "scheduled_jobs" not in (ROOT / relative).read_text(encoding="utf-8"), relative
+    importers = sorted(
+        str(path.relative_to(ROOT / "app")).replace("\\", "/")
+        for path in (ROOT / "app").rglob("*.py")
+        if "scheduled_jobs" not in path.parts
+        and re.search(r"^\s*(from|import) app\.scheduled_jobs", path.read_text(encoding="utf-8"), re.MULTILINE)
+    )
+    assert importers == [
+        "main.py", "scheduled_execution/adapter.py", "scheduled_execution/context.py", "scheduled_execution/occurrence.py",
+        "scheduled_execution/scheduler.py",
+    ]
 
 
-def test_the_kill_switch_exists_and_defaults_off_and_nothing_here_reads_it_yet():
+def test_the_kill_switch_is_a_setting_the_pure_foundation_never_reads_itself():
+    """The switch is read by the scheduler (injected as a callable from main.py) - never by this package's pure policy or store, so no
+    rule here can depend on it and it cannot become a second permission system inside the foundation."""
     from app.config import Settings
 
-    assert Settings.model_fields["scheduled_jobs_enabled"].default is False
+    assert Settings.model_fields["scheduled_jobs_enabled"].default is True
     assert "scheduled_jobs_enabled" not in "\n".join(path.read_text(encoding="utf-8") for path in FILES)

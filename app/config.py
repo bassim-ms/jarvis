@@ -127,16 +127,22 @@ class Settings(BaseSettings):
     schedule_min_interval_minutes: int = 15
 
     # Scheduled Jobs (see app/scheduled_jobs/): a Job created from a Schedule, once per occurrence, while Jarvis is running.
-    # `scheduled_jobs_enabled` is the kill switch - OFF by default, and nothing in this foundation consults it yet. The rest are
-    # the V1 limits: the shortest gap between runs of a NEW repeating Scheduled Job, how long a recurring one stays active after
-    # the user approves it (renewal needs fresh approval), how late a missed occurrence may still be caught up (ONCE, never a
-    # replay), how many may exist / run per day / run at the same time, and how many failed runs in a row pause one.
-    scheduled_jobs_enabled: bool = False
+    # `scheduled_jobs_enabled` is the global kill switch, read by the scheduler on EVERY tick: off, no occurrence creates a Job (each
+    # one that comes due is skipped, never queued or replayed, and Jobs already running are not touched). On by default - with nothing
+    # approved there is nothing to run. The rest are the V1 limits: the shortest gap between runs of a NEW repeating Scheduled Job,
+    # how long a recurring one stays active after the user approves it (renewal needs fresh approval), how late a missed occurrence
+    # may still be caught up (ONCE, never a replay), how many may exist, how many actual runs happen per rolling 24 hours across ALL
+    # of them (`scheduled_job_max_runs_per_day`, the global cap) and how many for ONE of them
+    # (`scheduled_job_max_runs_per_schedule_per_day`), how many may run at the same time, and how many failed runs in a row pause one
+    # (`scheduled_job_breaker_failures`). The per-Schedule cap and the breaker have HARD ceilings in policy code (10 and 3): a setting
+    # can only make them stricter.
+    scheduled_jobs_enabled: bool = True
     scheduled_job_min_interval_minutes: int = 60
     scheduled_job_lifetime_days: int = 90
     scheduled_job_catch_up_window_seconds: int = 21600
     scheduled_job_max_active: int = 10
     scheduled_job_max_runs_per_day: int = 10
+    scheduled_job_max_runs_per_schedule_per_day: int = 10
     scheduled_job_max_concurrent: int = 2
     scheduled_job_breaker_failures: int = 3
     # How long ONE run of a Scheduled Job may take, from the moment its Job is created (planning included). JobEngine fails the

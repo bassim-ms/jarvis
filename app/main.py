@@ -63,9 +63,14 @@ from app.orchestration.factory import (
 from app.orchestration.interaction_lifecycle import InteractionLifecycle
 from app.orchestration.notification_events import still_relevant
 from app.orchestration.interaction_resolver import InteractionResolver
+from app.scheduled_execution.adapter import ScheduledExecutionAdapter
+from app.scheduled_execution.context import FreshContextBuilder
+from app.scheduled_execution.scheduler import ScheduledJobScheduler
+from app.scheduled_jobs.policy import Limits as ScheduledJobLimits
+from app.scheduled_jobs.sqlite_store import SQLiteScheduledJobStore
 from datetime import datetime, timedelta
 
-from app.devices.base import DeviceAuthenticationError, DeviceContext
+from app.devices.base import DeviceAuthenticationError, DeviceContext, TrustState
 from app.devices.gateway import DeviceGateway
 from app.devices.operations import CommitDeviceRevocationTool, DeviceOperations, DeviceRevocationConfirmer
 from app.devices.registry import DeviceRegistry
@@ -326,6 +331,35 @@ core.tools.register(CommitDeviceRevocationTool(device_operations))
 # The Context Engine may show reasoning a confident staged candidate - labelled
 # UNCONFIRMED, in its own field, never as a fact.
 core.context_engine.candidate_source = core.memory_writer.candidates_for_context
+
+# Scheduled Jobs (see app/scheduled_jobs/ and app/scheduled_execution/): the scheduler is hung on the JobEngine's OWN tick - no
+# second loop, thread or timer - so it exists exactly while Jarvis runs. It decides which due occurrences become a Job and settles the
+# finished ones; the Job itself is an ordinary one that this same JobEngine plans and runs through `core.tools` (the Job-facing
+# registry) under the READ-only unattended profile. The kill switch (`scheduled_jobs_enabled`) is read on every tick; a device a
+# Scheduled Job was created from must still be TRUSTED in the existing device registry. Nothing here can create a Scheduled Job:
+# that (the approval flow) is a later slice, so until then the scheduler finds nothing due.
+_scheduled_job_limits = ScheduledJobLimits.from_settings()
+_scheduled_job_store = SQLiteScheduledJobStore.for_job_store(_job_store)
+scheduled_job_scheduler = ScheduledJobScheduler(
+    scheduled_jobs=_scheduled_job_store,
+    jobs=_job_store,
+    adapter=ScheduledExecutionAdapter(
+        scheduled_jobs=_scheduled_job_store,
+        tools=core.tools,
+        context_builder=FreshContextBuilder(
+            context_engine=core.context_engine,
+            snapshot_serializer=core._snapshot_to_job_context,
+            facts_provider=core.memory.get_facts,
+        ),
+        run_deadline=_scheduled_job_limits.run_deadline,
+    ),
+    limits=_scheduled_job_limits,
+    enabled=lambda: settings.scheduled_jobs_enabled,
+    device_trusted=lambda device_id: (
+        (device := _device_registry.get(device_id)) is not None and device.trust_state is TrustState.TRUSTED
+    ),
+)
+job_engine.add_tick_hook(scheduled_job_scheduler.tick)
 
 # The Morning Brief (app/morning_brief/): READS the existing calendar, task and reminder stores, the
 # Context Engine (World Model, memory, unconfirmed candidates), the Attention queue, Jobs and pending

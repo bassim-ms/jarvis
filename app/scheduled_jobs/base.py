@@ -176,6 +176,11 @@ class RunOutcome(Enum):
     SKIPPED_MISSED = "skipped_missed"  # missed, and too late to catch up
     SKIPPED_OVERLAP = "skipped_overlap"  # the previous run of this Scheduled Job had not finished
     SKIPPED_BLOCKED = "skipped_blocked"  # a re-check failed (capability gone, device revoked, ...); `reason` says which
+    # Slice 3 (the scheduler): the other reasons an occurrence is consumed without a Job. Each is a TERMINAL settlement of that one
+    # occurrence (its ledger row is never updated), and none of them counts as an execution or as a failure.
+    SKIPPED_DISABLED = "skipped_disabled"  # the global Scheduled Jobs kill switch was off
+    SKIPPED_CAP = "skipped_cap"  # this Scheduled Job already ran its maximum number of times in the rolling 24 hours
+    SKIPPED_EXPIRED = "skipped_expired"  # the approved period ended: nothing runs, the Scheduled Job is completed
 
 
 JOB_OUTCOMES = frozenset({RunOutcome.CREATED, RunOutcome.CREATED_LATE})
@@ -364,9 +369,12 @@ class ScheduledJobStore(ABC):
         """Any allowed move except approval and resume (`check_transition`)."""
 
     @abstractmethod
-    def resume(self, scheduled_job_id: str, *, next_due_at: datetime, expected_version: int, via: str) -> ScheduledJob:
+    def resume(
+        self, scheduled_job_id: str, *, next_due_at: datetime, expected_version: int, via: str, now: datetime | None = None
+    ) -> ScheduledJob:
         """PAUSED -> ACTIVE at `next_due_at` (the caller computes the next FUTURE occurrence). Clears the failure streak when the
-        pause was the circuit breaker's."""
+        pause was the circuit breaker's. Pausing never extends the approved period: once `expires_at` has passed (at `now`) it is refused -
+        only a fresh approval can start a new period."""
 
     @abstractmethod
     def reschedule(
@@ -413,8 +421,9 @@ class ScheduledJobStore(ABC):
         """Runs that created a Job whose result has not been recorded yet (the Job may still be running)."""
 
     @abstractmethod
-    def count_runs_since(self, since: datetime) -> int:
-        """Jobs created (CREATED / CREATED_LATE) at or after `since`, across all Scheduled Jobs - the daily cap's input."""
+    def count_runs_since(self, since: datetime, schedule_id: str | None = None) -> int:
+        """Jobs created (CREATED / CREATED_LATE) at or after `since` - of ONE Scheduled Job when `schedule_id` is given, otherwise
+        across all of them. Only an occurrence that actually made a Job is counted: no skipped one ever is."""
 
     @abstractmethod
     def settle_run(

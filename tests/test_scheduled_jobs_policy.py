@@ -54,6 +54,7 @@ def test_the_approved_v1_defaults():
     assert LIMITS.horizon == timedelta(days=800)
     assert LIMITS.run_deadline == timedelta(minutes=15)
     assert (LIMITS.max_open, LIMITS.max_runs_per_day, LIMITS.max_concurrent, LIMITS.breaker_failures) == (10, 10, 2, 3)
+    assert LIMITS.max_runs_per_schedule_per_day == 10  # Slice 3: per Scheduled Job, beside the global daily cap above
 
 
 def test_limits_come_from_settings_and_a_nonsense_value_is_clamped_not_trusted(monkeypatch):
@@ -70,7 +71,7 @@ def test_limits_come_from_settings_and_a_nonsense_value_is_clamped_not_trusted(m
     limits = Limits.from_settings()
     assert limits.run_deadline == timedelta(minutes=2)
     assert (limits.min_interval, limits.lifetime, limits.catch_up_window) == (timedelta(hours=2), timedelta(days=30), timedelta(hours=1))
-    assert (limits.max_open, limits.max_runs_per_day, limits.max_concurrent, limits.breaker_failures) == (3, 4, 1, 5)
+    assert (limits.max_open, limits.max_runs_per_day, limits.max_concurrent, limits.breaker_failures) == (3, 4, 1, 3)  # 5 -> the hard ceiling
     monkeypatch.setattr(settings, "scheduled_job_min_interval_minutes", 0)
     monkeypatch.setattr(settings, "scheduled_job_max_concurrent", -4)
     monkeypatch.setattr(settings, "scheduled_job_breaker_failures", 0)
@@ -80,10 +81,11 @@ def test_limits_come_from_settings_and_a_nonsense_value_is_clamped_not_trusted(m
     assert clamped.min_interval == timedelta(minutes=1) and clamped.max_concurrent == 1 and clamped.breaker_failures == 1
 
 
-def test_the_kill_switch_setting_exists_and_is_off_by_default():
+def test_the_kill_switch_setting_exists_and_is_on_by_default():
+    # Slice 3 reads it on every scheduler tick. On by default: with nothing approved there is nothing to run.
     from app.config import Settings
 
-    assert Settings.model_fields["scheduled_jobs_enabled"].default is False
+    assert Settings.model_fields["scheduled_jobs_enabled"].default is True
 
 
 # ====================================== lifetime: an execution boundary, not an understanding boundary ===========================
@@ -319,10 +321,43 @@ def test_overlap_wins_over_the_caps():
     assert admit(previous_run_unsettled=True, unsettled_total=5, runs_in_last_day=50, limits=LIMITS) is Admission.SKIP_OVERLAP
 
 
-def test_the_daily_and_concurrency_caps_defer_rather_than_drop():
+def test_the_global_daily_cap_and_concurrency_limit_defer_rather_than_drop():
+    # Slice 1, UNCHANGED: these two are GLOBAL controls across all Scheduled Jobs (`count_runs_since` was documented as "across all
+    # Scheduled Jobs - the daily cap's input", and `admit` as "the global caps"). Slice 3 keeps them beside the new per-Schedule cap.
     assert admit(previous_run_unsettled=False, unsettled_total=0, runs_in_last_day=10, limits=LIMITS) is Admission.DEFER_DAILY_CAP
     assert admit(previous_run_unsettled=False, unsettled_total=2, runs_in_last_day=0, limits=LIMITS) is Admission.DEFER_CONCURRENCY
     assert admit(previous_run_unsettled=False, unsettled_total=1, runs_in_last_day=9, limits=LIMITS) is Admission.ADMIT
+
+
+def test_a_scheduled_jobs_own_cap_skips_and_is_checked_before_the_global_caps():
+    # Slice 3: PER Scheduled Job, and an occurrence that meets it is skipped (consumed), never queued or replayed.
+    def decide(**kw):
+        return admit(**{"previous_run_unsettled": False, "unsettled_total": 0, "runs_in_last_day": 0, **kw}, limits=LIMITS)
+
+    assert decide(schedule_runs_in_last_day=10) is Admission.SKIP_CAP
+    assert decide(schedule_runs_in_last_day=9) is Admission.ADMIT
+    assert decide(schedule_runs_in_last_day=10, runs_in_last_day=50, unsettled_total=5) is Admission.SKIP_CAP  # its own cap comes first
+    assert decide(schedule_runs_in_last_day=0, runs_in_last_day=50) is Admission.DEFER_DAILY_CAP  # under its own cap, the global one still holds
+    assert decide(previous_run_unsettled=True, schedule_runs_in_last_day=10) is Admission.SKIP_OVERLAP  # overlap wins over everything
+
+
+def test_the_hard_ceilings_cannot_be_exceeded_however_limits_is_built(monkeypatch):
+    from app.config import settings
+    from app.scheduled_jobs.policy import HARD_MAX_BREAKER_FAILURES, HARD_MAX_RUNS_PER_SCHEDULE_PER_DAY
+
+    assert (HARD_MAX_RUNS_PER_SCHEDULE_PER_DAY, HARD_MAX_BREAKER_FAILURES) == (10, 3)
+    loose = Limits(max_runs_per_schedule_per_day=500, breaker_failures=50)
+    assert (loose.max_runs_per_schedule_per_day, loose.breaker_failures) == (10, 3)
+    assert admit(previous_run_unsettled=False, unsettled_total=0, runs_in_last_day=0, schedule_runs_in_last_day=10, limits=loose) is Admission.SKIP_CAP
+    strict = Limits(max_runs_per_schedule_per_day=2, breaker_failures=1)  # stricter is allowed
+    assert (strict.max_runs_per_schedule_per_day, strict.breaker_failures) == (2, 1)
+    monkeypatch.setattr(settings, "scheduled_job_max_runs_per_schedule_per_day", 999)
+    monkeypatch.setattr(settings, "scheduled_job_breaker_failures", 999)
+    configured = Limits.from_settings()
+    assert (configured.max_runs_per_schedule_per_day, configured.breaker_failures) == (10, 3)
+    # the GLOBAL daily cap is Slice 1's own, separately configured control and is not capped by the per-Schedule ceiling
+    monkeypatch.setattr(settings, "scheduled_job_max_runs_per_day", 40)
+    assert Limits.from_settings().max_runs_per_day == 40 and Limits(max_runs_per_day=500).max_runs_per_day == 500
 
 
 # ====================================== the circuit breaker =======================================================================

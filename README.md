@@ -167,7 +167,7 @@ jarvis/
       base.py              - ScheduledJob, the state machine (ALLOWED_TRANSITIONS), the occurrence ledger types, the ScheduledJobStore contract
       policy.py            - pure decisions: lifetime, new-schedule limits, missed-run (run-once catch-up), admission caps, circuit breaker
       sqlite_store.py      - SQLiteScheduledJobStore: the record + ledger; `record_run` writes the ledger row and the Job in ONE transaction
-    scheduled_execution/   - (Scheduled Jobs V1, Slice 2 - the execution adapter; INVOKED, never wakes up; not wired in)
+    scheduled_execution/   - (Scheduled Jobs V1, Slices 2-3 - the execution adapter, and the scheduler that decides what is due; hung on the JobEngine's tick)
       occurrence.py        - ScheduledOccurrence: one due occurrence, built from the Slice 1 policy's RUN / RUN_LATE decision
       context.py           - FreshContextBuilder: the run's context, read anew every time from the existing Context Engine + memory facts
       adapter.py           - ScheduledExecutionAdapter: occurrence -> ONE ordinary PENDING Job, atomically with its ledger row
@@ -261,7 +261,9 @@ jarvis/
     test_scheduled_jobs_boundaries.py - (Scheduled Jobs) the foundation cannot run/plan/notify/call tools and is not wired in
     test_run_profiles.py           - (Slice 2) the READ-only unattended profile and per-run deadline, as the existing JobEngine enforces them
     test_scheduled_execution_adapter.py - (Slice 2) occurrence -> Job: fresh context, atomic one-occurrence invariant (races, restart), failure, memory
-    test_scheduled_execution_boundaries.py - (Slice 2) the adapter has no scheduler/thread/notification/memory-write/tool-execution and is not wired in
+    test_scheduled_execution_boundaries.py - (Slices 2-3) the package has no loop/thread/timer/notification/memory-write/tool-execution; wired through main.py alone
+    test_scheduled_job_scheduler.py - (Slice 3) the scheduler: due discovery, kill switch, overlap, breaker, caps, device trust, boundary, settlement, races, paused period
+    test_scheduled_jobs_migration.py - (Slice 3) an OLD-schema ledger upgraded in place: rows, ids, constraints, new outcomes, rollback
     test_automation_store.py       - unit tests for SQLiteAutomationStore (persistence, trigger/condition/action round-trip)
     test_automation_conditions.py  - unit tests for FactEqualsCondition/TimeWindowCondition/condition_from_dict
     test_automation_engine.py      - unit tests for AutomationEngine (triggers, conditions, permissions, restart recovery, failure isolation)
@@ -1357,6 +1359,44 @@ JobEngine -> Planner -> ToolRegistry -> Tools -> Verify.` Slice 2 builds everyth
 - **One occurrence -> one Job** is unchanged from Slice 1 (the ledger's UNIQUE constraint; the Job and its row are one transaction).
 - **Schema.** `jobs` gains `run_profile TEXT NOT NULL DEFAULT 'interactive'` and `deadline_at TEXT` (additive; fixed at creation, never
   rewritten by a save). Existing rows are ordinary Jobs with no deadline.
+
+### Slice 3: the scheduler (Runtime + Scheduling)
+
+`Schedule -> scheduler tick -> due occurrence -> runtime gates -> ScheduledExecutionAdapter -> ordinary Job -> the existing JobEngine ->
+the existing ToolRegistry -> settlement.` `ScheduledJobScheduler.tick()` (`app/scheduled_execution/scheduler.py`) is hung on the JobEngine's
+own tick (`add_tick_hook`, in `main.py`): no second loop, thread, timer or external service - Jarvis running = it runs. All state is
+read from the database on every tick, so a restart or crash loses nothing. It never executes a tool, plans, notifies or enforces a
+deadline: it decides WHETHER an occurrence launches; the adapter makes the Job; the JobEngine owns the run, its deadline and its security.
+
+- **Gates, in order** (the first that fails consumes the occurrence with ONE terminal settlement - a skipped ledger row - and the Scheduled
+  Job moves on to its next FUTURE occurrence; nothing is queued, nothing is replayed): kill switch (`SKIPPED_DISABLED`) -> expiry
+  (`SKIPPED_EXPIRED`, and it completes) / too late to catch up (`SKIPPED_MISSED`) -> overlap (`SKIPPED_OVERLAP`) -> failure breaker
+  (pauses) -> this Scheduled Job's execution cap (`SKIPPED_CAP`) -> the two GLOBAL Slice 1 limits, the daily cap and the in-flight
+  limit (the occurrence stays due, bounded by the catch-up window) -> device trust (`SKIPPED_BLOCKED`; only that occurrence - the Scheduled
+  Job stays active and the next one is asked again) -> the Slice 2 capability-boundary re-check (`SKIPPED_BLOCKED`) -> launch.
+- **One occurrence -> at most one launch -> at most one terminal settlement** is the database's guarantee (ledger `UNIQUE(schedule,
+  occurrence)`, compare-and-set on the Scheduled Job's version and due time, `settle_run` only while unsettled), so two ticks, two
+  schedulers or two processes racing produce one winner. A launched run is settled once from the state its Job ended in (completed /
+  failed - a timeout is a failure / cancelled); a skipped occurrence is its own final settlement and is never an execution or a failure.
+- **Kill switch** `JARVIS_SCHEDULED_JOBS_ENABLED` (default on), read on every tick and again just before a launch (unreadable = off). Off:
+  nothing launches, running Jobs are untouched and still settle, the Scheduled Job is not modified, and nothing is backlogged or replayed
+  when it is turned back on.
+- **Overlap**: one run in flight per Scheduled Job. "In flight" means the Job is in a state the JobEngine itself advances (pending,
+  planning, running). A Job that is paused or waiting for an answer or confirmation is not being advanced - the engine skips it, maybe
+  forever - so it blocks nothing and holds no global slot (it stays unsettled, untouched, until it really ends); a finished one is settled
+  first.
+- **Failure breaker**: `JARVIS_SCHEDULED_JOB_BREAKER_FAILURES` (hard ceiling 3) consecutive failed executions pause the Scheduled Job
+  (reason `breaker`); a success resets the streak; skips never count.
+- **Execution caps**: `JARVIS_SCHEDULED_JOB_MAX_RUNS_PER_SCHEDULE_PER_DAY` (hard ceiling 10) actual executions per Scheduled Job in a
+  rolling 24 hours (a run exactly 24 hours old is outside it): hitting it skips the occurrence. Slice 1's GLOBAL controls are kept beside it
+  - `JARVIS_SCHEDULED_JOB_MAX_RUNS_PER_DAY` (all Scheduled Jobs together) and `JARVIS_SCHEDULED_JOB_MAX_CONCURRENT` - because they bound the
+  total unattended work and no per-Schedule cap does. Skipped occurrences never count; capacity returns by itself.
+- **The approved period never stops while paused.** Pausing does not extend the 90 days: the tick completes a paused Scheduled Job whose
+  period has ended (`completed`, reason `lifetime_ended`) and `resume` is refused after that - only a fresh approval starts a new period.
+- **Schema migration.** The ledger's outcome `CHECK` cannot be altered in SQLite, so the store inspects the table it finds (the repo's
+  convention; there is no schema-version table) and, only when it is behind, rebuilds `scheduled_job_runs` in one transaction (every row, id
+  and the id counter kept; index and constraints restored; rolled back whole on any failure). A current database is not touched.
+- **Missed runs**: at most one catch-up run for the most recent missed occurrence, then the next future one (Slice 1 policy, unchanged).
 
 ## Persistent Automation Engine (M8)
 
