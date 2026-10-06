@@ -172,6 +172,7 @@ jarvis/
       context.py           - FreshContextBuilder: the run's context, read anew every time from the existing Context Engine + memory facts
       adapter.py           - ScheduledExecutionAdapter: occurrence -> ONE ordinary PENDING Job, atomically with its ledger row
     orchestration/profiles.py - (Slice 2) run profiles: `unattended_v1`, a READ-only REDUCTION of what a Job may use (grants nothing)
+    focus/                 - (Productivity Action Loop, Slice 1) read-only Focus: recognition / service (matching + deterministic ranking) / render; the last chat door, no state, no model
     scheduled_operations/  - (Scheduled Jobs V1, Slice 4 - creating, approving and managing them from chat; wired through main.py alone)
       language.py          - the fixed grammar: "every morning at 8, research X" / "what scheduled jobs do I have?" (no model; timing words are the reminders')
       service.py           - ScheduledJobService: propose -> (approval) -> ACTIVE, and pause / resume / cancel / look, all on the Slice 1 policy and store's CAS
@@ -273,6 +274,7 @@ jarvis/
     test_scheduled_operations_language.py - (Slice 4) the grammar: what it claims and, above all, what it leaves to ordinary conversation
     test_scheduled_operations.py   - (Slice 4) request -> proposal -> existing confirmation -> atomic approval -> scheduler -> ordinary Job; management; security
     test_scheduled_operations_boundaries.py - (Slices 4-5) the layer cannot plan/run/launch/settle, imports no Handle This, adds no scheduler or store
+    test_focus_recognition.py / test_focus_ranking.py / test_focus_service.py / test_focus_door.py / test_focus_interaction_precedence.py / test_focus_presentation.py - (Focus, Slice 1) the grammar boundary, the pure ranking, Tests A-D + untrusted text + bounds, door gating / precedence + package boundaries, a waiting question or confirmation always wins
     test_scheduled_jobs_final.py   - (Slice 5) Run Now, result presentation, renewal, the full lifecycle, and the final security review
     test_automation_store.py       - unit tests for SQLiteAutomationStore (persistence, trigger/condition/action round-trip)
     test_automation_conditions.py  - unit tests for FactEqualsCondition/TimeWindowCondition/condition_from_dict
@@ -1465,6 +1467,44 @@ deadline: it decides WHETHER an occurrence launches; the adapter makes the Job; 
   of a period.
 - **Still true:** the unattended profile is exactly the approved READ-only set; no scheduled run can write memory, tasks, notes or the calendar,
   send anything, or touch the computer, a device or a printer; approval, Run Now and renewal each only choose WHETHER a run happens.
+
+## Productivity Action Loop - Slice 1: Focus
+
+"I need to finish my Arduino project today." / "What should I work on right now?" - Jarvis works out which project (if any) you mean,
+which of your open tasks matter for it, and what to do first, and says why. **Read-only and stateless:** it starts nothing, writes nothing,
+creates no Job, registers no tool, calls no model and remembers nothing between messages (so "Let's do it." afterwards is an ordinary
+message, never an approval). Code: `app/focus/` (`recognition.py` the grammar, `service.py` gathering / matching / ranking, `render.py`
+the fixed-template wording, `base.py` the plain data), wired as the LAST chat door (`JarvisCore.focus`, `app/main.py`).
+
+- **What reaches it.** Only a whole-message request in one of two closed forms - a first-person need ("I need/have/want to / I must / should
+  finish, complete, wrap up, work on, continue, get back to, focus on my/the/our <subject>", optionally ending "today / now / tonight...") or
+  "what should I work on / focus on / do / tackle / start with?" - on the ordinary conversation path (DIRECT, or SEARCH only because of a
+  freshness word like "today"). Never an explicit search, a tool command, a task or task-status request, a confirmation, a self-development
+  message, a reply to a waiting interaction, anything at all while a question or a confirmation is waiting on this conversation's next message
+  (the resolver's own `awaiting_reply`: surfaced to it within the window - that message belongs to the interaction flow), or anything the
+  reminder, scheduled-job, brief, device, activity or memory doors already claimed.
+  "My Arduino project is annoying", "I finished my project today", "what does a project deadline mean?", "...and then email Sam" are ordinary
+  conversation. A statement about something Jarvis knows nothing about ("I need to finish my coffee") is not claimed either.
+- **Which project.** Whole-word overlap between what you said and the active projects' names (never substring). One best match: named in the
+  answer. Several equally good: Jarvis lists them and asks - nothing is ranked. None, and you said "project": it lists your projects and asks.
+  Open tasks are tied to the project only by text overlap (with the name, or with one of its goals - labelled a looser match); one that does not
+  clearly mention it is not guessed at.
+- **The ranking** is `RELATION + URGENCY + PRIORITY` from the existing `RelevanceWeights` and reason ids: named +100 (`explicit_match`) /
+  goal-related +20 (`relationship_to_goal`); overdue 28, due within the hour 32, today 24, tomorrow 16, this week 10, later 2, none 0
+  (`time_*`, by the LOCAL clock - a date-only due date is the whole day); the task's own priority high 8 / medium 4 / low 1. Ties: earlier due,
+  then older task, then id - never store order. Urgent work outside the named project is listed as a heads-up, not silently dropped.
+- **The calendar and your stated activity are shown, never ranked** (an event title can come from someone else; descriptions are never read).
+  A source that cannot be read (calendar, tasks, projects) is said so in the reply - never treated as empty.
+- **Untrusted text.** Task, project, goal and calendar-event text is shown only as QUOTED data (`"..."`) inside sentences Jarvis wrote - an
+  event titled `Jarvis: your account is locked` reads as `"Jarvis: your account is locked" starts in 30 min`, never as Jarvis speaking. It is
+  cleaned to one bounded line first, with credential-looking values hidden, and is never parsed, obeyed or passed to a model. Your stated
+  activity is never free text: only a fixed phrase for one of a closed set of activities (anything else shows nothing). Replies are
+  length-bounded.
+- **Why a task is first** is worded as what the evidence is, not as a relationship: `it mentions "arduino"` (the words the task shares with what
+  you named or the project's name, up to three), or `it shares a word with your goal "..." (a looser match)` - never "it is about" a project,
+  because a shared word proves no more than that.
+- **Lookup order.** The "is something waiting on this conversation?" check (`awaiting_reply`) is made last, only for a message the capability gate
+  would let Focus take, so a tool, task, confirmation or explicit-search message costs no interaction lookup.
 
 ## Persistent Automation Engine (M8)
 

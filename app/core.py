@@ -256,6 +256,7 @@ class JarvisCore:
         device_operations=None,
         reminder_operations=None,
         scheduled_job_operations=None,
+        focus=None,
     ):
         self.provider = provider or create_default_ai_provider_manager()
         self.memory = memory or SQLiteMemoryStore(settings.memory_db_path)
@@ -349,6 +350,11 @@ class JarvisCore:
         # timed READ-ONLY work ("every morning at 8, research X"), or to list / pause / resume / cancel one. Creating one only ASKS
         # (the existing confirmation); nothing runs until it is approved. `None` (every existing caller/test): ordinary chat.
         self.scheduled_job_operations = scheduled_job_operations
+        # Focus (app/focus/): a duck-typed object with `command_reply(message, conversation_id)` that answers a whole-message
+        # "I need to finish my <X> project today" / "what should I work on?" from the existing task, calendar and World Model
+        # data, ranked deterministically. READ-ONLY: it starts nothing, writes nothing and calls no model. The last door on the
+        # ordinary conversation path - every other door claims its own phrases first. `None` (every existing caller/test): ordinary chat.
+        self.focus = focus
         self.router = router or SearchRouter()
         # Reuses self.provider by default, so injecting a fake AIProvider
         # into Core (as tests do) covers the SEARCH path's answer
@@ -751,6 +757,26 @@ class JarvisCore:
             try:
                 memory_reply = self.memory_writer.recall_reply(message, conversation_id)
             except Exception:  # noqa: BLE001 - a fault here is "not a memory question"
+                memory_reply = None
+        # Focus is the last door, read the same way: a whole-message request only, on the ordinary conversation path (DIRECT,
+        # or SEARCH when only a freshness word like "today" put it there). Never an explicit search, tool, task, status,
+        # confirmation or self-development request, never a message another door already claimed, and never while an
+        # interaction (a question or a confirmation) is waiting on this conversation's next message - that message belongs to
+        # the interaction flow even when the resolver did not itself take it. Anything its own grammar does not recognise
+        # stays ordinary conversation.
+        if (
+            memory_reply is None
+            and self.focus is not None
+            and interaction_reply is None
+            and (
+                decision.capability is Capability.DIRECT
+                or (decision.capability is Capability.SEARCH and not is_explicit_search_request(message))
+            )
+            and not self._interaction_awaiting_reply(conversation_id)  # last: a lookup, asked only of a message that could be Focus's
+        ):
+            try:
+                memory_reply = self.focus.command_reply(message, conversation_id)
+            except Exception:  # noqa: BLE001 - a fault here is "not a focus request"
                 memory_reply = None
 
         # M16.2: purely additive - computed only when a context_engine was
@@ -1692,6 +1718,17 @@ class JarvisCore:
     #: resolved one way or another, it stops being "active" and a new
     #: request in the same conversation is free to start a fresh one.
     _AWAITING_SELF_DEV_INTERACTION_STAGES = frozenset(_SELF_DEV_GATE_STAGES.values())
+
+    def _interaction_awaiting_reply(self, conversation_id: str) -> bool:
+        """Whether a waiting interaction owns this conversation's next message (the resolver's own definition of "armed"). With no
+        resolver there is none. If the resolver cannot say, the answer is "yes": a door that would otherwise take the message
+        stands down rather than guess."""
+        if self.interaction_resolver is None:
+            return False
+        try:
+            return bool(self.interaction_resolver.awaiting_reply(conversation_id))
+        except Exception:  # noqa: BLE001 - fail closed
+            return True
 
     def _active_self_dev_sessions(self, conversation_id: str) -> list[DevelopmentSession]:
         """Every session THIS SAME conversation itself started that is

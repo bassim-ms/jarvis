@@ -322,6 +322,13 @@ class InteractionResolver:
         confirm-by-bare-yes path must leave it alone."""
         return bool(self.interactions.list_pending_for_job(job_id))
 
+    def awaiting_reply(self, conversation_id: str) -> bool:
+        """Whether an interaction (a question or a confirmation) is waiting on THIS conversation's next message: exactly the
+        set `handle` arms its implicit replies from (surfaced to this conversation within the window, its Job still waiting,
+        not expired). A question only - it changes nothing. A chat door that answers whole-message requests uses it to leave
+        the message to the waiting interaction."""
+        return bool(self._armed(conversation_id))
+
     # -- explicit: answer <code>: <response> -------------------------------------------------------
 
     def _handle_code(self, code: str, response: str, conversation_id: str) -> ResolverOutcome:

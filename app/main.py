@@ -42,6 +42,7 @@ from app.config import settings
 from app.context_engine.factory import create_default_context_engine
 from app.context_planning.factory import create_default_context_planner
 from app.context_reasoning.factory import create_default_context_reasoner
+from app.focus import FocusService
 from app.handle_this.base import GoalFamily
 from app.handle_this.boundary import DEFAULT_BOUNDARY
 from app.handle_this.continuation import ObjectiveContinuer, plausible_input_answer
@@ -434,6 +435,17 @@ morning_brief_service = MorningBriefService(
 )
 core.morning_brief = morning_brief_service
 core.tools.register(MorningBriefTool(morning_brief_service))
+
+# Focus (app/focus/): "I need to finish my Arduino project today" / "what should I work on?" - READS the existing task store,
+# calendar, World Model projects and goals, and the user's stated activity, ranks deterministically and words the result from
+# fixed templates. It registers no tool, starts no Job, writes nothing and calls no model; it is the last chat door.
+core.focus = FocusService(
+    tasks=_task_store,
+    calendar=_calendar_provider,
+    world_model=_world_model_service,
+    activity=_activity_context,
+    clock=lambda: datetime.now().astimezone(),
+)
 
 # Observation + the narrow set of computer tools a Job may use (Slices 4-5, see app/observation/): the observe ->
 # act -> observe -> verify loop runs on the EXISTING Planner / JobEngine / ToolRegistry, so the JOB-facing registry
