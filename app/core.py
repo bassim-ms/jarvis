@@ -257,6 +257,7 @@ class JarvisCore:
         reminder_operations=None,
         scheduled_job_operations=None,
         focus=None,
+        action_proposals=None,
     ):
         self.provider = provider or create_default_ai_provider_manager()
         self.memory = memory or SQLiteMemoryStore(settings.memory_db_path)
@@ -355,6 +356,12 @@ class JarvisCore:
         # data, ranked deterministically. READ-ONLY: it starts nothing, writes nothing and calls no model. The last door on the
         # ordinary conversation path - every other door claims its own phrases first. `None` (every existing caller/test): ordinary chat.
         self.focus = focus
+        # Action Proposals (app/action_proposal/): a duck-typed object with `command_reply(message, conversation_id)` (a request for a plan,
+        # or a reply to the plan it just showed) and `confirmation_reply(message, conversation_id)`. A proposal is TEMPORARY, in memory and
+        # bound to one conversation; it creates no Job and runs no tool - an approval only hands the exact, revalidated proposal on. It is
+        # offered a message only after every other owner (the interaction resolver, every real confirmation, every other door) has declined
+        # it. `None` (every existing caller/test): ordinary chat.
+        self.action_proposals = action_proposals
         self.router = router or SearchRouter()
         # Reuses self.provider by default, so injecting a fake AIProvider
         # into Core (as tests do) covers the SEARCH path's answer
@@ -607,6 +614,14 @@ class JarvisCore:
                 f"Conversation '{conversation_id}' does not exist."
             )
 
+        # An Action Proposal waiting in this conversation is answered only by the very NEXT message: tell it one more has arrived, before
+        # anything decides who answers it (and even if this one goes on to fail - a failed exchange leaves nothing in the history).
+        if self.action_proposals is not None:
+            try:
+                self.action_proposals.note_message(conversation_id)
+            except Exception:  # noqa: BLE001 - a fault here is "nothing to count"
+                pass
+
         history = self.memory.get_messages(conversation_id)
         facts = with_derived_facts(self.memory.get_facts(), datetime.now().astimezone().date())
 
@@ -758,7 +773,7 @@ class JarvisCore:
                 memory_reply = self.memory_writer.recall_reply(message, conversation_id)
             except Exception:  # noqa: BLE001 - a fault here is "not a memory question"
                 memory_reply = None
-        # Focus is the last door, read the same way: a whole-message request only, on the ordinary conversation path (DIRECT,
+        # Focus is the last of the answering doors, read the same way: a whole-message request only, on the ordinary conversation path (DIRECT,
         # or SEARCH when only a freshness word like "today" put it there). Never an explicit search, tool, task, status,
         # confirmation or self-development request, never a message another door already claimed, and never while an
         # interaction (a question or a confirmation) is waiting on this conversation's next message - that message belongs to
@@ -777,6 +792,24 @@ class JarvisCore:
             try:
                 memory_reply = self.focus.command_reply(message, conversation_id)
             except Exception:  # noqa: BLE001 - a fault here is "not a focus request"
+                memory_reply = None
+        # The Action Proposal door follows Focus, on the same terms: ordinary conversation only (DIRECT, or SEARCH when only a freshness word put
+        # it there), never an explicit search, tool, task, status, confirmation or self-development request, never a message another door already
+        # claimed, never while an interaction is waiting on this conversation's next message. A reply to a proposal that is waiting also arrives
+        # through the CONFIRMATION branch below (yes / no / go ahead) - after the real confirmations have had it.
+        if (
+            memory_reply is None
+            and self.action_proposals is not None
+            and interaction_reply is None
+            and (
+                decision.capability is Capability.DIRECT
+                or (decision.capability is Capability.SEARCH and not is_explicit_search_request(message))
+            )
+            and not self._interaction_awaiting_reply(conversation_id)
+        ):
+            try:
+                memory_reply = self.action_proposals.command_reply(message, conversation_id)
+            except Exception:  # noqa: BLE001 - a fault here is "not a proposal message"
                 memory_reply = None
 
         # M16.2: purely additive - computed only when a context_engine was
@@ -857,11 +890,18 @@ class JarvisCore:
                 # conversation (see `_active_self_dev_sessions`'s own
                 # docstring), and a self-development session's approval
                 # has its own, separate SELF_DEV_APPROVAL capability.
-                reply, sources, reasoning_result, planning_directive = (
-                    self._fallback_to_direct(
-                        message, history, facts, request_context, context_snapshot
+                #
+                # Only HERE - after the interaction resolver and every real confirmation have declined it - may a yes/no be a
+                # reply to an Action Proposal that is waiting in this conversation (see app/action_proposal/service.py).
+                proposal_reply = self._proposal_confirmation_reply(message, conversation_id)
+                if proposal_reply is not None:
+                    reply, sources = proposal_reply, []
+                else:
+                    reply, sources, reasoning_result, planning_directive = (
+                        self._fallback_to_direct(
+                            message, history, facts, request_context, context_snapshot
+                        )
                     )
-                )
         elif decision.capability is Capability.SELF_DEVELOPMENT:
             if active_self_dev_sessions:
                 # A self-development session is ALREADY awaiting an
@@ -1718,6 +1758,16 @@ class JarvisCore:
     #: resolved one way or another, it stops being "active" and a new
     #: request in the same conversation is free to start a fresh one.
     _AWAITING_SELF_DEV_INTERACTION_STAGES = frozenset(_SELF_DEV_GATE_STAGES.values())
+
+    def _proposal_confirmation_reply(self, message: str, conversation_id: str) -> str | None:
+        """A yes/no-shaped message that no real confirmation took, offered to the Action Proposal waiting in this conversation (if any).
+        Stands down while an interaction is waiting on the conversation, and on any fault: the message then carries on as it always did."""
+        if self.action_proposals is None or self._interaction_awaiting_reply(conversation_id):
+            return None
+        try:
+            return self.action_proposals.confirmation_reply(message, conversation_id)
+        except Exception:  # noqa: BLE001
+            return None
 
     def _interaction_awaiting_reply(self, conversation_id: str) -> bool:
         """Whether a waiting interaction owns this conversation's next message (the resolver's own definition of "armed"). With no

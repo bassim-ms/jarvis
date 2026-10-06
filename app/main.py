@@ -42,6 +42,7 @@ from app.config import settings
 from app.context_engine.factory import create_default_context_engine
 from app.context_planning.factory import create_default_context_planner
 from app.context_reasoning.factory import create_default_context_reasoner
+from app.action_proposal import ActionProposalService
 from app.focus import FocusService
 from app.handle_this.base import GoalFamily
 from app.handle_this.boundary import DEFAULT_BOUNDARY
@@ -444,6 +445,16 @@ core.focus = FocusService(
     calendar=_calendar_provider,
     world_model=_world_model_service,
     activity=_activity_context,
+    clock=lambda: datetime.now().astimezone(),
+)
+
+# Action Proposals (app/action_proposal/): "make a plan" - a few honest steps built from what Focus decided, shown, and held IN MEMORY for a
+# few minutes, bound to one conversation. It creates no Job, runs no tool, calls no model and writes nothing; a yes only hands the exact,
+# revalidated proposal on, and `on_approved` (the Slice 3 handoff) is deliberately left unset - so nothing can be started yet.
+core.action_proposals = ActionProposalService(
+    focus=core.focus,
+    tasks=_task_store,
+    tools=core.tools,
     clock=lambda: datetime.now().astimezone(),
 )
 

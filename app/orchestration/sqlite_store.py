@@ -43,6 +43,11 @@ from app.orchestration.base import (
 )
 
 
+#: A Job whose plan the user already approved is never re-planned by a model: its replan budget starts spent (the same device the
+#: memory, device and Scheduled Job confirmation Jobs use).
+PREBUILT_PLAN_REPLAN_COUNT = 10_000
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -214,6 +219,40 @@ class SQLiteJobStore(JobStore):
         with self._lock:
             self.insert_job_locked(self._conn, job)
             self._conn.commit()
+        return job
+
+    def create_running_job(
+        self,
+        goal: str,
+        steps: list[PlanStep],
+        *,
+        context: dict[str, Any] | None = None,
+        conversation_id: str | None = None,
+        priority: JobPriority = JobPriority.MEDIUM,
+        autonomy: AutonomyLevel = AutonomyLevel.ASSISTED,
+    ) -> Job:
+        """Insert a Job that is BORN RUNNING with a plan that was ALREADY validated and approved - the handoff for an approved
+        Action Proposal (see app/action_proposal/). One insert, one commit: there is no moment at which the row is PENDING, and
+        that matters - the engine always PLANS a PENDING Job with the model, overwriting any plan on it, so `create()` followed by a
+        `save()` could be planned by the model in between. Here the engine can only ever ADVANCE exactly these steps (each still
+        under its own permission and confirmation rules), and `replan_count` is already spent, so a failure never asks a model for
+        different ones. `steps` must be fresh, validated PlanSteps (their `permission` filled by `validate_plan`)."""
+        if not steps:
+            raise ValueError("A running Job needs at least one step.")
+        for step in steps:
+            if step.permission is None or step.status is not StepStatus.PENDING or step.confirmed or step.result is not None:
+                raise ValueError(f"Step '{step.id}' is not a fresh, validated step.")
+        job = self.build_job(goal, priority, autonomy, context, conversation_id, status=JobStatus.RUNNING)
+        job.plan = Plan(steps=list(steps))
+        job.total_step_count = len(steps)
+        job.replan_count = PREBUILT_PLAN_REPLAN_COUNT
+        with self._lock:
+            try:
+                self.insert_job_locked(self._conn, job)
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
         return job
 
     # -- lock-free construction/insert, for creating a Job together with another

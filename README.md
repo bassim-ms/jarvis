@@ -172,6 +172,7 @@ jarvis/
       context.py           - FreshContextBuilder: the run's context, read anew every time from the existing Context Engine + memory facts
       adapter.py           - ScheduledExecutionAdapter: occurrence -> ONE ordinary PENDING Job, atomically with its ledger row
     orchestration/profiles.py - (Slice 2) run profiles: `unattended_v1`, a READ-only REDUCTION of what a Job may use (grants nothing)
+    action_proposal/       - (Productivity Action Loop, Slice 2) a temporary, in-memory plan the user can approve: honest 'Your part / My part' steps; no Job, no model, no store
     focus/                 - (Productivity Action Loop, Slice 1) read-only Focus: recognition / service (matching + deterministic ranking) / render; the last chat door, no state, no model
     scheduled_operations/  - (Scheduled Jobs V1, Slice 4 - creating, approving and managing them from chat; wired through main.py alone)
       language.py          - the fixed grammar: "every morning at 8, research X" / "what scheduled jobs do I have?" (no model; timing words are the reminders')
@@ -275,6 +276,7 @@ jarvis/
     test_scheduled_operations.py   - (Slice 4) request -> proposal -> existing confirmation -> atomic approval -> scheduler -> ordinary Job; management; security
     test_scheduled_operations_boundaries.py - (Slices 4-5) the layer cannot plan/run/launch/settle, imports no Handle This, adds no scheduler or store
     test_focus_recognition.py / test_focus_ranking.py / test_focus_service.py / test_focus_door.py / test_focus_interaction_precedence.py / test_focus_presentation.py - (Focus, Slice 1) the grammar boundary, the pure ranking, Tests A-D + untrusted text + bounds, door gating / precedence + package boundaries, a waiting question or confirmation always wins
+    test_action_proposal_recognition.py / _service.py / _door.py / _handoff.py - (Action Proposal, Slice 2) the grammars, building / follow-ups / approval / revalidation, precedence in the real core, the Slice 3 handoff and the package boundary
     test_scheduled_jobs_final.py   - (Slice 5) Run Now, result presentation, renewal, the full lifecycle, and the final security review
     test_automation_store.py       - unit tests for SQLiteAutomationStore (persistence, trigger/condition/action round-trip)
     test_automation_conditions.py  - unit tests for FactEqualsCondition/TimeWindowCondition/condition_from_dict
@@ -1505,6 +1507,42 @@ the fixed-template wording, `base.py` the plain data), wired as the LAST chat do
   because a shared word proves no more than that.
 - **Lookup order.** The "is something waiting on this conversation?" check (`awaiting_reply`) is made last, only for a message the capability gate
   would let Focus take, so a tool, task, confirmation or explicit-search message costs no interaction lookup.
+
+## Productivity Action Loop - Slice 2: Action Proposal
+
+"Make a plan for my Arduino project." - Jarvis builds a few honest steps from what Focus decided, SHOWS them, and waits for a yes. **Nothing
+executes, no Job exists and nothing is stored**: a proposal is TEMPORARY, in memory, bound to one conversation, and gone on a restart. Code:
+`app/action_proposal/` (`recognition.py` the two small grammars, `builder.py`, `service.py`, `render.py`, `base.py`), wired in `app/core.py`
+(a door after Focus, and one hook in the CONFIRMATION branch) and `app/main.py`. No model, no Planner, no new tool, permission, store or
+resolver.
+
+- **Honest steps.** Each step says whose it is: `Your part: work on "..."` (Jarvis cannot do the user's work, so a physical step is never
+  worded as Jarvis's) or `My part: I'll set a reminder for 16:30 ...` - the only step of Jarvis's, built from a fixed template, validated by
+  the EXISTING plan validator against the live registry, and limited to a reminder ahead of a task's own TIMED due time (in the reminder
+  service's time zone). A proposal with no step of Jarvis's has nothing to approve, so it is shown but never pending. 1-4 steps.
+- **Asking, not inventing.** An ambiguous project, an unknown one, no tasks, or nothing to rank builds no proposal: Focus's own question is
+  asked instead.
+- **What the user can say while it waits** (closed grammars, whole-message, no model): *yes / yeah / go ahead / let's do it / do it*
+  approves; *no / cancel / not now* drops it; *ok / sure* is a nod, not an approval (it asks for a clear yes); "yes but ..." is not an
+  approval and drops the plan; *what does step 2 mean? / why this plan? / what happens after step 2? / show the plan again* are answered from
+  the stored steps and keep it waiting; *skip step N* discards the plan and builds a new one from the rest; *change/add/swap ...* is
+  declined (only skipping is supported); anything else is unrelated - the plan is dropped and the message carries on as ordinary.
+  A follow-up NEVER extends the lifetime (10 minutes, absolute).
+- **The very next message.** The core tells the service about EVERY message first (`note_message`), whatever goes on to answer it; a proposal
+  is consulted only while exactly one has arrived since it was last shown. A reminder, a search, a tool call, a question another door took, or
+  a message that failed outright all end its chance, so a later "yes" can never approve an old plan.
+- **Precedence.** A waiting interaction (question or confirmation), every real confirmation, a Task flow, a tool, an explicit search and the
+  other doors all come first; a proposal is offered a yes/no only after every real confirmation has declined it, and neither makes nor answers
+  a plan while an interaction waits on the conversation.
+- **Approval covers exactly what was shown.** The reply is a pure function of the stored steps; an approval POPS the proposal (exactly once),
+  recomputes its digest from LIVE data (a task that was finished, changed or cancelled makes it stale), validates every tool call again and
+  checks the day and the reminder time - any doubt creates nothing. Only then is the exact proposal handed to `on_approved`, the Slice 3
+  handoff, which is deliberately unset: until Slice 3 provides it an approval says nothing was started.
+- **The handoff infrastructure.** `SQLiteJobStore.create_running_job` inserts a Job BORN RUNNING with an already-validated plan in one atomic
+  insert (a PENDING Job would be planned by the model over the top of it), with its replan budget already spent. The engine, planner and
+  permission rules are unchanged: each step still runs under its own permission and confirmation rules.
+- **Untrusted text** (tasks, projects) appears only as quoted data, bounded, with credentials hidden; it is never parsed, and a tool name
+  can only come from the fixed allow-list (`create_reminder`).
 
 ## Persistent Automation Engine (M8)
 
