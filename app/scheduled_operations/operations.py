@@ -24,6 +24,7 @@ The Scheduled Job's own words are DATA: stored and shown as plain text; nothing 
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timedelta
 from collections.abc import Callable
 
 from app.notifications.text import clean_text
@@ -31,7 +32,8 @@ from app.orchestration.base import Job, JobStatus, Plan, PlanStep
 from app.orchestration.interactions import InteractionStatus, InteractionType, default_ttl_seconds
 from app.reminders.timefmt import local_phrase
 from app.scheduled_jobs.base import RunOutcome, ScheduledJob, ScheduledJobRun, ScheduledJobStatus, StatusReason
-from app.scheduled_operations.language import ManageAction, ManageRequest, CreateRequest, parse_request, topic_words
+from app.scheduled_operations.presenter import JobFacts, span
+from app.scheduled_operations.language import CreateRequest, ManageAction, ManageRequest, hint_name, parse_request, topic_words
 from app.scheduled_operations.service import (
     UNATTENDED_REFUSAL,
     Approved,
@@ -68,7 +70,6 @@ _PAUSE_REASONS = {
 _DONE_REASONS = {
     _R.ONE_TIME_DONE: "finished (it ran once)",
     _R.ONE_TIME_MISSED: "finished (its time passed while I wasn't running)",
-    _R.LIFETIME_ENDED: "its approved period has ended - ask me to schedule it again to renew",
 }
 _OUTCOMES = {
     RunOutcome.SKIPPED_MISSED: "skipped (I wasn't running at the time)",
@@ -89,9 +90,9 @@ class ScheduledJobApprovalConfirmer:
         self.interactions = interactions
         self.mark_surfaced = mark_surfaced
 
-    def approved(self, job_id: str, scheduled_job_id: str) -> str | None:
-        """The id of the confirmation the user APPROVED for exactly this Scheduled Job, or None. Read from the interaction store, so a
-        forged call - or the step of a declined, expired or different Job - can never approve."""
+    def approval(self, job_id: str, scheduled_job_id: str):
+        """The confirmation the user APPROVED for exactly this Scheduled Job, or None. Read from the interaction store, so a forged call -
+        or the step of a declined, expired or different Job - can never approve."""
         for interaction in self.interactions.list_for_job(job_id):
             if (
                 interaction.type is InteractionType.CONFIRMATION
@@ -99,10 +100,15 @@ class ScheduledJobApprovalConfirmer:
                 and interaction.detail.get("origin") == ORIGIN
                 and interaction.detail.get("scheduled_job_id") == scheduled_job_id
             ):
-                return interaction.id
+                return interaction
         return None
 
-    def ask(self, scheduled_job_id: str, prompt: str, conversation_id: str | None) -> str:
+    def approved(self, job_id: str, scheduled_job_id: str) -> str | None:
+        """The id of that confirmation, or None."""
+        interaction = self.approval(job_id, scheduled_job_id)
+        return interaction.id if interaction is not None else None
+
+    def ask(self, scheduled_job_id: str, prompt: str, conversation_id: str | None, renews: str | None = None) -> str:
         from app.orchestration.sqlite_store import SQLiteJobStore
 
         job: Job = SQLiteJobStore.build_job(GOAL, conversation_id=conversation_id, status=JobStatus.AWAITING_CONFIRMATION)
@@ -120,7 +126,7 @@ class ScheduledJobApprovalConfirmer:
         job.confirmation_message = prompt
         created, interaction = self.interactions.create_job_awaiting_confirmation(
             job, prompt=prompt, step_ids=[_STEP_ID],
-            detail={"origin": ORIGIN, "dangerous": False, "scheduled_job_id": scheduled_job_id},
+            detail={"origin": ORIGIN, "dangerous": False, "scheduled_job_id": scheduled_job_id, **({"renews": renews} if renews else {})},
             ttl_seconds=default_ttl_seconds(InteractionType.CONFIRMATION),
         )
         if self.mark_surfaced is not None and conversation_id:
@@ -147,13 +153,15 @@ def proposal_words(proposed: Proposed) -> str:
     sj, schedule = proposed.scheduled_job, proposed.scheduled_job.schedule
     once = schedule.kind is ScheduleKind.ONCE
     lines = [
-        "Here's what I'll set up:",
+        "Here's what I'll renew:" if proposed.renews else "Here's what I'll set up:",
         f"- I'll: {clean_text(sj.intent_text, _SHOWN)}",
         f"- When: {schedule.describe()}",
         f"- First run: {_at(proposed.first_due, schedule.tz)}",
     ]
     if once:
         lines.append("- It runs once, then it's done.")
+    elif proposed.renews:
+        lines.append("- This is a fresh approval: the current one ends when you say yes, and the new period lasts up to 90 days from then. Nothing renews itself.")
     else:
         lines.append("- It keeps going for up to 90 days from your approval; after that I'll ask you before continuing.")
     lines += [
@@ -165,35 +173,44 @@ def proposal_words(proposed: Proposed) -> str:
         lines.append("(That time has already passed today, so the first run is tomorrow.)")
     if proposed.warning:
         lines.append(f"Note: {proposed.warning}")
-    lines.append("Shall I schedule it?")
+    lines.append("Shall I renew it?" if proposed.renews else "Shall I schedule it?")
     return "\n".join(lines)
 
 
 def approved_words(approved: Approved) -> str:
     sj = approved.scheduled_job
     if approved.already:
-        return f"'{clean_text(sj.title, 80)}' is already scheduled."
-    message = f"Scheduled: '{clean_text(sj.title, 80)}' - {sj.schedule.describe()}. First run: {_at(sj.due_at, sj.schedule.tz)}."
+        return f"'{clean_text(sj.title, 80)}' is already {'renewed' if approved.renewed else 'scheduled'}."
+    message = f"{'Renewed' if approved.renewed else 'Scheduled'}: '{clean_text(sj.title, 80)}' - {sj.schedule.describe()}. First run: {_at(sj.due_at, sj.schedule.tz)}."
     if approved.lifetime.expires_at is not None:
         message += f" It runs until {_at(approved.lifetime.expires_at, sj.schedule.tz)}; I'll ask before it continues after that."
     return message
 
 
-def _state_words(sj: ScheduledJob) -> str:
+#: How close to the end of its approved period a Scheduled Job is when Jarvis starts mentioning that it can be renewed.
+RENEWAL_HINT_WITHIN = timedelta(days=7)
+
+
+def _state_words(sj: ScheduledJob, now: datetime | None = None) -> str:
     tz = sj.schedule.tz
     if sj.status is _S.ACTIVE:
-        return f"{_when_words(sj)}; next {_at(sj.due_at, tz)}"
+        text = f"{_when_words(sj)}; next {_at(sj.due_at, tz)}"
+        if now is not None and sj.expires_at is not None and sj.expires_at - now <= RENEWAL_HINT_WITHIN:
+            text += f"; its approved period ends {_at(sj.expires_at, tz)} - say \"renew my {hint_name(sj.title)} scheduled job\" to keep it going"
+        return text
     if sj.status is _S.PAUSED:
         return f"{_PAUSE_REASONS.get(sj.status_reason, 'paused')}; {_when_words(sj)}"
     if sj.status is _S.COMPLETED:
+        if sj.status_reason is _R.LIFETIME_ENDED:
+            return f"its approved period has ended - say \"renew my {hint_name(sj.title)} scheduled job\" to start a new one"
         return _DONE_REASONS.get(sj.status_reason, "finished")
     if sj.status is _S.PROPOSED:
         return "waiting for your approval"
     return sj.status.value
 
 
-def _line(sj: ScheduledJob) -> str:
-    return f"{clean_text(sj.title, 70)} - {_state_words(sj)}"
+def _line(sj: ScheduledJob, now: datetime | None = None) -> str:
+    return f"{clean_text(sj.title, 70)} - {_state_words(sj, now)}"
 
 
 def _outcome_words(run: ScheduledJobRun | None, tz: str | None) -> str:
@@ -205,14 +222,16 @@ def _outcome_words(run: ScheduledJobRun | None, tz: str | None) -> str:
     return f"{_RESULTS.get(run.result_state, 'started, not finished yet')} ({when})"
 
 
-def detail_words(sj: ScheduledJob, last: ScheduledJobRun | None) -> str:
+def detail_words(sj: ScheduledJob, last: ScheduledJobRun | None, facts: JobFacts | None = None, now: datetime | None = None) -> str:
     tz = sj.schedule.tz
     lines = [
         f"{clean_text(sj.title, 80)}",
         f"- What: {clean_text(sj.intent_text, _SHOWN)}",
-        f"- State: {_state_words(sj)}",
+        f"- State: {_state_words(sj, now)}",
         f"- Runs so far: {sj.runs_total}; last: {_outcome_words(last, tz)}",
     ]
+    if facts is not None and facts.result_excerpt:  # what the last finished run found: a bounded excerpt of its own report, quoted as data
+        lines.append(f"- What it found: \"{facts.result_excerpt}\"")
     if sj.consecutive_failures:
         lines.append(f"- Failed runs in a row: {sj.consecutive_failures}")
     if sj.expires_at is not None:
@@ -221,13 +240,55 @@ def detail_words(sj: ScheduledJob, last: ScheduledJobRun | None) -> str:
     return "\n".join(lines)
 
 
+_REFUSED = {
+    "disabled": "scheduled jobs are switched off right now",
+    "overlap": "its previous run is still going",
+    "cap": "it has already run the most it may in 24 hours",
+    "global_cap": "I've reached the daily limit for scheduled runs across all your scheduled jobs",
+    "busy": "other scheduled runs are still in progress - try again in a moment",
+    "device": "the device it was set up from isn't trusted any more",
+    "blocked": "something it needs isn't available to an unattended run right now",
+    "changed": "a run was just started (or it just changed), so I didn't start another",
+    "one_time": "it's a one-time job that runs once, at its time - running it now as well would make it run twice. Cancel it and ask me again if you want it done now",
+}
+
+
+def run_words(sj: ScheduledJob, result, now: datetime) -> str:
+    """What to say about a "run it now" request, from what the scheduler answered (`launched`, `refusal`). A refusal started nothing."""
+    name = f"'{clean_text(sj.title, 60)}'"
+    if getattr(result, "launched", False):
+        nxt = f" Its regular schedule is unchanged - next run {_at(sj.due_at, sj.schedule.tz)}." if sj.due_at is not None else ""
+        return f"Started: {name} is running now. I'll tell you when it's done.{nxt}"
+    refusal = getattr(getattr(result, "refusal", None), "value", "")
+    if refusal == "not_active":
+        if sj.status is _S.PAUSED:
+            return f"{name} is {_PAUSE_REASONS.get(sj.status_reason, 'paused')}, so I haven't run it. Resume it first."
+        if sj.status is _S.COMPLETED:
+            renew = f" Say \"renew my {hint_name(sj.title)} scheduled job\" to start a new approved period." if sj.status_reason is _R.LIFETIME_ENDED else ""
+            return f"{name} has finished, so there is nothing to run.{renew}"
+        return f"{name} isn't running, so I haven't run it."
+    if refusal == "expired":
+        return f"The period you approved for {name} has ended, so I haven't run it. Say \"renew my {hint_name(sj.title)} scheduled job\" to start a new one."
+    if refusal == "breaker":
+        return f"{name} has failed {sj.consecutive_failures} runs in a row, so I won't run it again until you've looked at it - I'm about to pause it."
+    if refusal == "not_found":
+        return "I couldn't find that scheduled job, so nothing was run."
+    return f"I haven't run {name}: {_REFUSED.get(refusal, 'it could not be started right now')}."
+
+
 # ====================================== the chat hook ====================================================================
 
 
 class ScheduledJobOperations:
-    def __init__(self, service: ScheduledJobService, confirmer: ScheduledJobApprovalConfirmer | None = None):
+    def __init__(
+        self,
+        service: ScheduledJobService,
+        confirmer: ScheduledJobApprovalConfirmer | None = None,
+        job_facts: Callable[[str], JobFacts | None] | None = None,
+    ):
         self.service = service
         self.confirmer = confirmer
+        self._job_facts = job_facts
 
     def command_reply(self, message: str, conversation_id: str | None = None, device_context=None) -> str | None:
         """`device_context` is the Gateway-authenticated DeviceContext of THIS request (None on the anonymous /chat). It is only used
@@ -238,19 +299,29 @@ class ScheduledJobOperations:
         try:
             if isinstance(request, CreateRequest):
                 return self._create(request, conversation_id, device_context)
-            return self._manage(request)
+            return self._manage(request, conversation_id, device_context)
         except ScheduledJobRequestError as exc:
             return str(exc)
 
     # -- creating (asked, never just done) ----------------------------------------------------------------------------------------
 
+    @staticmethod
+    def _device_id(device_context) -> str | None:
+        if device_context is not None and getattr(device_context, "is_authenticated", False):
+            return getattr(device_context, "device_id", None)
+        return None
+
     def _create(self, request: CreateRequest, conversation_id: str | None, device_context) -> str:
         if not request.reads_only:  # "send / add / buy / open ... every day": V1 schedules read-only work only - said aloud, not stored
             return UNATTENDED_REFUSAL
-        device_id = None
-        if device_context is not None and getattr(device_context, "is_authenticated", False):
-            device_id = getattr(device_context, "device_id", None)
-        proposed = self.service.propose(request.text, request.when, conversation_id=conversation_id, device_id=device_id)
+        proposed = self.service.propose(
+            request.text, request.when, conversation_id=conversation_id, device_id=self._device_id(device_context)
+        )
+        return self._ask(proposed, conversation_id)
+
+    def _ask(self, proposed, conversation_id: str | None) -> str:
+        """Put a stored proposal (a new one, or a renewal) to the user through the existing confirmation. Nothing is live until it is
+        approved; if it cannot be asked, it is withdrawn."""
         if proposed.duplicate:
             if proposed.scheduled_job.status is _S.PROPOSED:
                 return "I'm already waiting for your answer on that one - say yes to schedule it, or no to drop it."
@@ -260,7 +331,7 @@ class ScheduledJobOperations:
             return "I can't ask for that confirmation right now, so nothing was scheduled."
         prompt = proposal_words(proposed)
         try:
-            self.confirmer.ask(proposed.scheduled_job.id, prompt, conversation_id)
+            self.confirmer.ask(proposed.scheduled_job.id, prompt, conversation_id, renews=proposed.renews)
         except Exception:  # noqa: BLE001 - it cannot be asked: nothing is scheduled, nothing stays proposed
             logger.warning("scheduled job confirmation failed")
             self.service.discard(proposed.scheduled_job.id)
@@ -270,14 +341,15 @@ class ScheduledJobOperations:
     def commit_approval(self, scheduled_job_id: str, job_id: str | None) -> str:
         """Make live the Scheduled Job a confirmation was asked about - called ONLY by the CONFIRM-level tool, i.e. only when the user
         approved the confirmation of THAT Job (`job_id` comes from the engine, never from a plan)."""
-        approval = self.confirmer.approved(job_id, scheduled_job_id) if self.confirmer is not None and job_id else None
+        approval = self.confirmer.approval(job_id, scheduled_job_id) if self.confirmer is not None and job_id else None
         if approval is None:
             raise ScheduledJobRequestError("that can only be done by the confirmation that was asked")
-        return approved_words(self.service.approve(scheduled_job_id, approval))
+        renews = approval.detail.get("renews")  # set only by `ask`, when the proposal is a renewal; the store re-checks it atomically
+        return approved_words(self.service.approve(scheduled_job_id, approval.id, renews=renews if isinstance(renews, str) and renews else None))
 
     # -- looking and managing -------------------------------------------------------------------------------------------------------
 
-    def _manage(self, request: ManageRequest) -> str:
+    def _manage(self, request: ManageRequest, conversation_id: str | None = None, device_context=None) -> str:
         if request.action is ManageAction.LIST:
             return self._list()
         if request.everything:
@@ -287,6 +359,11 @@ class ScheduledJobOperations:
             return self._nothing_to_do(request)
         if len(eligible) > 1:
             return self._which(request, eligible)
+        if request.action is ManageAction.RENEW:
+            return self._ask(
+                self.service.propose_renewal(eligible[0].id, conversation_id=conversation_id, device_id=self._device_id(device_context)),
+                conversation_id,
+            )
         return self._apply(request.action, eligible[0])
 
     def _list(self) -> str:
@@ -294,7 +371,8 @@ class ScheduledJobOperations:
         if not shown:
             return "You don't have any scheduled jobs."
         lines = [f"You have {len(shown) if len(shown) <= MAX_LISTED else MAX_LISTED}{'+' if len(shown) > MAX_LISTED else ''} scheduled job{'' if len(shown) == 1 else 's'}:"]
-        lines += [f"{n}. {_line(sj)}" for n, sj in enumerate(shown[:MAX_LISTED], start=1)]
+        now = self.service.now()
+        lines += [f"{n}. {_line(sj, now)}" for n, sj in enumerate(shown[:MAX_LISTED], start=1)]
         return "\n".join(lines)
 
     _STATES = {
@@ -302,6 +380,9 @@ class ScheduledJobOperations:
         ManageAction.RESUME: (_S.PAUSED,),
         ManageAction.CANCEL: (_S.ACTIVE, _S.PAUSED),
         ManageAction.SHOW: (_S.ACTIVE, _S.PAUSED, _S.COMPLETED),
+        # asked about in any live or finished state, so that the answer can say exactly WHY it can't be done (paused, finished, ...)
+        ManageAction.RUN: (_S.ACTIVE, _S.PAUSED, _S.COMPLETED),
+        ManageAction.RENEW: (_S.ACTIVE, _S.PAUSED, _S.COMPLETED),
     }
 
     def _matching(self, request: ManageRequest) -> list[ScheduledJob]:
@@ -324,6 +405,8 @@ class ScheduledJobOperations:
             return f"'{clean_text(first.title, 60)}' is {'already paused' if first.status is _S.PAUSED else 'not running'}, so there is nothing to pause."
         if request.action is ManageAction.RESUME:
             return f"'{clean_text(first.title, 60)}' isn't paused."
+        if request.action in (ManageAction.RUN, ManageAction.RENEW):
+            return f"I couldn't find a running scheduled job like that to {request.action.value}."
         return f"'{clean_text(first.title, 60)}' isn't running, so there is nothing to cancel."
 
     def _which(self, request: ManageRequest, eligible: list[ScheduledJob]) -> str:
@@ -335,7 +418,12 @@ class ScheduledJobOperations:
     def _apply(self, action: ManageAction, sj: ScheduledJob) -> str:
         name = clean_text(sj.title, 60)
         if action is ManageAction.SHOW:
-            return detail_words(sj, self.service.last_run(sj.id))
+            last = self.service.last_run(sj.id)
+            facts = self._job_facts(last.job_id) if self._job_facts is not None and last is not None and last.job_id else None
+            return detail_words(sj, last, facts, self.service.now())
+        if action is ManageAction.RUN:
+            current, result = self.service.run_now(sj.id)
+            return run_words(self.service.store.get(sj.id) or current, result, self.service.now())
         if action is ManageAction.PAUSE:
             self.service.pause(sj.id)
             return f"Paused: '{name}'. It won't run until you resume it."

@@ -402,6 +402,39 @@ class SQLiteScheduledJobStore(ScheduledJobStore):
                 self._conn.rollback()
                 raise
 
+    @staticmethod
+    def _activation_changes(
+        current: ScheduledJob, *, approved: datetime, first: datetime, end: datetime | None, approval_interaction_id: str, via: str
+    ) -> dict[str, Any]:
+        """The fields an approval sets, after every rule an approval has to meet. Raises (changing nothing) otherwise."""
+        if current.status is not _S.PROPOSED:
+            raise InvalidTransitionError(f"Only a proposal can be approved; this one is {current.status.value}.")
+        check_transition(current.status, _S.ACTIVE, None)
+        if current.proposal_expires_at is not None and approved > current.proposal_expires_at:
+            raise InvalidTransitionError("This proposal expired before it was approved.")
+        if first <= approved:
+            raise ScheduledJobError("The first run has to be after the approval.")
+        one_time = current.schedule.kind is ScheduleKind.ONCE
+        if one_time and end is not None:
+            raise ScheduledJobError("A one-time Scheduled Job has no lifetime.")
+        if not one_time and end is None:
+            raise ScheduledJobError("A repeating Scheduled Job needs a lifetime (its approval does not last forever).")
+        if end is not None and first >= end:
+            raise ScheduledJobError("The first run would fall after the lifetime ends.")
+        event = _event(approved, "approved", f"first run {_iso(first)}", via)
+        return {
+            "status": _S.ACTIVE.value, "status_reason": None, "approved_at": _iso(approved),
+            "approval_interaction_id": approval_interaction_id, "due_at": _iso(first), "expires_at": _iso(end),
+            "events": _events_json(current.events, event), "updated_at": _iso(approved),
+        }
+
+    @staticmethod
+    def _approval_arguments(approved_at, approval_interaction_id, due_at, expires_at, via):
+        valid_via(via)
+        if not isinstance(approval_interaction_id, str) or not approval_interaction_id or len(approval_interaction_id) > MAX_ID_CHARS:
+            raise ScheduledJobError("An approval has to name the confirmation it came from.")
+        return _utc(approved_at), _utc(due_at), _utc(expires_at) if expires_at is not None else None
+
     def activate(
         self,
         scheduled_job_id: str,
@@ -413,34 +446,66 @@ class SQLiteScheduledJobStore(ScheduledJobStore):
         expires_at: datetime | None,
         via: str,
     ) -> ScheduledJob:
-        valid_via(via)
-        approved, first, end = _utc(approved_at), _utc(due_at), _utc(expires_at) if expires_at is not None else None
-        if not isinstance(approval_interaction_id, str) or not approval_interaction_id or len(approval_interaction_id) > MAX_ID_CHARS:
-            raise ScheduledJobError("An approval has to name the confirmation it came from.")
+        approved, first, end = self._approval_arguments(approved_at, approval_interaction_id, due_at, expires_at, via)
 
         def build(current: ScheduledJob) -> dict[str, Any]:
-            if current.status is not _S.PROPOSED:
-                raise InvalidTransitionError(f"Only a proposal can be approved; this one is {current.status.value}.")
-            check_transition(current.status, _S.ACTIVE, None)
-            if current.proposal_expires_at is not None and approved > current.proposal_expires_at:
-                raise InvalidTransitionError("This proposal expired before it was approved.")
-            if first <= approved:
-                raise ScheduledJobError("The first run has to be after the approval.")
-            one_time = current.schedule.kind is ScheduleKind.ONCE
-            if one_time and end is not None:
-                raise ScheduledJobError("A one-time Scheduled Job has no lifetime.")
-            if not one_time and end is None:
-                raise ScheduledJobError("A repeating Scheduled Job needs a lifetime (its approval does not last forever).")
-            if end is not None and first >= end:
-                raise ScheduledJobError("The first run would fall after the lifetime ends.")
-            event = _event(approved, "approved", f"first run {_iso(first)}", via)
-            return {
-                "status": _S.ACTIVE.value, "status_reason": None, "approved_at": _iso(approved),
-                "approval_interaction_id": approval_interaction_id, "due_at": _iso(first), "expires_at": _iso(end),
-                "events": _events_json(current.events, event), "updated_at": _iso(approved),
-            }
+            return self._activation_changes(
+                current, approved=approved, first=first, end=end, approval_interaction_id=approval_interaction_id, via=via
+            )
 
         return self._mutate(scheduled_job_id, expected_version, build)
+
+    def activate_renewal(
+        self,
+        scheduled_job_id: str,
+        *,
+        expected_version: int,
+        replaces: str,
+        replaces_version: int,
+        approved_at: datetime,
+        approval_interaction_id: str,
+        due_at: datetime,
+        expires_at: datetime | None,
+        via: str,
+    ) -> ScheduledJob:
+        """Approve a RENEWAL: exactly `activate`, and - in the SAME transaction - end the Scheduled Job it renews, so that the renewed and
+        the renewing one can never both be live. The renewed one must still be ACTIVE (it is cancelled, reason USER, with a note saying it
+        was renewed) or already have ended its approved period (COMPLETED, lifetime_ended: nothing left to end); anything else - cancelled,
+        paused, gone, changed under us - refuses the whole approval and nothing changes. The renewal is a NEW Scheduled Job with a NEW
+        approval and a fresh bounded period, and it extends nothing. It is also the SAME scheduled intent continuing, so its failure
+        streak carries over: renewing is never a way to erase the history the failure breaker works from. `replaces_version` is the renewed
+        one's version as the caller CHECKED it (that nothing of it is running): a run launched or settled since changes that version, so the
+        approval is refused whole rather than letting a run finish into a record that no longer counts."""
+        approved, first, end = self._approval_arguments(approved_at, approval_interaction_id, due_at, expires_at, via)
+        if not isinstance(replaces, str) or not replaces or replaces == scheduled_job_id:
+            raise ScheduledJobError("A renewal has to name the Scheduled Job it renews.")
+        with self._lock:
+            try:
+                current = self._guarded(scheduled_job_id, expected_version)
+                old = self._select(replaces)
+                if old is None:
+                    raise ScheduledJobError("The Scheduled Job being renewed is gone, so nothing was renewed.")
+                if old.version != replaces_version:
+                    raise StaleScheduledJobError("The Scheduled Job being renewed changed (a run may have just started or finished), so nothing was renewed.")
+                ends_it = old.status is _S.ACTIVE
+                if not ends_it and not (old.status is _S.COMPLETED and old.status_reason is _R.LIFETIME_ENDED):
+                    raise InvalidTransitionError(f"A {old.status.value} Scheduled Job cannot be renewed, so nothing was renewed.")
+                changes = self._activation_changes(
+                    current, approved=approved, first=first, end=end, approval_interaction_id=approval_interaction_id, via=via
+                )
+                changes["consecutive_failures"] = old.consecutive_failures  # the same intent, continuing: its failure history comes with it
+                updated = self._apply(current, changes)
+                if ends_it:
+                    check_transition(old.status, _S.CANCELLED, _R.USER)
+                    self._apply(old, {
+                        "status": _S.CANCELLED.value, "status_reason": _R.USER.value, "updated_at": _iso(approved),
+                        "events": _events_json(old.events, _event(approved, f"cancelled:{_R.USER.value}", "renewed by a new approval", via)),
+                    })
+                self._conn.commit()
+                return updated
+            except BaseException:
+                self._conn.rollback()
+                raise
 
     # -- the lifecycle ---------------------------------------------------------------------------------------------------------
 
@@ -658,6 +723,17 @@ class SQLiteScheduledJobStore(ScheduledJobStore):
             params = (schedule_id,)
         with self._lock:
             rows = self._conn.execute(query + " ORDER BY id", params).fetchall()
+        return [_run_from_row(r) for r in rows]
+
+    def unreported_runs(self, limit: int = 50) -> list[ScheduledJobRun]:
+        """Occurrences whose outcome is FINAL and which the user has not been told about yet, oldest first: every skipped one, and every
+        run whose Job has ended and been settled. A run whose Job is still going is not final, so it is not here."""
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT {_RUN_COLUMNS} FROM scheduled_job_runs WHERE reported_at IS NULL AND (job_id IS NULL OR result_state IS NOT NULL) "
+                "ORDER BY id LIMIT ?",
+                (max(1, int(limit)),),
+            ).fetchall()
         return [_run_from_row(r) for r in rows]
 
     def count_runs_since(self, since: datetime, schedule_id: str | None = None) -> int:

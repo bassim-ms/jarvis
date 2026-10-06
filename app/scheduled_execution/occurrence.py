@@ -16,11 +16,16 @@ Pure: no clock, no I/O, no storage.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 
 from app.scheduled_jobs.base import RunKind, RunOutcome, ScheduledJob, ScheduledJobError, ScheduledJobStatus, StatusReason
 from app.scheduled_jobs.policy import DueAction, DueDecision
 from app.scheduling.runs import occurrence_key
+
+
+def manual_occurrence_key(scheduled_job_id: str, version: int) -> str:
+    occurrence_key(scheduled_job_id, datetime(2000, 1, 1, tzinfo=timezone.utc))  # the same id rules as every occurrence key
+    return f"{scheduled_job_id}@manual:v{int(version)}"
 
 
 @dataclass(frozen=True)
@@ -38,6 +43,28 @@ class ScheduledOccurrence:
     @property
     def late(self) -> bool:
         return self.outcome is RunOutcome.CREATED_LATE
+
+    @classmethod
+    def manual(cls, scheduled_job: ScheduledJob, now: datetime) -> "ScheduledOccurrence":
+        """A "run it now" request for an ACTIVE Scheduled Job. It is the ledger's own MANUAL kind (Slice 1): same checks, same launch, but it
+        does not move the schedule - no next due time, no completion - so the next REAL occurrence is untouched and nothing is consumed.
+
+        Its identity is `<id>@manual:v<version>`: derived from the Scheduled Job's version as it was READ. Two requests that read the same
+        state share one identity, so the ledger's UNIQUE constraint (and the compare-and-set on that same version) lets exactly one launch
+        - the other is a duplicate and writes nothing. Every launch bumps the version, so a LATER request gets a new identity; and it can
+        never equal a scheduled occurrence's key (`<id>@<instant>`). It is not a historical occurrence: `scheduled_for` is simply now."""
+        if scheduled_job.status is not ScheduledJobStatus.ACTIVE or scheduled_job.due_at is None:
+            raise ScheduledJobError("Only an active Scheduled Job can be run now.")
+        return cls(
+            scheduled_job_id=scheduled_job.id,
+            occurrence=manual_occurrence_key(scheduled_job.id, scheduled_job.version),
+            scheduled_for=now,
+            outcome=RunOutcome.CREATED,
+            expected_due_at=scheduled_job.due_at,
+            next_due_at=None,
+            complete_reason=None,
+            kind=RunKind.MANUAL,
+        )
 
     @classmethod
     def from_decision(cls, scheduled_job: ScheduledJob, decision: DueDecision) -> "ScheduledOccurrence":

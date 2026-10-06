@@ -54,7 +54,7 @@ from app.scheduled_jobs.policy import (
     validate_new_schedule,
 )
 from app.scheduling.builder import ScheduleSpec, ScheduleSpecError, Wording, build_schedule
-from app.scheduling.schedule import Schedule, ScheduleError, next_due
+from app.scheduling.schedule import Schedule, ScheduleError, ScheduleKind, next_due
 from app.scheduling.timezones import UTC, TimezoneUnavailableError, ZoneChoice, resolve_timezone
 
 logger = logging.getLogger("jarvis.scheduled_operations")
@@ -86,6 +86,7 @@ class Proposed:
     rolled: bool = False  # a bare "at 7pm" that had passed today was set for tomorrow
     duplicate: bool = False
     warning: str = ""  # JARVIS_TIMEZONE was set but unusable and the system zone was used instead
+    renews: str | None = None  # the id of the Scheduled Job this proposal would RENEW (and replace) if approved
 
 
 @dataclass(frozen=True)
@@ -93,6 +94,7 @@ class Approved:
     scheduled_job: ScheduledJob
     lifetime: Lifetime
     already: bool = False  # it was approved by this very confirmation before: nothing was done again
+    renewed: bool = False  # it replaced the Scheduled Job it renews
 
 
 def _utc_now() -> datetime:
@@ -153,8 +155,12 @@ class ScheduledJobService:
         clock: Callable[[], datetime] | None = None,
         zone_resolver: Callable[[], ZoneChoice] | None = None,
         proposal_ttl: timedelta = timedelta(hours=1),
+        run_now: Callable[[str], Any] | None = None,
+        in_flight: Callable[[str], bool] | None = None,
     ):
         self.store = store
+        self._run_now = run_now
+        self._in_flight = in_flight
         self.limits = limits
         self._understand = understand
         self._check_objective = check_objective
@@ -216,25 +222,40 @@ class ScheduledJobService:
             raise ScheduledJobRequestError(f"I couldn't set that up: {exc}.") from None
         lifetime = lifetime_for(schedule, now, None, self.limits)
 
+        return self._store_proposal(
+            intent=intent, title=_short_title(intent), schedule=schedule, first_due=first_due, lifetime=lifetime, rolled=rolled,
+            warning=choice.warning, now=now, profile=PROFILE_UNATTENDED_V1,
+            make_objective=lambda: stable_objective(self._understand(intent, conversation_id)),
+            conversation_id=conversation_id, device_id=device_id,
+        )
+
+    def _store_proposal(
+        self, *, intent: str, title: str, schedule: Schedule, first_due: datetime, lifetime: Lifetime, rolled: bool, warning: str,
+        now: datetime, profile: str, make_objective: Callable[[], dict[str, Any]], conversation_id: str | None, device_id: str | None,
+        renews: str | None = None, open_discount: int = 0,
+    ) -> Proposed:
+        """The part a NEW request and a RENEWAL share: no duplicate, a place free, the objective something an unattended run could do,
+        stored as a PROPOSAL. `renews` names the Scheduled Job a renewal replaces (it is not a duplicate of its own renewal, and while it
+        is ACTIVE it does not use up a second place: `open_discount`)."""
         key = schedule.to_dict()
         for existing in self.store.list(OPEN_STATUSES):
-            if existing.intent_text.casefold() == intent.casefold() and existing.schedule.to_dict() == key:
-                return Proposed(existing, existing.due_at or first_due, lifetime, rolled, duplicate=True, warning=choice.warning)
+            if existing.id != renews and existing.intent_text.casefold() == intent.casefold() and existing.schedule.to_dict() == key:
+                return Proposed(existing, existing.due_at or first_due, lifetime, rolled, duplicate=True, warning=warning, renews=renews)
 
         try:  # (after the duplicate check: repeating something you already have is not "too many")
-            check_proposal_cap(self.store.count(OPEN_STATUSES), self.limits)
+            check_proposal_cap(max(0, self.store.count(OPEN_STATUSES) - open_discount), self.limits)
         except ScheduledJobPolicyError as exc:
             raise ScheduledJobRequestError(str(exc)) from None
-        objective = stable_objective(self._understand(intent, conversation_id))
-        self._require_unattended(objective, PROFILE_UNATTENDED_V1)
+        objective = make_objective()
+        self._require_unattended(objective, profile)
         try:
             proposal = self.store.create_proposal(
-                title=_short_title(intent),
+                title=title,
                 intent_text=intent,
                 objective=objective,
                 schedule=schedule,
                 proposal_expires_at=now + self.proposal_ttl,
-                profile=PROFILE_UNATTENDED_V1,
+                profile=profile,
                 created_via_conversation_id=conversation_id,
                 created_via_device_id=device_id,
                 now=now,
@@ -245,14 +266,93 @@ class ScheduledJobService:
         # look again and the EARLIEST (created time, then id) wins: the loser withdraws its own row, so exactly one proposal is ever asked.
         earlier = [
             sj for sj in self.store.list(OPEN_STATUSES)
-            if sj.id != proposal.id and sj.intent_text.casefold() == intent.casefold() and sj.schedule.to_dict() == key
+            if sj.id not in (proposal.id, renews) and sj.intent_text.casefold() == intent.casefold() and sj.schedule.to_dict() == key
             and (sj.created_at, sj.id) < (proposal.created_at, proposal.id)
         ]
         if earlier:
             self.discard(proposal.id)
             winner = min(earlier, key=lambda sj: (sj.created_at, sj.id))
-            return Proposed(winner, winner.due_at or first_due, lifetime, rolled, duplicate=True, warning=choice.warning)
-        return Proposed(proposal, first_due, lifetime, rolled, warning=choice.warning)
+            return Proposed(winner, winner.due_at or first_due, lifetime, rolled, duplicate=True, warning=warning, renews=renews)
+        return Proposed(proposal, first_due, lifetime, rolled, warning=warning, renews=renews)
+
+    # -- renewing ----------------------------------------------------------------------------------------------------------------------
+
+    def propose_renewal(self, scheduled_job_id: str, *, conversation_id: str | None = None, device_id: str | None = None) -> Proposed:
+        """Propose RENEWING a repeating Scheduled Job: a NEW Scheduled Job - same instruction, same understanding, same schedule - that the
+        user must approve exactly as they approved the first (the same confirmation, the same commit tool). Nothing is renewed by asking, and
+        nothing renews itself. It is a fresh scheduling decision, so it meets every rule a new one does (minimum gap, the 90-day bound from
+        ITS approval, the unattended check against what is available now): approving it extends nothing - it starts one new bounded period.
+
+        Only a Scheduled Job that is running (ACTIVE) or whose approved period has just ended can be renewed. A paused one is not - the user
+        decides to resume it first - and neither is one the user cancelled, nor a one-time one (it has no period to renew)."""
+        self.sweep()
+        now = self.now()
+        old = self._require(scheduled_job_id)
+        self._require_renewable(old)
+        self._require_not_running(old)
+        if old.consecutive_failures >= self.limits.breaker_failures:
+            # Its failure streak is at the limit where the breaker stops a Scheduled Job (and the streak would come with a renewal), so
+            # renewing it would only be paused again: say why, and leave a NEW request - a fresh decision - as the way forward.
+            raise ScheduledJobRequestError(
+                f"'{old.title}' had failed {old.consecutive_failures} runs in a row, which is where I stop running a scheduled job, so I won't renew it as it is. "
+                "Look at why it was failing; if you still want it, ask me to schedule it again as a new one."
+            )
+        first_due = next_due(old.schedule, now)
+        try:
+            validate_new_schedule(old.schedule, now=now, first_due=first_due, limits=self.limits)
+        except ScheduledJobPolicyError as exc:
+            raise ScheduledJobRequestError(f"{exc} I can't renew it as it is.") from None
+        lifetime = lifetime_for(old.schedule, now, None, self.limits)
+        return self._store_proposal(
+            intent=old.intent_text, title=old.title, schedule=old.schedule, first_due=first_due, lifetime=lifetime, rolled=False,
+            warning="", now=now, profile=old.profile, make_objective=lambda: old.objective, conversation_id=conversation_id,
+            device_id=device_id, renews=old.id, open_discount=1 if old.status is _S.ACTIVE else 0,
+        )
+
+    def _require_not_running(self, old: ScheduledJob) -> None:
+        """A run still in flight settles into THIS record - which a renewal ends - so its result (a failure that should count toward the
+        breaker, say) would be lost to the renewed one. So nothing is renewed while a run is going: the scheduler's own definition of "in
+        flight" (see `ScheduledJobScheduler.in_flight`), asked fail-closed - if it cannot be asked, the answer is no."""
+        try:
+            running = self._in_flight is None or self._in_flight(old.id)
+        except Exception:  # noqa: BLE001 - a question that cannot be answered is not a "no"
+            running = True
+        if running:
+            raise ScheduledJobRequestError(
+                f"'{old.title}' is running right now. Let it finish first - I'll tell you when it's done - and then ask me to renew it."
+            )
+
+    @staticmethod
+    def _require_renewable(old: ScheduledJob) -> None:
+        name = f"'{old.title}'"
+        if old.schedule.kind is ScheduleKind.ONCE:
+            raise ScheduledJobRequestError(f"{name} is a one-time scheduled job, so it has no period to renew.")
+        if old.status is _S.ACTIVE or (old.status is _S.COMPLETED and old.status_reason is _R.LIFETIME_ENDED):
+            return
+        if old.status is _S.PAUSED and old.status_reason is _R.BREAKER:
+            raise ScheduledJobRequestError(f"{name} was paused after several failed runs in a row. Resume it first (that clears the failure count), then renew it if you still need to.")
+        if old.status is _S.PAUSED:
+            raise ScheduledJobRequestError(f"{name} is paused. Resume it first, then renew it if you still need to.")
+        if old.status is _S.CANCELLED:
+            raise ScheduledJobRequestError(f"You cancelled {name}, so there is nothing to renew. Ask me to schedule it again if you want it back.")
+        if old.status is _S.COMPLETED:
+            raise ScheduledJobRequestError(f"{name} has finished, so there is nothing to renew.")
+        raise ScheduledJobRequestError(f"{name} isn't an approved scheduled job, so there is nothing to renew.")
+
+    # -- running one now ---------------------------------------------------------------------------------------------------------------
+
+    def run_now(self, scheduled_job_id: str) -> tuple[ScheduledJob, Any]:
+        """Ask the scheduler to start ONE run of an approved Scheduled Job now. All the rules are the scheduler's (the same gates, the same
+        launch as a due occurrence); this only hands the request over and returns what it said. Nothing here launches anything."""
+        current = self._require(scheduled_job_id)
+        if self._run_now is None:
+            raise ScheduledJobRequestError("I can't start scheduled runs right now, so nothing was run.")
+        try:
+            result = self._run_now(current.id)
+        except Exception:  # noqa: BLE001 - whatever went wrong, nothing is half-started: the launch is one transaction
+            logger.warning("scheduled job run-now failed", exc_info=True)
+            raise ScheduledJobRequestError("I couldn't start that just now, so nothing was run.") from None
+        return current, result
 
     def _require_unattended(self, objective: dict[str, Any], profile: str) -> None:
         try:
@@ -275,7 +375,7 @@ class ScheduledJobService:
 
     # -- approving -----------------------------------------------------------------------------------------------------------------
 
-    def approve(self, scheduled_job_id: str, approval_interaction_id: str) -> Approved:
+    def approve(self, scheduled_job_id: str, approval_interaction_id: str, renews: str | None = None) -> Approved:
         """PROPOSED -> ACTIVE, atomically (the store's compare-and-set records the approval, the first due time and the lifetime in ONE
         update, so the scheduler can never see a half-approved row). Called only after the user's confirmation was approved. The request
         is validated AGAIN against now: the time may have passed, the limits or the tools may have changed since it was proposed."""
@@ -293,16 +393,34 @@ class ScheduledJobService:
         except ScheduledJobPolicyError as exc:
             raise ScheduledJobRequestError(f"{exc} Nothing was scheduled - please ask me again.") from None
         self._require_unattended(current.objective, current.profile)
+        replaces_version = None
+        if renews:  # a renewal may only replace the very thing it renews: the same instruction on the same schedule
+            old = self.store.get(renews)
+            if old is None or old.id == current.id or old.intent_text != current.intent_text or old.schedule.to_dict() != current.schedule.to_dict():
+                raise ScheduledJobRequestError("That isn't a renewal of the scheduled job it names, so nothing was changed.")
+            self._require_not_running(old)  # the user may have started a run since they were asked
+            old = self.store.get(renews)  # read AFTER that check (it settles finished runs)...
+            if old is None:
+                raise ScheduledJobRequestError("The scheduled job to renew is gone, so nothing was changed.")
+            self._require_not_running(old)  # ...and asked AGAIN: a run launched in between shows up here
+            replaces_version = old.version  # and one launched after this changes the version, which the store holds the renewal to
+        arguments = dict(
+            expected_version=current.version, approved_at=now, approval_interaction_id=approval_interaction_id,
+            due_at=due, expires_at=lifetime.expires_at, via="chat",
+        )
         try:
-            activated = self.store.activate(
-                current.id, expected_version=current.version, approved_at=now, approval_interaction_id=approval_interaction_id,
-                due_at=due, expires_at=lifetime.expires_at, via="chat",
-            )
-        except (StaleScheduledJobError, InvalidTransitionError):
-            return self._already(self._require(scheduled_job_id), approval_interaction_id)  # raced: see what the winner did
+            if renews:  # the renewed Scheduled Job ends in the SAME transaction: the two can never both be live
+                activated = self.store.activate_renewal(current.id, replaces=renews, replaces_version=replaces_version, **arguments)
+            else:
+                activated = self.store.activate(current.id, **arguments)
+        except (StaleScheduledJobError, InvalidTransitionError) as exc:
+            again = self._require(scheduled_job_id)
+            if renews and isinstance(exc, InvalidTransitionError) and again.status is _S.PROPOSED:
+                raise ScheduledJobRequestError(f"{exc} Ask me again if you still want it renewed.") from None  # the one to renew changed
+            return self._already(again, approval_interaction_id)  # raced: see what the winner did
         except ScheduledJobError as exc:
             raise ScheduledJobRequestError(f"{exc} Nothing was scheduled.") from None
-        return Approved(activated, lifetime)
+        return Approved(activated, lifetime, renewed=bool(renews))
 
     def _already(self, current: ScheduledJob, approval_interaction_id: str) -> Approved:
         if current.approval_interaction_id == approval_interaction_id and current.status in (_S.ACTIVE, _S.PAUSED, _S.COMPLETED):

@@ -390,6 +390,8 @@ class JobEngine:
         """Announce a finished Job through the notification router. Never
         raises and never affects the Job (which is already persisted)."""
         try:
+            if job.run_profile != INTERACTIVE_PROFILE:
+                return  # a Job running under a capability profile is reported by whoever created it, in its own words (no generic duplicate)
             if job.status == JobStatus.FAILED:
                 if self._failure_was_users_decision(job):
                     return

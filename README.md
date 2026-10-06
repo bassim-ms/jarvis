@@ -176,6 +176,7 @@ jarvis/
       language.py          - the fixed grammar: "every morning at 8, research X" / "what scheduled jobs do I have?" (no model; timing words are the reminders')
       service.py           - ScheduledJobService: propose -> (approval) -> ACTIVE, and pause / resume / cancel / look, all on the Slice 1 policy and store's CAS
       operations.py        - the chat door (`command_reply`), the plain-words approval question, and the confirmer that ASKS through the existing confirmation
+      presenter.py         - (Slice 5) `present_run` (pure words from recorded facts) and `ScheduledJobReporter` (tells the user once, via the existing notifications)
       tools.py             - `commit_scheduled_job_approval`: CONFIRM-level, non-plannable, non-automatable; activates ONE confirmed proposal
     automation/
       base.py             - Automation/AutomationStatus/Trigger/Condition/AutomationStore interface, AutomationExecution
@@ -271,7 +272,8 @@ jarvis/
     test_scheduled_jobs_migration.py - (Slice 3) an OLD-schema ledger upgraded in place: rows, ids, constraints, new outcomes, rollback
     test_scheduled_operations_language.py - (Slice 4) the grammar: what it claims and, above all, what it leaves to ordinary conversation
     test_scheduled_operations.py   - (Slice 4) request -> proposal -> existing confirmation -> atomic approval -> scheduler -> ordinary Job; management; security
-    test_scheduled_operations_boundaries.py - (Slice 4) the layer cannot plan/run/launch/settle, imports no Handle This, adds no scheduler or store
+    test_scheduled_operations_boundaries.py - (Slices 4-5) the layer cannot plan/run/launch/settle, imports no Handle This, adds no scheduler or store
+    test_scheduled_jobs_final.py   - (Slice 5) Run Now, result presentation, renewal, the full lifecycle, and the final security review
     test_automation_store.py       - unit tests for SQLiteAutomationStore (persistence, trigger/condition/action round-trip)
     test_automation_conditions.py  - unit tests for FactEqualsCondition/TimeWindowCondition/condition_from_dict
     test_automation_engine.py      - unit tests for AutomationEngine (triggers, conditions, permissions, restart recovery, failure isolation)
@@ -1432,7 +1434,37 @@ deadline: it decides WHETHER an occurrence launches; the adapter makes the Job; 
 - **Managing them.** "What scheduled jobs do I have?", "show / pause / resume / cancel my AI news scheduled job" (never several at once; an
   ambiguous one is listed and nothing changes). Resume goes to the next *future* run; a recurring one whose approved period has ended cannot
   be resumed - only a fresh approval starts a new period. A one-time one has no lifetime of its own.
-- **Not here yet:** a notification/summary of what a run found (Slice 5), "run now", and renewal as its own gesture.
+
+### Slice 5: Run Now, results, renewal (Scheduled Jobs V1 complete)
+
+- **Run Now** ("run my AI news scheduled job now") is the scheduler's own `run_now`: the same gates in the same order as a due occurrence
+  (kill switch -> active and inside its approved period -> overlap -> failure breaker -> this Scheduled Job's cap -> the two global limits ->
+  device trust -> the adapter's capability check) and then the same adapter launch (the same ordinary Job, READ-only profile and ledger
+  transaction). The one difference: a gate that stops a due occurrence *consumes* it; here it only *refuses* the request and writes nothing,
+  because a refused request is not an occurrence. It uses the ledger's existing `MANUAL` kind: it counts as an execution for the caps, overlap
+  and the breaker, but does not move the schedule, so the next real occurrence is untouched. Its identity is `<id>@manual:v<version>`
+  (the Scheduled Job's version as read): two racing requests share it, so exactly one launches. A one-time Scheduled Job refuses Run Now
+  (it would run twice).
+- **Results.** The engine used to announce any finished background Job generically ("I finished '<goal>'") and said nothing about skipped
+  occurrences. A Job under a capability profile is now announced by its owner instead: `ScheduledJobReporter` (on the engine's tick, after the
+  scheduler) tells the user about RESULTS and MEANINGFUL CHANGES through the existing attention-gated notification router: a run that
+  finished ("...finished in 3 minutes. Ask me to show it and I'll tell you what it found."), a run that failed (a timeout says so, with the
+  limit; the failure streak and a breaker pause are mentioned), a problem beginning (blocked, or missed because Jarvis was off - told ONCE,
+  and again only after something different happened in between), and the end of an approved period. ROUTINE scheduler decisions are never
+  announced however often they recur - skipped because scheduled jobs are switched off, because the previous run was still going, or at
+  the daily cap - they stay in the ledger and in "show my X scheduled job". It uses only recorded facts, never a tool's error text or output
+  (that is available on request: "show" quotes a bounded excerpt of the last report). It changes nothing but the ledger's `reported_at`;
+  an outcome more than a day old is marked handled silently.
+- **Renewal** ("renew my X scheduled job") is never automatic and extends nothing: it proposes a NEW Scheduled Job (same instruction, same
+  understanding, same schedule) that the user approves through the Slice 4 confirmation. It meets every rule a new one does (minimum gap, the
+  90-day bound from ITS approval, the unattended check against what is available now), and approving it ends the renewed one in the SAME
+  transaction (`activate_renewal`), so the two can never both be live. Only a running or just-ended recurring one can be renewed: a paused one
+  (resume it first - which clears a breaker's streak), a cancelled one, and a one-time one cannot. **Renewing never erases failure
+  history:** a renewal is the same intent continuing, so its failure streak carries over (in the same transaction), and one already at the
+  breaker's limit is not renewed at all - a NEW request is the way forward. Jarvis mentions renewal in the listing within 7 days of the end
+  of a period.
+- **Still true:** the unattended profile is exactly the approved READ-only set; no scheduled run can write memory, tasks, notes or the calendar,
+  send anything, or touch the computer, a device or a printer; approval, Run Now and renewal each only choose WHETHER a run happens.
 
 ## Persistent Automation Engine (M8)
 
@@ -2007,3 +2039,8 @@ These were not decided now, to avoid overbuilding before they're needed:
   not deleted.
 - Remote access / security design — deferred until that milestone, since it
   needs deliberate design rather than a quick default.
+- `/chat` hardening that is app-wide, not Scheduled-Jobs-specific: `/chat` is the anonymous LOCAL interface and relies on the documented
+  start (`uvicorn app.main:app`, which binds the loopback address; no CORS, and a cross-site non-JSON POST is refused). The server does not
+  validate the `Host` header, so a DNS-rebinding page could in principle reach it, and `app/config.py` carries a `host = "0.0.0.0"` default
+  that nothing reads (a test pins that nothing binds from it) - it would expose `/chat` to the network if it were ever wired to the server.
+  Both belong to the remote-access design above (host validation, an explicit bind address), not to any one feature.

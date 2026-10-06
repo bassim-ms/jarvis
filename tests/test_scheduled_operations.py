@@ -660,7 +660,7 @@ def test_an_expired_schedule_cannot_be_resumed_even_though_it_was_paused_and_not
     assert chain.only_scheduled().status is S.PAUSED  # unchanged: only a fresh approval can start another period
     chain.scheduler.tick()  # the existing Slice 3 sweep completes it
     assert chain.only_scheduled().status is S.COMPLETED and chain.only_scheduled().status_reason is R.LIFETIME_ENDED
-    assert "ask me to schedule it again to renew" in chain.say("what scheduled jobs do I have?")
+    assert 'say "renew my research ai robotics scheduled job" to start a new one' in chain.say("what scheduled jobs do I have?")
 
 
 def test_a_paused_one_time_job_keeps_no_90_day_lifetime_and_can_still_be_resumed_while_its_time_is_ahead(chain):
@@ -945,6 +945,23 @@ def test_chat_stays_the_anonymous_local_interface_and_this_layer_changes_nothing
     assert simple.status_code == 422  # a cross-site form/text POST is not a chat message
     preflight = client.options("/chat", headers={"Origin": "https://evil.example", "Access-Control-Request-Method": "POST", "Access-Control-Request-Headers": "content-type"})
     assert preflight.status_code == 405 and "access-control-allow-origin" not in preflight.headers  # so JSON from another origin is blocked
+
+
+def test_nothing_binds_the_server_from_the_unused_host_setting():
+    """`config.py` has a `host = "0.0.0.0"` default that nothing reads: the server only listens where its launcher says (the documented
+    `uvicorn app.main:app` is loopback). If anything ever starts reading it, /chat - which has no credential by design - would be
+    network-reachable, so that change must be a deliberate one (and part of the remote-access design), not a side effect."""
+    import pathlib
+    import re
+
+    app_dir = pathlib.Path(__file__).resolve().parent.parent / "app"
+    readers = [
+        str(path.relative_to(app_dir))
+        for path in app_dir.rglob("*.py")
+        if path.name != "config.py" and re.search(r"settings\.(host|port)\b|JARVIS_(HOST|PORT)", path.read_text(encoding="utf-8"))
+    ]
+    assert readers == []
+    assert "uvicorn.run" not in "".join(path.read_text(encoding="utf-8") for path in app_dir.rglob("*.py"))  # the app never starts a server itself
 
 
 def test_no_route_or_credential_specific_to_scheduled_jobs_exists():

@@ -421,6 +421,27 @@ class ScheduledJobStore(ABC):
         """Runs that created a Job whose result has not been recorded yet (the Job may still be running)."""
 
     @abstractmethod
+    def activate_renewal(
+        self,
+        scheduled_job_id: str,
+        *,
+        expected_version: int,
+        replaces: str,
+        replaces_version: int,
+        approved_at: datetime,
+        approval_interaction_id: str,
+        due_at: datetime,
+        expires_at: datetime | None,
+        via: str,
+    ) -> ScheduledJob:
+        """`activate` for a RENEWAL, ending the Scheduled Job it renews in the same transaction (see the SQLite store). A renewal is a
+        NEW Scheduled Job with its own approval and a fresh bounded period; nothing is extended."""
+
+    @abstractmethod
+    def unreported_runs(self, limit: int = 50) -> list[ScheduledJobRun]:
+        """Final occurrences (skipped, or run and settled) the user has not been told about yet, oldest first."""
+
+    @abstractmethod
     def count_runs_since(self, since: datetime, schedule_id: str | None = None) -> int:
         """Jobs created (CREATED / CREATED_LATE) at or after `since` - of ONE Scheduled Job when `schedule_id` is given, otherwise
         across all of them. Only an occurrence that actually made a Job is counted: no skipped one ever is."""

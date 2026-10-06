@@ -103,7 +103,7 @@ def test_the_foundation_is_wired_only_through_main_and_nothing_else_reaches_it()
     # Slice 4 adds the creation/approval layer (app/scheduled_operations): it reads the store and the model, and is itself wired only by main.
     assert importers == [
         "main.py", "scheduled_execution/adapter.py", "scheduled_execution/context.py", "scheduled_execution/occurrence.py",
-        "scheduled_execution/scheduler.py", "scheduled_operations/operations.py", "scheduled_operations/service.py",
+        "scheduled_execution/scheduler.py", "scheduled_operations/operations.py", "scheduled_operations/presenter.py", "scheduled_operations/service.py",
     ]
 
 

@@ -102,6 +102,7 @@ from app.reminders.operations import ReminderOperations
 from app.orchestration.interactions import InteractionType, default_ttl_seconds
 from app.scheduled_operations.operations import ScheduledJobApprovalConfirmer, ScheduledJobOperations
 from app.scheduled_operations.service import ScheduledJobService, understander as scheduled_job_understander
+from app.scheduled_operations.presenter import ScheduledJobReporter, facts_from_job as scheduled_job_facts_from_job
 from app.scheduled_operations.tools import CommitScheduledJobApprovalTool
 from app.search.factory import create_default_search_provider
 from app.tasks.factory import create_default_task_store
@@ -378,11 +379,28 @@ _scheduled_job_service = ScheduledJobService(
     understand=scheduled_job_understander(lambda: core.handle_this),
     check_objective=_scheduled_job_adapter.check_objective,
     proposal_ttl=timedelta(seconds=default_ttl_seconds(InteractionType.CONFIRMATION)),
+    run_now=scheduled_job_scheduler.run_now,  # "run it now" is the SCHEDULER's: the same gates and the same launch as a due occurrence
+    in_flight=scheduled_job_scheduler.in_flight,  # a renewal waits for a run in flight: the scheduler's own definition of it
 )
+
+def _scheduled_job_facts(job_id: str):
+    return scheduled_job_facts_from_job(_job_store.get(job_id))  # read-only: the Job's own recorded status, times and report
+
+
 scheduled_job_operations = ScheduledJobOperations(
     _scheduled_job_service,
     ScheduledJobApprovalConfirmer(_interaction_store, mark_surfaced=core.interaction_resolver.mark_surfaced),
+    job_facts=_scheduled_job_facts,
 )
+# Telling the user what became of each occurrence (finished, failed, skipped and why), once, in Jarvis's words - through the EXISTING
+# attention-gated notification router, hung on the engine's tick like the scheduler. It changes nothing but the ledger's `reported_at`.
+scheduled_job_reporter = ScheduledJobReporter(
+    scheduled_jobs=_scheduled_job_store,
+    notify=_gated_router.notify,
+    job_facts=_scheduled_job_facts,
+    limits=_scheduled_job_limits,
+)
+job_engine.add_tick_hook(scheduled_job_reporter.report)
 core.scheduled_job_operations = scheduled_job_operations
 core.tools.register(CommitScheduledJobApprovalTool(scheduled_job_operations))
 

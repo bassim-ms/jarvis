@@ -18,7 +18,7 @@ FILES = sorted(PACKAGE.glob("*.py"))
 #: The only parts of the application this package may import.
 ALLOWED_APP_IMPORTS = (
     "app.scheduled_operations", "app.scheduled_jobs", "app.scheduling", "app.reminders.language", "app.reminders.timefmt",
-    "app.notifications.text", "app.orchestration.base", "app.orchestration.interactions", "app.orchestration.sqlite_store",
+    "app.notifications.text", "app.notifications.base", "app.orchestration.base", "app.orchestration.interactions", "app.orchestration.sqlite_store",
     "app.tools.base", "app.config", "app.system_timezone",
 )
 FORBIDDEN = (
@@ -55,7 +55,7 @@ def code_identifiers(path: pathlib.Path) -> set[str]:
 
 
 def test_the_package_is_what_we_expect():
-    assert {f.name for f in FILES} == {"__init__.py", "language.py", "operations.py", "service.py", "tools.py"}
+    assert {f.name for f in FILES} == {"__init__.py", "language.py", "operations.py", "presenter.py", "service.py", "tools.py"}
 
 
 def test_it_imports_nothing_that_could_plan_run_a_tool_reach_a_device_write_memory_or_call_a_model():
@@ -84,7 +84,7 @@ def test_nothing_here_plans_runs_a_tool_launches_work_or_settles_an_occurrence()
     used = set().union(*(code_identifiers(path) for path in FILES))
     for needle in (
         "ToolRegistry", "create_job", "JobEngine", "Planner", "confirm_job", "NotificationRouter", "generate_reply", "AIProvider",
-        "insert_job_locked", "record_run", "settle_run", "list_due", "mark_reported", "ScheduledJobScheduler", "ScheduledExecutionAdapter",
+        "insert_job_locked", "record_run", "settle_run", "list_due", "ScheduledJobScheduler", "ScheduledExecutionAdapter",
         "subprocess",
     ):
         assert needle not in used, needle
@@ -132,3 +132,27 @@ def test_the_only_edit_to_the_execution_adapter_is_the_shared_check_the_run_alre
     adapter = (ROOT / "app" / "scheduled_execution" / "adapter.py").read_text(encoding="utf-8")
     assert adapter.count("def check_objective(") == 1
     assert "self.check_objective(scheduled_job.objective, scheduled_job.profile)" in adapter  # creation and every run use ONE check
+
+
+def test_the_only_thing_this_layer_ever_writes_about_what_it_told_the_user_is_the_reported_marker():
+    """`mark_reported` (the ledger's own "the user was told" flag) is used by the reporter in presenter.py and nowhere else here; the presenter
+    functions are pure words and the rest of the layer cannot even name it."""
+    users = {path.name for path in FILES if "mark_reported" in code_identifiers(path)}
+    assert users == {"presenter.py"}
+    presenter = (PACKAGE / "presenter.py").read_text(encoding="utf-8")
+    present_run = presenter[presenter.index("def present_run("): presenter.index("# ====================================== telling the user, once")]
+    assert not re.search(r"\b(store|_store|mark_reported|notify|transition|record_run|settle_run|activate|resume)\b", present_run.split('"""')[2])
+
+
+def test_the_engine_only_learned_that_a_Job_under_a_capability_profile_is_reported_by_its_owner():
+    engine = (ROOT / "app" / "orchestration" / "engine.py").read_text(encoding="utf-8")
+    assert "scheduled_job" not in engine and "app.scheduled" not in engine  # still knows nothing of Scheduled Jobs (a run profile is generic)
+    block = engine[engine.index("def _route_finished"): engine.index("def _notify_if_finished")]
+    assert "job.run_profile != INTERACTIVE_PROFILE" in block and block.index("run_profile") < block.index("failed_event(job)")
+
+
+def test_run_now_is_the_schedulers_own_method_and_no_other_package_can_launch_a_scheduled_run():
+    scheduler = (ROOT / "app" / "scheduled_execution" / "scheduler.py").read_text(encoding="utf-8")
+    assert scheduler.count("def run_now(") == 1 and scheduler.count("self._adapter.launch(") == 2  # the due occurrence, and run-now: ONE adapter
+    for path in FILES:
+        assert "launch" not in code_identifiers(path), path.name  # this layer hands over a request; it never launches

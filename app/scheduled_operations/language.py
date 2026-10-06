@@ -41,6 +41,8 @@ class ManageAction(Enum):
     PAUSE = "pause"
     RESUME = "resume"
     CANCEL = "cancel"
+    RUN = "run"  # "run it now": one extra run, through the same gates
+    RENEW = "renew"  # a fresh, explicit approval for another bounded period
 
 
 @dataclass(frozen=True)
@@ -147,15 +149,23 @@ _VERB_ACTIONS = {
     "resume": ManageAction.RESUME, "unpause": ManageAction.RESUME, "restart": ManageAction.RESUME,
     "cancel": ManageAction.CANCEL, "delete": ManageAction.CANCEL, "remove": ManageAction.CANCEL, "stop": ManageAction.CANCEL,
     "show": ManageAction.SHOW, "inspect": ManageAction.SHOW, "describe": ManageAction.SHOW,
+    "run": ManageAction.RUN, "trigger": ManageAction.RUN, "execute": ManageAction.RUN, "start": ManageAction.RUN,
+    "renew": ManageAction.RENEW,
 }
 _MANAGE = re.compile(
     _LEAD + r"(?P<verb>" + "|".join(_VERB_ACTIONS) + r")\s+(?:(?:my|the|that|this|a|an)\s+)?(?P<body>.+?)" + _END, _I
 )
-_TOPIC_NOISE = frozenset("my the a an that this about for to of on regarding please scheduled job jobs task tasks called named titled one ones".split())
+_TOPIC_NOISE = frozenset("my the a an that this about for to of on regarding please scheduled job jobs task tasks called named titled one ones now".split())
 
 
 def topic_words(topic: str) -> tuple[str, ...]:
     return tuple(w for w in re.findall(r"[a-z0-9']+", topic.lower()) if w not in _TOPIC_NOISE)
+
+
+def hint_name(title: str) -> str:
+    """How to refer to a Scheduled Job in a suggestion ("renew my <this> scheduled job"): its first few WHOLE words (a cut-off word would not
+    match anything), the ones a later request is matched on."""
+    return " ".join(topic_words(title)[:3]) or "scheduled"
 
 
 def _manage(match: re.Match) -> ManageRequest | None:

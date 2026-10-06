@@ -53,6 +53,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from enum import Enum
 from datetime import datetime, timedelta, timezone
 
 from app.orchestration.base import TERMINAL_JOB_STATUSES, JobStatus
@@ -75,6 +76,7 @@ from app.scheduled_jobs.base import (
 )
 from app.scheduled_jobs.policy import DAILY_WINDOW, Admission, DueAction, DueDecision, Limits, admit, decide_due
 from app.scheduling.runs import occurrence_key
+from app.scheduling.schedule import ScheduleKind
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +113,32 @@ class TickResult:
 
     def count_skip(self, outcome: RunOutcome) -> None:
         self.skipped[outcome.value] = self.skipped.get(outcome.value, 0) + 1
+
+
+class ManualRefusal(Enum):
+    """Why a "run it now" request did not start a run. Every one of them wrote NOTHING: no ledger row, no Job, no change to the Scheduled
+    Job - a refused request is not an occurrence."""
+
+    NOT_FOUND = "not_found"
+    NOT_ACTIVE = "not_active"  # paused (by the user or the breaker), finished, cancelled, or still a proposal
+    ONE_TIME = "one_time"  # a one-time Scheduled Job runs ONCE, at its time: a manual run would make it run twice
+    DISABLED = "disabled"  # the global kill switch is off
+    EXPIRED = "expired"  # its approved period has ended
+    OVERLAP = "overlap"  # its previous run is still in flight
+    BREAKER = "breaker"  # its failure streak is at the limit
+    CAP = "cap"  # its own execution cap for the rolling 24 hours
+    GLOBAL_CAP = "global_cap"  # the daily cap across all Scheduled Jobs
+    BUSY = "busy"  # the global in-flight limit
+    DEVICE = "device"  # the device it was created from is not trusted
+    BLOCKED = "blocked"  # the adapter's runtime capability / boundary check refused
+    CHANGED = "changed"  # another request or tick acted on it first (a duplicate request, or a race)
+
+
+@dataclass(frozen=True)
+class ManualRunResult:
+    launched: bool
+    refusal: ManualRefusal | None = None
+    job_id: str | None = None
 
 
 class ScheduledJobScheduler:
@@ -205,6 +233,12 @@ class ScheduledJobScheduler:
             if settled.tripped:
                 result.paused += 1
         return False
+
+    def in_flight(self, scheduled_job_id: str) -> bool:
+        """Whether a run of this Scheduled Job is IN FLIGHT right now: the very definition overlap uses (its Job is pending, planning or
+        running - the states the JobEngine itself advances), after settling any run whose Job has already ended. A question only: it starts,
+        stops and changes nothing but that settlement."""
+        return self._in_flight(scheduled_job_id, TickResult()) > 0
 
     def _in_flight(self, schedule_id: str | None, result: TickResult) -> int:
         """How many runs are IN FLIGHT - of one Scheduled Job, or of all of them - after settling every one whose Job has already ended,
@@ -329,6 +363,71 @@ class ScheduledJobScheduler:
             return
         result.launched += 1
         logger.info("scheduled jobs: launched %s (%s)", scheduled_job.id, occurrence.occurrence)
+
+    # -- run it now ---------------------------------------------------------------------------------------------------------------
+
+    def run_now(self, scheduled_job_id: str) -> ManualRunResult:
+        """Start ONE run of an approved, ACTIVE Scheduled Job right now - through the very same gates as a due occurrence, in the same
+        order, and then the same adapter launch (so the same Job, profile, boundary check and ledger transaction):
+
+            kill switch -> active and inside its approved period -> overlap -> failure breaker -> this Scheduled Job's cap ->
+            the two GLOBAL limits -> device trust -> kill switch again -> the adapter's capability check and atomic launch
+
+        The ONE difference: a gate that stops a due occurrence CONSUMES it (a skipped ledger row, the schedule moves on); here a gate
+        merely REFUSES the request and writes nothing, because a refused request is not an occurrence - there is nothing to consume and
+        no history to fake. A manual run is the ledger's MANUAL kind: it counts as an execution for every cap, overlap and the breaker
+        (it IS one), but it does not move the schedule, so the next real occurrence is exactly where it was. Two requests racing for the
+        same state share one identity (see `ScheduledOccurrence.manual`): one launches, the other is refused as CHANGED."""
+        now = self._now()
+        if not self._is_enabled():
+            return ManualRunResult(False, ManualRefusal.DISABLED)
+        scheduled_job = self._store.get(scheduled_job_id)
+        if scheduled_job is None:
+            return ManualRunResult(False, ManualRefusal.NOT_FOUND)
+        if scheduled_job.status is not ScheduledJobStatus.ACTIVE or scheduled_job.due_at is None:
+            return ManualRunResult(False, ManualRefusal.NOT_ACTIVE)
+        if scheduled_job.schedule.kind is ScheduleKind.ONCE:
+            return ManualRunResult(False, ManualRefusal.ONE_TIME)
+        if scheduled_job.expires_at is not None and now >= scheduled_job.expires_at:
+            return ManualRunResult(False, ManualRefusal.EXPIRED)
+
+        result = TickResult()  # settling what has ended is bookkeeping the tick does too; its counts are not needed here
+        previous_in_flight = self._in_flight(scheduled_job.id, result) > 0
+        scheduled_job = self._store.get(scheduled_job_id)  # settling may have changed its version (or tripped the breaker)
+        if scheduled_job is None or scheduled_job.status is not ScheduledJobStatus.ACTIVE or scheduled_job.due_at is None:
+            return ManualRunResult(False, ManualRefusal.NOT_ACTIVE)
+        window_start = now - DAILY_WINDOW + _MICROSECOND
+        admission = admit(
+            previous_run_unsettled=previous_in_flight,
+            unsettled_total=self._in_flight(None, result),
+            runs_in_last_day=self._store.count_runs_since(window_start),
+            schedule_runs_in_last_day=self._store.count_runs_since(window_start, scheduled_job.id),
+            limits=self._limits,
+        )
+        if admission is Admission.SKIP_OVERLAP:
+            return ManualRunResult(False, ManualRefusal.OVERLAP)
+        if scheduled_job.consecutive_failures >= self._limits.breaker_failures:
+            return ManualRunResult(False, ManualRefusal.BREAKER)
+        if admission is Admission.SKIP_CAP:
+            return ManualRunResult(False, ManualRefusal.CAP)
+        if admission is Admission.DEFER_DAILY_CAP:
+            return ManualRunResult(False, ManualRefusal.GLOBAL_CAP)
+        if admission is Admission.DEFER_CONCURRENCY:
+            return ManualRunResult(False, ManualRefusal.BUSY)
+        if scheduled_job.created_via_device_id is not None and not self._is_trusted(scheduled_job.created_via_device_id):
+            return ManualRunResult(False, ManualRefusal.DEVICE)
+        if not self._is_enabled():  # thrown while we were deciding: still stops it
+            return ManualRunResult(False, ManualRefusal.DISABLED)
+
+        try:
+            launched = self._adapter.launch(scheduled_job, ScheduledOccurrence.manual(scheduled_job, self._now()))
+        except ExecutionRefused as refusal:
+            logger.info("scheduled jobs: run now refused for %s (%s)", scheduled_job.id, refusal)
+            return ManualRunResult(False, ManualRefusal.BLOCKED)
+        except (DuplicateOccurrenceError, StaleScheduledJobError):
+            return ManualRunResult(False, ManualRefusal.CHANGED)
+        logger.info("scheduled jobs: launched %s manually (%s)", scheduled_job.id, launched.run.occurrence)
+        return ManualRunResult(True, job_id=launched.job.id)
 
     # -- consuming an occurrence ------------------------------------------------------------------------------------------------
 
