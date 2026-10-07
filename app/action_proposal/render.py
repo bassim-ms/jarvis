@@ -103,6 +103,7 @@ def cannot_change(proposal: ActionProposal) -> str:
 
 
 NOTE_UNAVAILABLE = "I can't add the note step to this plan right now, so a yes won't save a note."
+TASK_UNAVAILABLE = "I can't add the task step to this plan right now, so a yes won't add a task."
 DROPPED = 'Okay - I\'ve dropped that plan. Say "make a plan" any time for a fresh one.'
 NOTHING_TO_DO = "Okay - without that there's nothing left for me to do, so I've dropped the plan."
 UNWIRED = "Understood - but I can't carry out my part yet, so nothing has been started."

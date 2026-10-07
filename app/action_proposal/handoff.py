@@ -13,10 +13,12 @@ born RUNNING (a PENDING Job would be planned by the model over the top of it). T
 ToolRegistry under the existing permission rules, with the existing single attempt, recovery and reporting. A step that is "Your part" has no
 `PlanStep` at all: a physical action can never become a tool call.
 
-THE ALLOW-LIST is two tools, `create_reminder` and `save_note`, each a SAFE_ACTION with its own fixed argument names (base.py); everything
-else - any other tool, a read-only one, one that needs confirmation, an unknown name - is refused here even if something upstream let it
-through, and nothing is created. A note is checked exactly like everything else, and more: its title and text must be present, single-line,
-within their bounds and exactly what was approved, and a plan carries at most one.
+THE ALLOW-LIST is three tools, `create_reminder`, `save_note` and `create_task`, each a SAFE_ACTION with its own fixed argument names
+(base.py); everything else - any other tool (`complete_task` and `cancel_task` among them), a read-only one, one that needs confirmation, an
+unknown name - is refused here even if something upstream let it through, and nothing is created. A note is checked exactly like everything
+else, and more: its title and text must be present, single-line, within their bounds and exactly what was approved, and a plan carries at
+most one. A task is the same: exactly one argument, `text` (no priority, due date or id), and it must be exactly what `task_text_ok` accepts;
+a plan carries at most one.
 
 FAILURE is honest and final: if the insert fails nothing was started, the user is told so, and nothing is retried or substituted. The reply is
 built BEFORE the insert; after it the only thing this handoff does is pass the new Job to the injected `on_started` (Slice 4 wires it to
@@ -41,6 +43,7 @@ from app.action_proposal.base import (
     NOTE_TITLE_LIMIT,
     ApprovedProposal,
     proposal_digest,
+    task_text_ok,
 )
 from app.morning_brief.gather import safe_text
 from app.orchestration.base import AutonomyLevel, PlanStep, RetryPolicy, StepStatus
@@ -109,6 +112,8 @@ class ExecutionHandoff:
                 return "unexpected arguments"
             if step.tool_name == "save_note" and not ExecutionHandoff._note_ok(step.arguments):
                 return "the note is not a plain, bounded title and text"
+            if step.tool_name == "create_task" and not ExecutionHandoff._task_ok(step.arguments):
+                return "the task is not a plain, bounded line of text"
             if not isinstance(step.id, str) or _STEP_ID.fullmatch(step.id) is None:
                 return "bad step id"
             if step.depends_on or step.expectation is not None or step.evaluation is not None:
@@ -119,6 +124,8 @@ class ExecutionHandoff:
                 return "a proposal's steps are attempted once"
         if sum(1 for step in plan if step.tool_name == "save_note") > 1:
             return "a plan saves one note"  # a note is not idempotent: never two from one approval
+        if sum(1 for step in plan if step.tool_name == "create_task") > 1:
+            return "a plan adds one task"  # nor is a task: never two from one approval
         return None
 
     @staticmethod
@@ -131,6 +138,12 @@ class ExecutionHandoff:
             if not isinstance(value, str) or not value or value != value.strip() or safe_text(value, limit) != value:
                 return False
         return True
+
+    @staticmethod
+    def _task_ok(arguments: dict) -> bool:
+        """Exactly one argument, `text`, and exactly a line the user's own words could have made - nothing a tool would have to trim, reinterpret
+        or default for us (the tool's own defaults apply to everything else)."""
+        return set(arguments) == ALLOWED_ARGUMENTS["create_task"] and task_text_ok(arguments["text"])
 
     @staticmethod
     def _reply(approved: ApprovedProposal) -> str:

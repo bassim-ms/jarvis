@@ -41,7 +41,7 @@ from app.action_proposal.base import (
     proposal_digest,
     task_stamp,
 )
-from app.action_proposal.builder import ProposalBuilder, ProposalError, is_note_step, plan_steps_for, reminder_zone
+from app.action_proposal.builder import ProposalBuilder, ProposalError, is_note_step, is_task_step, plan_steps_for, reminder_zone
 from app.action_proposal.recognition import (
     ACK,
     APPROVE,
@@ -120,7 +120,9 @@ class ActionProposalService:
             if reply is not None:
                 return reply
             request = parse_plan_request(message)
-            return None if request is None else self._create(request.subject, conversation_id, note=request.save_note)
+            if request is None:
+                return None
+            return self._create(request.subject, conversation_id, note=request.save_note, task_text=request.task_text)
         except Exception:  # noqa: BLE001 - a fault here is "not a proposal message": nothing was created
             return None
 
@@ -140,7 +142,7 @@ class ActionProposalService:
 
     # -- creating -----------------------------------------------------------------------------------------------------------------------
 
-    def _create(self, subject: str, conversation_id: str, *, note: bool = False) -> str | None:
+    def _create(self, subject: str, conversation_id: str, *, note: bool = False, task_text: str = "") -> str | None:
         if subject:
             # The same reading of "my <X> project" Focus itself uses: a subject with a clause in it is not ours to plan.
             request = parse_focus_request(f"I need to finish my {subject}")
@@ -153,11 +155,12 @@ class ActionProposalService:
             return None  # "make a plan for my coffee": nothing is known about it - ordinary conversation
         if decision.outcome != PICK:
             return render_decision(decision)  # ambiguous / unknown / nothing to rank: Focus's own question - no proposal is built
-        proposal = self._builder.build(decision, conversation_id, note=note)
+        proposal = self._builder.build(decision, conversation_id, note=note, task_text=task_text)
         if proposal is None:
             return render_decision(decision)
-        # A note the user asked for but that could not be offered is SAID, never silently left out.
+        # A note or a task the user asked for but that could not be offered is SAID, never silently left out.
         notice = words.NOTE_UNAVAILABLE + "\n" if note and not any(is_note_step(step) for step in proposal.steps) else ""
+        notice += words.TASK_UNAVAILABLE + "\n" if task_text and not any(is_task_step(step) for step in proposal.steps) else ""
         if not proposal.my_steps:  # nothing of Jarvis's to approve: shown, never pending
             return notice + words.render_proposal(proposal, approvable=False)
         self._hold(conversation_id, _Pending(proposal, self._monotonic() + self._ttl))

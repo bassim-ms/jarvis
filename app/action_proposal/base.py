@@ -13,9 +13,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
+
+from app.morning_brief.gather import HIDDEN, safe_text
 
 MAX_STEPS = 4
 TTL_SECONDS = 600.0  # an absolute lifetime: a follow-up question never extends it
@@ -25,6 +28,7 @@ MAX_ARGUMENT_TEXT = 100
 
 NOTE_TITLE_LIMIT = 100  # a saved plan's title, and the largest it may ever be
 NOTE_CONTENT_LIMIT = 400  # ... and its text: single line, built only from what the proposal already showed
+TASK_TEXT_LIMIT = 100  # the text of a task the user asked to add: their own words, one line, and the largest it may ever be
 
 #: The only tools a proposal may ever name, and the only arguments each may carry. A tool must ALSO be registered, plannable, schema-valid
 #: and a SAFE_ACTION (checked against the live registry whenever a proposal is built, again just before it is handed on, and once more by
@@ -32,9 +36,28 @@ NOTE_CONTENT_LIMIT = 400  # ... and its text: single line, built only from what 
 ALLOWED_ARGUMENTS = {
     "create_reminder": frozenset({"at", "day", "text"}),
     "save_note": frozenset({"title", "content"}),
+    "create_task": frozenset({"text"}),  # never a priority, a due date or an id: the tool's own defaults apply
 }
-ALLOWED_TOOLS = frozenset({"create_reminder", "save_note"})
+ALLOWED_TOOLS = frozenset({"create_reminder", "save_note", "create_task"})
 ALLOWED_PERMISSIONS = frozenset({"safe_action"})
+
+#: What a task the user asks for may be made of: words, digits and a little plain punctuation - and nothing that could be mistaken for
+#: markup, a quotation, a command separator or a second clause. The ONE definition: the request grammar, the builder and the handoff all use it.
+TASK_TEXT_CHARS = r"[\w ',\-./:+#()%@]"
+TASK_TEXT = re.compile(rf"\w{TASK_TEXT_CHARS}*")
+
+
+def task_text_ok(value: object) -> bool:
+    """Exactly a task the user may have asked for: a non-blank, trimmed, single clean line within its bound, made only of the plain characters
+    above, that the existing safe-text handling would show UNCHANGED (so it is neither cut short, nor altered, nor a hidden credential)."""
+    return (
+        isinstance(value, str)
+        and 0 < len(value) <= TASK_TEXT_LIMIT
+        and value == value.strip()
+        and TASK_TEXT.fullmatch(value) is not None
+        and value != HIDDEN
+        and safe_text(value, TASK_TEXT_LIMIT) == value
+    )
 
 
 @dataclass(frozen=True)

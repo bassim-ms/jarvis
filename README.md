@@ -172,7 +172,7 @@ jarvis/
       context.py           - FreshContextBuilder: the run's context, read anew every time from the existing Context Engine + memory facts
       adapter.py           - ScheduledExecutionAdapter: occurrence -> ONE ordinary PENDING Job, atomically with its ledger row
     orchestration/profiles.py - (Slice 2) run profiles: `unattended_v1`, a READ-only REDUCTION of what a Job may use (grants nothing)
-    action_proposal/       - (Productivity Action Loop, Slices 2-5) a temporary, in-memory plan the user can approve: honest 'Your part / My part' steps (My part: a reminder, or - if asked - saving the plan as a note); no Job until approval, no model; the verified one-time result report
+    action_proposal/       - (Productivity Action Loop, Slices 2-6) a temporary, in-memory plan the user can approve: honest 'Your part / My part' steps (My part: a reminder, or - if asked - saving the plan as a note and/or adding one task the user named); no Job until approval, no model; the verified one-time result report
     focus/                 - (Productivity Action Loop, Slice 1) read-only Focus: recognition / service (matching + deterministic ranking) / render; the last chat door, no state, no model
     scheduled_operations/  - (Scheduled Jobs V1, Slice 4 - creating, approving and managing them from chat; wired through main.py alone)
       language.py          - the fixed grammar: "every morning at 8, research X" / "what scheduled jobs do I have?" (no model; timing words are the reminders')
@@ -276,7 +276,7 @@ jarvis/
     test_scheduled_operations.py   - (Slice 4) request -> proposal -> existing confirmation -> atomic approval -> scheduler -> ordinary Job; management; security
     test_scheduled_operations_boundaries.py - (Slices 4-5) the layer cannot plan/run/launch/settle, imports no Handle This, adds no scheduler or store
     test_focus_recognition.py / test_focus_ranking.py / test_focus_service.py / test_focus_door.py / test_focus_interaction_precedence.py / test_focus_presentation.py - (Focus, Slice 1) the grammar boundary, the pure ranking, Tests A-D + untrusted text + bounds, door gating / precedence + package boundaries, a waiting question or confirmation always wins
-    test_action_proposal_recognition.py / _service.py / _door.py / _handoff.py / _execution.py / _result.py / _notes.py - (Action Proposal, Slices 2-5) the grammars, building / follow-ups / approval / revalidation, precedence in the real core, the store handoff and package boundary, the exact approved plan run by the real JobEngine (allow-list, refusals, failure, restart, pause/resume, no re-planning), the verified one-time result report (truth, conversation binding, exactly-once, bounds, hook safety), and the optional note step (grammar, shown in full, exact handoff, mixed outcomes, interruption)
+    test_action_proposal_recognition.py / _service.py / _door.py / _handoff.py / _execution.py / _result.py / _notes.py / _tasks.py - (Action Proposal, Slices 2-6) the grammars, building / follow-ups / approval / revalidation, precedence in the real core, the store handoff and package boundary, the exact approved plan run by the real JobEngine (allow-list, refusals, failure, restart, pause/resume, no re-planning), the verified one-time result report (truth, conversation binding, exactly-once, bounds, hook safety), and the optional note step (grammar, shown in full, exact handoff, mixed outcomes, interruption)
     test_scheduled_jobs_final.py   - (Slice 5) Run Now, result presentation, renewal, the full lifecycle, and the final security review
     test_automation_store.py       - unit tests for SQLiteAutomationStore (persistence, trigger/condition/action round-trip)
     test_automation_conditions.py  - unit tests for FactEqualsCondition/TimeWindowCondition/condition_from_dict
@@ -1608,6 +1608,43 @@ builder, the service's revalidation and the handoff.
   tell whether it happened - I did not retry it" (a restart can interrupt a write whose outcome is unknown). Report lines go through the existing
   credential filter unchanged: a saved note's result line carries its record id, which that filter hides, so the step is still verified from
   the stored result but its line may read as hidden.
+
+### Slice 6: a plan may also add one task
+
+A third tool joins `create_reminder` and `save_note` on the allow-list (`app/action_proposal/base.py`): **`create_task`**, a SAFE_ACTION that
+adds one TODO row to the Tasks store the proposal itself reads. Nothing else about tasks was added: `complete_task`, `cancel_task`,
+`list_tasks`, task ids, priorities and due dates are not reachable from a proposal, and the Task tool, `TaskStore` and every other part of the
+engine are unchanged.
+
+- **Only when asked, in one closed form.** A task step is offered only when the plan request ends "... **and add a task to** <what>" (also
+  "and also add ..." / "and then add ..." / "add task to ..."; "help me plan ..." works the same). It follows the optional note rider ("make a
+  plan and write it in a note and add a task to order the servo") - and being last, the task's own words run to the end of the message, so
+  nothing can follow them. Other ways of asking ("create a task", "make this a task", "save / store / keep a task", "remember to ...") are not
+  part of this grammar and never offer a task; neither is a task whose words hold a note rider or a second "add a task" (two requests in one
+  sentence is not understood, so nothing is done). A plain "make a plan" never offers one.
+- **Shown in full, created exactly.** The step reads `My part: I'll add a task "<text>" to your list.` The text is the user's own words: one
+  plain line (letters, digits, spaces and `' , - . / : + # ( ) % @` - no quotes, backticks, braces, brackets, semicolons, pipes, `&`, `$`,
+  backslashes or control characters), at most 100 characters, unchanged by the existing safe-text handling (so never cut short, altered, or
+  hiding a credential), runs of spaces collapsed to one before it is shown. That one definition (`task_text_ok`) is shared by the grammar, the
+  builder and the handoff. The text becomes the step's ONLY argument - `{"text": ...}` - and the tool's own defaults (medium priority, no due
+  date) apply. It is never rebuilt after approval. Text that cannot be offered (for example one that looks like a credential) is not
+  stored, and the reply says so.
+- **Strict handoff.** `create_task` takes exactly `text`, exactly what `task_text_ok` accepts, and a plan carries at most one. The plan
+  validator (`plan_steps_for`) now also refuses any argument that `ALLOWED_ARGUMENTS` does not name for a tool - the real `create_task` declares
+  `priority` and `due_date`, and no proposal may set them. Task text is data in a quoted slot: it can never name a tool or add an argument.
+- **Room.** `MAX_STEPS` is still 4. The task step is added after everything already offered; if the proposal is full (your two steps, a
+  reminder and a note), the task is not offered and the reply says so, with every other step unchanged. If it is the only step of Jarvis's, the
+  usual rule applies: nothing to approve. Skipping one of your steps leaves the task step alone (a note, if any, is rewritten in the same place);
+  skipping the task step removes only it.
+- **Identical text is not a duplicate.** Tasks have no uniqueness rule (two open tasks may have the same words - a chore that comes round
+  again), so nothing compares the text with the tasks that already exist, and an existing task with the same words neither blocks the offer nor
+  makes an approved proposal stale. What stops one approval creating two tasks is unchanged: the proposal is popped exactly once, the Job is
+  born RUNNING with one attempt and no re-planning, and a step found mid-run after a restart is never run again. A new task is not a referent
+  of the plan, so it has no `task_stamp`; the only freshness rules that apply to it are the proposal's digest, its age, and the day.
+- **Unchanged guarantees.** One approval pops one proposal and starts one RUNNING Job; no model, no Planner, no retry, no replanning, no
+  automatic continuation. Slice 4 reports the tool's own stored result unchanged ("Step 3: Task 'order the servo' created."): a failure is
+  reported as a failure, and an interrupted step as "I can't tell whether it happened - I did not retry it" - so a restart can leave zero or one
+  new task, never two.
 
 ## Persistent Automation Engine (M8)
 

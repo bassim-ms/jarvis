@@ -3,8 +3,9 @@ Reading what the user said to (or about) an Action Proposal - deterministic, bou
 
 Two small grammars, both closed:
 
-  * a REQUEST for a plan: "make a plan", "make a plan for my Arduino project", "help me plan my Arduino project" - optionally ending in
-    "and write it in a note" (the only way a note step is ever offered);
+  * a REQUEST for a plan: "make a plan", "make a plan for my Arduino project", "help me plan my Arduino project" - optionally followed by
+    "and write it in a note" (the only way a note step is ever offered) and then, last, by "and add a task to <what>" (the only way a task
+    step is ever offered; the task's own words run to the end of the message, so nothing can follow them);
   * a reply while a proposal is WAITING: approve, reject, a not-quite-yes ("ok"), a question ABOUT the plan, "skip step N", an
     unsupported change, or anything else (= unrelated).
 
@@ -17,9 +18,11 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from app.action_proposal.base import TASK_TEXT_CHARS, TASK_TEXT_LIMIT
 from app.focus.recognition import MAX_SUBJECT_TOKENS
 
 MAX_MESSAGE_CHARS = 120
+MAX_REQUEST_CHARS = 240  # a plan request that also carries a task: the plan request itself, a note rider, and up to TASK_TEXT_LIMIT characters
 
 APPROVE = "approve"
 REJECT = "reject"
@@ -166,19 +169,27 @@ _WORD = r"[a-z0-9][a-z0-9'\-]*"
 _SUBJECT = rf"(?P<subject>{_WORD}(?:\s+{_WORD}){{0,{MAX_SUBJECT_TOKENS - 1}}}?)"
 _MAKE = r"(?:make|give)(?:\s+me)?\s+a\s+plan"
 
-#: The one optional rider on a plan request: "... and write it in a note". Closed: nothing else may follow the plan request. These are the
-#: wordings the capability router leaves as ordinary conversation; a "save it ..." / "store it ..." / "keep it ..." request is routed elsewhere
-#: (a multi-step goal -> a Job) BEFORE this door sees it, so it is deliberately not part of this grammar.
+#: The optional riders on a plan request, in this order and no other: "... and write it in a note", then "... and add a task to <what>". Closed:
+#: nothing else may follow the plan request. These are the wordings the capability router leaves as ordinary conversation; a "save it ..." /
+#: "store it ..." / "keep it ..." request is routed elsewhere (a multi-step goal -> a Job) BEFORE this door sees it, so it is deliberately not
+#: part of this grammar - and neither is any other way of asking for a task ("create a task", "make this a task", "remember to ...").
 _IT = r"(?:it|this\s+plan|the\s+plan)"
-_NOTE = (
-    r"(?P<note>\s+(?:and\s+(?:(?:also|then)\s+)?(?:"
+_NOTE_PHRASE = (
+    r"(?:and\s+(?:(?:also|then)\s+)?(?:"
     + rf"write\s+{_IT}\s+(?:down\s+)?(?:in|as)\s+a\s+note|put\s+{_IT}\s+in\s+a\s+note|make\s+a\s+note\s+of\s+(?:it|this|the\s+plan)|note\s+{_IT}\s+down"
-    + r")|with\s+a\s+note))?"
+    + r")|with\s+a\s+note)"
 )
+_NOTE = rf"(?P<note>\s+{_NOTE_PHRASE})?"
+#: The task's own words run to the END of the message (lazily, so the sentence's closing punctuation is not part of them), drawn only from the
+#: plain characters `task_text_ok` allows and no more than its bound. Nothing can follow them, so they cannot carry a second request.
+_TASK_WORDS = rf"\w{TASK_TEXT_CHARS}{{0,{TASK_TEXT_LIMIT - 1}}}?"
+_TASK = rf"(?P<task>\s+and\s+(?:(?:also|then)\s+)?add\s+(?:a\s+)?task\s+to\s+(?P<task_text>{_TASK_WORDS}))?"
+#: Task words that themselves hold a note rider or another "add a task" are two requests in one sentence: not understood, so not acted on.
+_TASK_AMBIGUOUS = re.compile(_NOTE_PHRASE + r"|\badd\s+(?:a\s+)?task\b", re.IGNORECASE)
 
-_PLAN_GLOBAL = re.compile(_LEAD + _MAKE + _TAIL + _NOTE + _TAIL + _END, re.IGNORECASE)
+_PLAN_GLOBAL = re.compile(_LEAD + _MAKE + _TAIL + _NOTE + _TAIL + _TASK + _END, re.IGNORECASE)
 _PLAN_FOR = tuple(
-    re.compile(_LEAD + body + _TAIL + _NOTE + _TAIL + _END, re.IGNORECASE)
+    re.compile(_LEAD + body + _TAIL + _NOTE + _TAIL + _TASK + _END, re.IGNORECASE)
     for body in (
         _MAKE + r"\s+(?:for|to\s+finish|to\s+complete)\s+(?:my|the|our)\s+" + _SUBJECT,
         r"help\s+me\s+plan\s+(?:my|the|our)\s+" + _SUBJECT,
@@ -190,6 +201,17 @@ _PLAN_FOR = tuple(
 class PlanRequest:
     subject: str = ""  # what the user called it ("Arduino project"); empty for a plain "make a plan"
     save_note: bool = False  # "... and write it in a note": the user asked for the plan to be kept as a note
+    task_text: str = ""  # "... and add a task to <what>": the user's own words, one line; "" when no task was asked for. Not yet checked
+    #                      for safety - the builder offers it only if `task_text_ok`, and says so if it cannot.
+
+
+def _request(match: re.Match[str], subject: str) -> PlanRequest | None:
+    task_text = ""
+    if match.group("task"):
+        task_text = " ".join(match.group("task_text").split())  # runs of spaces are one space: what is shown is what is stored
+        if not task_text or _TASK_AMBIGUOUS.search(task_text):
+            return None
+    return PlanRequest(subject=subject, save_note=bool(match.group("note")), task_text=task_text)
 
 
 def parse_plan_request(message: object) -> PlanRequest | None:
@@ -198,13 +220,16 @@ def parse_plan_request(message: object) -> PlanRequest | None:
     if not isinstance(message, str):
         return None
     text = message.strip()
-    if not text or len(text) > MAX_MESSAGE_CHARS or "\n" in text or "\r" in text:
+    if not text or len(text) > MAX_REQUEST_CHARS or "\n" in text or "\r" in text:
         return None
     match = _PLAN_GLOBAL.match(text)
-    if match is not None:
-        return PlanRequest(save_note=bool(match.group("note")))
-    for pattern in _PLAN_FOR:
-        match = pattern.match(text)
-        if match is not None:
-            return PlanRequest(subject=match.group("subject").strip(), save_note=bool(match.group("note")))
-    return None
+    if match is None:
+        for pattern in _PLAN_FOR:
+            match = pattern.match(text)
+            if match is not None:
+                break
+    if match is None:
+        return None
+    if len(text) > MAX_MESSAGE_CHARS and not match.group("task"):
+        return None  # only a request that carries a task may be longer than any other message
+    return _request(match, (match.groupdict().get("subject") or "").strip())
