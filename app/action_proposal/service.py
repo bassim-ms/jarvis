@@ -19,7 +19,7 @@ so a later "yes" can never approve an old proposal. (A count of stored messages 
 WHAT AN APPROVAL COVERS. Exactly the steps that were shown: the plan handed on is rebuilt from those same stored steps, the digest is
 recomputed from live data (a task that changed or was finished makes it stale), and every tool call is validated again against the live
 registry. Any doubt - stale, expired, wrong conversation, already consumed - creates nothing. This module has no model, no Planner, no
-JobStore and no way to create a Job: the Slice 3 handoff is a callback (`on_approved`) that is simply absent until Slice 3 provides it.
+JobStore and no way to create a Job: the handoff is a callback (`on_approved`, see handoff.py) - absent, the approval says nothing was started.
 """
 
 from __future__ import annotations
@@ -74,7 +74,7 @@ class _Pending:
 
 class ActionProposalService:
     """`focus` needs only `decide(FocusRequest)`; `tasks` is read-only (`get`); `tools` is the live registry (validated against, never
-    executed). `on_approved(ApprovedProposal) -> str` is the Slice 3 handoff - `None` (the default) means nothing can be started yet, and an approval says so."""
+    executed). `on_approved(ApprovedProposal) -> str` is the handoff that starts the approved steps (handoff.py) - `None` (the default) means nothing can be started, and an approval says so."""
 
     def __init__(
         self,

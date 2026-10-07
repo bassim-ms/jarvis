@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.action_proposal import ActionProposalService
+from app.action_proposal import ActionProposalService, ExecutionHandoff
 from app.capability import DeterministicCapabilityRouter
 from app.core import JarvisCore
 from app.focus import FocusService
@@ -402,12 +402,12 @@ def test_a_fault_in_the_proposal_service_is_not_a_proposal_message(tmp_path):
 # ======================================================= the real application ============================================================
 
 
-def test_the_real_application_wires_proposals_with_no_handoff_and_no_new_tool():
+def test_the_real_application_wires_proposals_to_the_execution_handoff_and_adds_no_tool():
     import app.main as live
 
     service = live.core.action_proposals
     assert isinstance(service, ActionProposalService)
-    assert service.on_approved is None  # Slice 3 supplies it: until then nothing can be started
+    assert isinstance(service.on_approved, ExecutionHandoff)  # the one boundary an approved proposal leaves through (Slice 3)
     assert service.focus is live.core.focus and service.tools is live.core.tools and service.tasks is live._task_store
     assert not [name for name in live.core.tools._tools if "proposal" in name]
     assert service.command_reply("what is the capital of France?", "c1") is None and service.pending_count() == 0

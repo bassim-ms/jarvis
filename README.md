@@ -276,7 +276,7 @@ jarvis/
     test_scheduled_operations.py   - (Slice 4) request -> proposal -> existing confirmation -> atomic approval -> scheduler -> ordinary Job; management; security
     test_scheduled_operations_boundaries.py - (Slices 4-5) the layer cannot plan/run/launch/settle, imports no Handle This, adds no scheduler or store
     test_focus_recognition.py / test_focus_ranking.py / test_focus_service.py / test_focus_door.py / test_focus_interaction_precedence.py / test_focus_presentation.py - (Focus, Slice 1) the grammar boundary, the pure ranking, Tests A-D + untrusted text + bounds, door gating / precedence + package boundaries, a waiting question or confirmation always wins
-    test_action_proposal_recognition.py / _service.py / _door.py / _handoff.py - (Action Proposal, Slice 2) the grammars, building / follow-ups / approval / revalidation, precedence in the real core, the Slice 3 handoff and the package boundary
+    test_action_proposal_recognition.py / _service.py / _door.py / _handoff.py / _execution.py - (Action Proposal, Slices 2-3) the grammars, building / follow-ups / approval / revalidation, precedence in the real core, the store handoff and package boundary, and the exact approved plan run by the real JobEngine (allow-list, refusals, failure, restart, pause/resume, no re-planning)
     test_scheduled_jobs_final.py   - (Slice 5) Run Now, result presentation, renewal, the full lifecycle, and the final security review
     test_automation_store.py       - unit tests for SQLiteAutomationStore (persistence, trigger/condition/action round-trip)
     test_automation_conditions.py  - unit tests for FactEqualsCondition/TimeWindowCondition/condition_from_dict
@@ -1536,13 +1536,34 @@ resolver.
   a plan while an interaction waits on the conversation.
 - **Approval covers exactly what was shown.** The reply is a pure function of the stored steps; an approval POPS the proposal (exactly once),
   recomputes its digest from LIVE data (a task that was finished, changed or cancelled makes it stale), validates every tool call again and
-  checks the day and the reminder time - any doubt creates nothing. Only then is the exact proposal handed to `on_approved`, the Slice 3
-  handoff, which is deliberately unset: until Slice 3 provides it an approval says nothing was started.
+  checks the day and the reminder time - any doubt creates nothing. Only then is the exact proposal handed to `on_approved`, the one boundary it
+  leaves through (Slice 3, below).
 - **The handoff infrastructure.** `SQLiteJobStore.create_running_job` inserts a Job BORN RUNNING with an already-validated plan in one atomic
   insert (a PENDING Job would be planned by the model over the top of it), with its replan budget already spent. The engine, planner and
   permission rules are unchanged: each step still runs under its own permission and confirmation rules.
 - **Untrusted text** (tasks, projects) appears only as quoted data, bounded, with credentials hidden; it is never parsed, and a tool name
   can only come from the fixed allow-list (`create_reminder`).
+
+### Slice 3: an approved proposal becomes one running Job
+
+`app/action_proposal/handoff.py` - `ExecutionHandoff`, wired as `on_approved` in `app/main.py` - is the ONLY place a Job can come from a
+proposal, and it runs only after a valid approval (popped once, revalidated against live data). It checks, once more, that what would run is
+EXACTLY what was approved, then starts ONE Job through the existing `SQLiteJobStore.create_running_job`:
+
+- **Exactly the approved plan.** The validated `PlanStep`s Slice 2 built for the "My part" steps, with their exact arguments, one attempt
+  (`max_attempts=1`), no dependencies or expectations; "Your part" steps never become anything. The Job is born RUNNING (never PENDING - the
+  engine would plan a PENDING Job with the model), `ASSISTED`, with its replan budget already spent, tied to the conversation; its provenance
+  (proposal id and digest) rides in the existing `context`. No Job schema field was added.
+- **One tool.** The allow-list is `create_reminder`, as a SAFE_ACTION. Every other tool - read-only ones, `create_task`, `complete_task`,
+  `analyze`, anything model-backed, anything needing confirmation, anything unknown - is refused here even if something upstream let it through,
+  and so is any step that is not fresh, validated and identical to the approved action.
+- **The existing engine does the rest.** The JobEngine runs the step through the ToolRegistry under the existing permission rules, records the
+  result, never re-runs an interrupted step, and reports through the existing paths ("is that finished?" answers from the Job; a failure is
+  announced). No model, Planner or provider is called anywhere on this path. Nothing here adds a retry, timeout, recovery, notification or
+  progress system.
+- **Honest failure.** If the insert fails, nothing was started and the user is told so; it is attempted once, never retried, and there is no
+  fallback Job. A refused hand-off says so and creates nothing. The reply claims only that the part was STARTED; what happened is reported
+  from the Job itself.
 
 ## Persistent Automation Engine (M8)
 

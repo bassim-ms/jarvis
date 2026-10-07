@@ -42,7 +42,7 @@ from app.config import settings
 from app.context_engine.factory import create_default_context_engine
 from app.context_planning.factory import create_default_context_planner
 from app.context_reasoning.factory import create_default_context_reasoner
-from app.action_proposal import ActionProposalService
+from app.action_proposal import ActionProposalService, ExecutionHandoff
 from app.focus import FocusService
 from app.handle_this.base import GoalFamily
 from app.handle_this.boundary import DEFAULT_BOUNDARY
@@ -449,13 +449,16 @@ core.focus = FocusService(
 )
 
 # Action Proposals (app/action_proposal/): "make a plan" - a few honest steps built from what Focus decided, shown, and held IN MEMORY for a
-# few minutes, bound to one conversation. It creates no Job, runs no tool, calls no model and writes nothing; a yes only hands the exact,
-# revalidated proposal on, and `on_approved` (the Slice 3 handoff) is deliberately left unset - so nothing can be started yet.
+# few minutes, bound to one conversation. Until a yes it creates no Job, runs no tool, calls no model and writes nothing; a valid yes pops the
+# proposal, revalidates it against live data and hands the exact approved steps to `on_approved` (Slice 3), which starts ONE Job.
 core.action_proposals = ActionProposalService(
     focus=core.focus,
     tasks=_task_store,
     tools=core.tools,
     clock=lambda: datetime.now().astimezone(),
+    # An approved, revalidated proposal becomes ONE Job, born RUNNING with exactly the approved steps (never PENDING: the engine would plan it
+    # with the model). The existing JobEngine runs it through the existing ToolRegistry and permission rules.
+    on_approved=ExecutionHandoff(_job_store.create_running_job),
 )
 
 # Observation + the narrow set of computer tools a Job may use (Slices 4-5, see app/observation/): the observe ->

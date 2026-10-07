@@ -23,10 +23,10 @@ MAX_PENDING = 20  # proposals held at once (one per conversation), oldest evicte
 MAX_STEP_TEXT = 260
 MAX_ARGUMENT_TEXT = 100
 
-#: The only tools a proposal may ever name. A tool must ALSO be registered, plannable, schema-valid and READ or SAFE_ACTION (checked
-#: against the live registry whenever a proposal is built and again just before it is handed on).
+#: The only tools a proposal may ever name. A tool must ALSO be registered, plannable, schema-valid and a SAFE_ACTION (checked against the
+#: live registry whenever a proposal is built, again just before it is handed on, and once more by the handoff that starts it).
 ALLOWED_TOOLS = frozenset({"create_reminder"})
-ALLOWED_PERMISSIONS = frozenset({"read", "safe_action"})
+ALLOWED_PERMISSIONS = frozenset({"safe_action"})
 
 
 @dataclass(frozen=True)
