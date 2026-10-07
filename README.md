@@ -276,7 +276,7 @@ jarvis/
     test_scheduled_operations.py   - (Slice 4) request -> proposal -> existing confirmation -> atomic approval -> scheduler -> ordinary Job; management; security
     test_scheduled_operations_boundaries.py - (Slices 4-5) the layer cannot plan/run/launch/settle, imports no Handle This, adds no scheduler or store
     test_focus_recognition.py / test_focus_ranking.py / test_focus_service.py / test_focus_door.py / test_focus_interaction_precedence.py / test_focus_presentation.py - (Focus, Slice 1) the grammar boundary, the pure ranking, Tests A-D + untrusted text + bounds, door gating / precedence + package boundaries, a waiting question or confirmation always wins
-    test_action_proposal_recognition.py / _service.py / _door.py / _handoff.py / _execution.py - (Action Proposal, Slices 2-3) the grammars, building / follow-ups / approval / revalidation, precedence in the real core, the store handoff and package boundary, and the exact approved plan run by the real JobEngine (allow-list, refusals, failure, restart, pause/resume, no re-planning)
+    test_action_proposal_recognition.py / _service.py / _door.py / _handoff.py / _execution.py / _result.py - (Action Proposal, Slices 2-4) the grammars, building / follow-ups / approval / revalidation, precedence in the real core, the store handoff and package boundary, the exact approved plan run by the real JobEngine (allow-list, refusals, failure, restart, pause/resume, no re-planning), and the verified one-time result report (truth, conversation binding, exactly-once, bounds, hook safety)
     test_scheduled_jobs_final.py   - (Slice 5) Run Now, result presentation, renewal, the full lifecycle, and the final security review
     test_automation_store.py       - unit tests for SQLiteAutomationStore (persistence, trigger/condition/action round-trip)
     test_automation_conditions.py  - unit tests for FactEqualsCondition/TimeWindowCondition/condition_from_dict
@@ -1564,6 +1564,25 @@ EXACTLY what was approved, then starts ONE Job through the existing `SQLiteJobSt
 - **Honest failure.** If the insert fails, nothing was started and the user is told so; it is attempted once, never retried, and there is no
   fallback Job. A refused hand-off says so and creates nothing. The reply claims only that the part was STARTED; what happened is reported
   from the Job itself.
+
+### Slice 4: verification and one result
+
+`app/action_proposal/result.py` - `ResultReports`, wired in `app/main.py` - tells the user how the started Job REALLY turned out, once, and
+stops: `one approval -> one execution -> one verification -> one result -> an optional suggestion -> STOP`.
+
+- **Pulled, not pushed.** The handoff registers the Job it started (a bounded, in-memory watch bound to its `conversation_id`). When the Job
+  reaches a terminal state (read from the Job store at the engine's tick, or lazily at the next message) it becomes ONE pending report; the
+  next reply in THAT conversation appends it through a small, exception-safe hook in `app/core.py` and consumes it. Another conversation never
+  sees it, a duplicate or repeated watch never makes a second report, and a message that fails does not consume it. Nothing is stored, so a
+  restart forgets pending reports ("is that finished?" still answers from the Job). No notification channel, Job field or schema was added.
+- **Deterministic truth.** Success needs the Job COMPLETED, every step SUCCEEDED, and a stored tool result whose own status is `success` with a
+  message - and that stored message is what is shown, never the plan's intended value. A failed Job or tool, an interrupted step ("not
+  automatically retried"), a cancelled Job and a malformed or missing result are each reported as exactly that - never as success. No model,
+  Planner or provider is involved.
+- **Bounded.** 50 watches, 50 pending reports and 3 per conversation; a full registry drops its OLDEST entry, never another conversation's.
+- **Read-only, no continuation.** It only reads a Job by id: it never creates a Job, runs a tool, approves or builds a proposal or retries
+  anything. The suggestion after a success is one sentence (ask what to focus on - nothing runs unless you approve it); acting on it goes back
+  through the Action Proposal and its approval.
 
 ## Persistent Automation Engine (M8)
 

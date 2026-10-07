@@ -258,6 +258,7 @@ class JarvisCore:
         scheduled_job_operations=None,
         focus=None,
         action_proposals=None,
+        result_reports=None,
     ):
         self.provider = provider or create_default_ai_provider_manager()
         self.memory = memory or SQLiteMemoryStore(settings.memory_db_path)
@@ -362,6 +363,9 @@ class JarvisCore:
         # offered a message only after every other owner (the interaction resolver, every real confirmation, every other door) has declined
         # it. `None` (every existing caller/test): ordinary chat.
         self.action_proposals = action_proposals
+        # Slice 4: `take(conversation_id)` returns (and consumes) the verified result of a Job an approved proposal started in THIS
+        # conversation, appended to the reply to the next message - pulled, never pushed. Best-effort. `None`: nothing is appended.
+        self.result_reports = result_reports
         self.router = router or SearchRouter()
         # Reuses self.provider by default, so injecting a fake AIProvider
         # into Core (as tests do) covers the SEARCH path's answer
@@ -1002,6 +1006,16 @@ class JarvisCore:
             if urgent_items:
                 lines = " ".join(item.event.text for item in urgent_items)
                 reply = f"{reply}\n\nThis was urgent and I had no way to reach you: {lines}"
+
+        # How a Job that an approved Action Proposal started in this conversation turned out, told once (see action_proposal/result.py).
+        # Read-only and best-effort: it runs nothing, and if it fails the reply is unchanged.
+        if self.result_reports is not None:
+            try:
+                finished = self.result_reports.take(conversation_id)
+            except Exception:  # noqa: BLE001
+                finished = None
+            if finished and isinstance(finished, str):
+                reply = f"{reply}\n\n{finished}"
 
         # Surface anything now waiting on the user in this conversation (its
         # own Jobs' and background Jobs' questions/confirmations), which is

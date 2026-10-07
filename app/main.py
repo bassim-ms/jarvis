@@ -42,7 +42,7 @@ from app.config import settings
 from app.context_engine.factory import create_default_context_engine
 from app.context_planning.factory import create_default_context_planner
 from app.context_reasoning.factory import create_default_context_reasoner
-from app.action_proposal import ActionProposalService, ExecutionHandoff
+from app.action_proposal import ActionProposalService, ExecutionHandoff, ResultReports
 from app.focus import FocusService
 from app.handle_this.base import GoalFamily
 from app.handle_this.boundary import DEFAULT_BOUNDARY
@@ -458,8 +458,12 @@ core.action_proposals = ActionProposalService(
     clock=lambda: datetime.now().astimezone(),
     # An approved, revalidated proposal becomes ONE Job, born RUNNING with exactly the approved steps (never PENDING: the engine would plan it
     # with the model). The existing JobEngine runs it through the existing ToolRegistry and permission rules.
-    on_approved=ExecutionHandoff(_job_store.create_running_job),
+    on_approved=ExecutionHandoff(_job_store.create_running_job, on_started=lambda job: core.result_reports.watch(job)),
 )
+# Slice 4: how that Job turned out, verified from its own stored state and told ONCE, in the next reply in the same conversation (pulled, in
+# memory, nothing pushed). Read-only: it only ever calls the Job store's `get`.
+core.result_reports = ResultReports(_job_store.get)
+job_engine.add_tick_hook(core.result_reports.poll)
 
 # Observation + the narrow set of computer tools a Job may use (Slices 4-5, see app/observation/): the observe ->
 # act -> observe -> verify loop runs on the EXISTING Planner / JobEngine / ToolRegistry, so the JOB-facing registry

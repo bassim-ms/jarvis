@@ -17,7 +17,9 @@ THE ALLOW-LIST is one tool, `create_reminder`, as a SAFE_ACTION; everything else
 an unknown name - is refused here even if something upstream let it through, and nothing is created.
 
 FAILURE is honest and final: if the insert fails nothing was started, the user is told so, and nothing is retried or substituted. The reply is
-built BEFORE the insert, so nothing fallible happens after a Job exists.
+built BEFORE the insert; after it the only thing this handoff does is pass the new Job to the injected `on_started` (Slice 4 wires it to
+`ResultReports.watch`), and an exception from that callback is swallowed, so it can never turn a created Job into a failed handoff. What the
+callback does, and the rest of the result lifecycle, belong to result.py, not to this module.
 """
 
 from __future__ import annotations
@@ -49,8 +51,9 @@ class ExecutionHandoff:
     """`start(goal, steps, *, context, conversation_id, autonomy)` is the store's atomic insert of a Job born RUNNING with an already-validated
     plan (injected, so this package never touches a Job store). Called with an `ApprovedProposal`, the instance returns what the user is told."""
 
-    def __init__(self, start: Callable[..., Any]):
+    def __init__(self, start: Callable[..., Any], on_started: Callable[[Any], Any] | None = None):
         self._start = start
+        self._on_started = on_started  # Slice 4: told about the Job once it exists (result.py); never able to change the outcome
 
     def __call__(self, approved: ApprovedProposal) -> str:
         if self.problem(approved) is not None:
@@ -58,7 +61,7 @@ class ExecutionHandoff:
         reply = self._reply(approved)  # built first: nothing fallible happens once a Job exists
         goal = safe_text(f"Action plan: {approved.subject}", MAX_ARGUMENT_TEXT) if approved.subject else "Action plan"
         try:
-            self._start(
+            job = self._start(
                 goal,
                 list(approved.plan_steps),
                 context={"source": "action_proposal", "proposal_id": approved.proposal_id, "digest": approved.digest},
@@ -67,6 +70,11 @@ class ExecutionHandoff:
             )
         except Exception:  # noqa: BLE001 - one attempt, no retry, no fallback Job: nothing was started and the user is told so
             return words.FAILED
+        if self._on_started is not None and job is not None:
+            try:
+                self._on_started(job)
+            except Exception:  # noqa: BLE001 - the Job exists and runs regardless; at worst its result is not volunteered later
+                pass
         return reply
 
     # -- the check: what runs must be exactly what was approved, and nothing the allow-list does not name -----------------------------

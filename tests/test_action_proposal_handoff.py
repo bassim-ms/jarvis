@@ -266,7 +266,7 @@ def test_the_registry_is_asked_every_time(tmp_path):
 PACKAGE = pathlib.Path(__file__).resolve().parent.parent / "app" / "action_proposal"
 ALLOWED_APP_IMPORTS = {
     "app.action_proposal", "app.action_proposal.base", "app.action_proposal.builder", "app.action_proposal.recognition",
-    "app.action_proposal.render", "app.action_proposal.service", "app.action_proposal.handoff",
+    "app.action_proposal.render", "app.action_proposal.service", "app.action_proposal.handoff", "app.action_proposal.result",
     "app.focus.base", "app.focus.recognition", "app.focus.render",  # Focus is called, never changed
     "app.context_engine.scoring", "app.morning_brief.gather", "app.tasks.base",
     "app.orchestration.base", "app.orchestration.validator",  # the existing plan validator and its types - no store, no engine
@@ -285,7 +285,7 @@ def _modules(path):
 
 def test_the_package_imports_only_the_agreed_existing_helpers_and_the_standard_library():
     files = sorted(PACKAGE.glob("*.py"))
-    assert {f.name for f in files} == {"__init__.py", "base.py", "builder.py", "handoff.py", "recognition.py", "render.py", "service.py"}
+    assert {f.name for f in files} == {"__init__.py", "base.py", "builder.py", "handoff.py", "recognition.py", "render.py", "result.py", "service.py"}
     for path in files:
         for module in _modules(path):
             top = module.split(".")[0]
