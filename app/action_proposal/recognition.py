@@ -3,7 +3,8 @@ Reading what the user said to (or about) an Action Proposal - deterministic, bou
 
 Two small grammars, both closed:
 
-  * a REQUEST for a plan: "make a plan", "make a plan for my Arduino project", "help me plan my Arduino project";
+  * a REQUEST for a plan: "make a plan", "make a plan for my Arduino project", "help me plan my Arduino project" - optionally ending in
+    "and write it in a note" (the only way a note step is ever offered);
   * a reply while a proposal is WAITING: approve, reject, a not-quite-yes ("ok"), a question ABOUT the plan, "skip step N", an
     unsupported change, or anything else (= unrelated).
 
@@ -165,9 +166,19 @@ _WORD = r"[a-z0-9][a-z0-9'\-]*"
 _SUBJECT = rf"(?P<subject>{_WORD}(?:\s+{_WORD}){{0,{MAX_SUBJECT_TOKENS - 1}}}?)"
 _MAKE = r"(?:make|give)(?:\s+me)?\s+a\s+plan"
 
-_PLAN_GLOBAL = re.compile(_LEAD + _MAKE + _TAIL + _END, re.IGNORECASE)
+#: The one optional rider on a plan request: "... and write it in a note". Closed: nothing else may follow the plan request. These are the
+#: wordings the capability router leaves as ordinary conversation; a "save it ..." / "store it ..." / "keep it ..." request is routed elsewhere
+#: (a multi-step goal -> a Job) BEFORE this door sees it, so it is deliberately not part of this grammar.
+_IT = r"(?:it|this\s+plan|the\s+plan)"
+_NOTE = (
+    r"(?P<note>\s+(?:and\s+(?:(?:also|then)\s+)?(?:"
+    + rf"write\s+{_IT}\s+(?:down\s+)?(?:in|as)\s+a\s+note|put\s+{_IT}\s+in\s+a\s+note|make\s+a\s+note\s+of\s+(?:it|this|the\s+plan)|note\s+{_IT}\s+down"
+    + r")|with\s+a\s+note))?"
+)
+
+_PLAN_GLOBAL = re.compile(_LEAD + _MAKE + _TAIL + _NOTE + _TAIL + _END, re.IGNORECASE)
 _PLAN_FOR = tuple(
-    re.compile(_LEAD + body + _TAIL + _END, re.IGNORECASE)
+    re.compile(_LEAD + body + _TAIL + _NOTE + _TAIL + _END, re.IGNORECASE)
     for body in (
         _MAKE + r"\s+(?:for|to\s+finish|to\s+complete)\s+(?:my|the|our)\s+" + _SUBJECT,
         r"help\s+me\s+plan\s+(?:my|the|our)\s+" + _SUBJECT,
@@ -178,6 +189,7 @@ _PLAN_FOR = tuple(
 @dataclass(frozen=True)
 class PlanRequest:
     subject: str = ""  # what the user called it ("Arduino project"); empty for a plain "make a plan"
+    save_note: bool = False  # "... and write it in a note": the user asked for the plan to be kept as a note
 
 
 def parse_plan_request(message: object) -> PlanRequest | None:
@@ -188,10 +200,11 @@ def parse_plan_request(message: object) -> PlanRequest | None:
     text = message.strip()
     if not text or len(text) > MAX_MESSAGE_CHARS or "\n" in text or "\r" in text:
         return None
-    if _PLAN_GLOBAL.match(text):
-        return PlanRequest()
+    match = _PLAN_GLOBAL.match(text)
+    if match is not None:
+        return PlanRequest(save_note=bool(match.group("note")))
     for pattern in _PLAN_FOR:
         match = pattern.match(text)
         if match is not None:
-            return PlanRequest(subject=match.group("subject").strip())
+            return PlanRequest(subject=match.group("subject").strip(), save_note=bool(match.group("note")))
     return None

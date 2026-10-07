@@ -282,7 +282,7 @@ def test_the_valid_baseline_is_accepted_by_the_handoff():
     "tool,permission",
     [
         ("create_task", "safe_action"), ("complete_task", "safe_action"), ("cancel_task", "safe_action"), ("create_reminder_x", "safe_action"),
-        ("analyze", "read"), ("list_tasks", "read"), ("web_search", "read"), ("list_events", "read"), ("save_note", "safe_action"),
+        ("analyze", "read"), ("list_tasks", "read"), ("web_search", "read"), ("list_events", "read"), ("list_notes", "read"),
         ("create_event", "confirm"), ("update_event", "confirm"), ("delete_event", "dangerous"), ("create_job", "safe_action"),
         ("confirm_job", "safe_action"), ("run_automation", "safe_action"), ("open_url", "safe_action"), ("not_a_tool", "safe_action"),
         ("", "safe_action"), ("CREATE_REMINDER", "safe_action"), ("create_reminder ", "safe_action"), ("create_reminder;delete_event", "safe_action"),
@@ -611,7 +611,7 @@ def test_stored_text_cannot_inject_a_tool_name_an_argument_or_a_step(tmp_path, h
 def test_the_only_executable_tool_is_a_fixed_allow_list_not_a_property_of_the_text():
     from app.action_proposal.base import ALLOWED_TOOLS
 
-    assert ALLOWED_TOOLS == frozenset({"create_reminder"})
+    assert ALLOWED_TOOLS == frozenset({"create_reminder", "save_note"})  # Slice 5: exactly these two, nothing else
 
 
 # ====================================================== no model, no planner, no provider anywhere in the path ===========================

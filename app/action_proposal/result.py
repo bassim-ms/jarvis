@@ -33,6 +33,7 @@ MAX_SEEN = 500  # job ids already watched or reported, so a repeat can never pre
 MAX_LINE = 240
 
 _GOAL_PREFIX = "Action plan:"
+_INTERRUPTED = "Interrupted"  # how the engine words a step it found mid-run after a restart (app/orchestration/engine.py)
 
 SUCCESS_SUGGESTION = "If you'd like a next step, ask me what to focus on and I'll propose it - nothing runs unless you approve it."
 FAILURE_SUGGESTION = "Nothing was retried or changed. If you still want this, ask me to make a plan again and I'll show it to you first."
@@ -84,7 +85,10 @@ def verify(job: Any) -> tuple[str, list[str]]:
         elif step_status is StepStatus.FAILED:
             stored = getattr(step, "result", None)
             reason = _line(getattr(step, "error", None)) or _line(stored.get("message") if isinstance(stored, dict) else None)
-            facts.append(f"Step {number} didn't work: {reason or 'no reason was recorded'}")
+            if reason.startswith(_INTERRUPTED):  # the engine marked it so on a restart: whether it took effect is NOT known
+                facts.append(f"Step {number} was interrupted by a restart, so I can't tell whether it happened - I did not retry it.")
+            else:
+                facts.append(f"Step {number} didn't work: {reason or 'no reason was recorded'}")
         else:
             facts.append(f"Step {number} did not run.")
     if status is JobStatus.COMPLETED:

@@ -239,8 +239,8 @@ def test_what_runs_is_what_was_shown_and_never_re_planned(tmp_path):
 # =============================================== what a proposal may ever ask for =========================================================
 
 
-def test_only_a_reminder_may_be_proposed_and_only_as_a_safe_action():
-    assert ALLOWED_TOOLS == frozenset({"create_reminder"}) and ALLOWED_PERMISSIONS == frozenset({"safe_action"})
+def test_only_a_reminder_or_a_note_may_be_proposed_and_only_as_a_safe_action():
+    assert ALLOWED_TOOLS == frozenset({"create_reminder", "save_note"}) and ALLOWED_PERMISSIONS == frozenset({"safe_action"})
 
 
 def test_the_registry_is_asked_every_time(tmp_path):

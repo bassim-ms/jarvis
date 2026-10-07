@@ -41,7 +41,7 @@ from app.action_proposal.base import (
     proposal_digest,
     task_stamp,
 )
-from app.action_proposal.builder import ProposalBuilder, ProposalError, plan_steps_for, reminder_zone
+from app.action_proposal.builder import ProposalBuilder, ProposalError, is_note_step, plan_steps_for, reminder_zone
 from app.action_proposal.recognition import (
     ACK,
     APPROVE,
@@ -120,7 +120,7 @@ class ActionProposalService:
             if reply is not None:
                 return reply
             request = parse_plan_request(message)
-            return None if request is None else self._create(request.subject, conversation_id)
+            return None if request is None else self._create(request.subject, conversation_id, note=request.save_note)
         except Exception:  # noqa: BLE001 - a fault here is "not a proposal message": nothing was created
             return None
 
@@ -140,7 +140,7 @@ class ActionProposalService:
 
     # -- creating -----------------------------------------------------------------------------------------------------------------------
 
-    def _create(self, subject: str, conversation_id: str) -> str | None:
+    def _create(self, subject: str, conversation_id: str, *, note: bool = False) -> str | None:
         if subject:
             # The same reading of "my <X> project" Focus itself uses: a subject with a clause in it is not ours to plan.
             request = parse_focus_request(f"I need to finish my {subject}")
@@ -153,13 +153,15 @@ class ActionProposalService:
             return None  # "make a plan for my coffee": nothing is known about it - ordinary conversation
         if decision.outcome != PICK:
             return render_decision(decision)  # ambiguous / unknown / nothing to rank: Focus's own question - no proposal is built
-        proposal = self._builder.build(decision, conversation_id)
+        proposal = self._builder.build(decision, conversation_id, note=note)
         if proposal is None:
             return render_decision(decision)
+        # A note the user asked for but that could not be offered is SAID, never silently left out.
+        notice = words.NOTE_UNAVAILABLE + "\n" if note and not any(is_note_step(step) for step in proposal.steps) else ""
         if not proposal.my_steps:  # nothing of Jarvis's to approve: shown, never pending
-            return words.render_proposal(proposal, approvable=False)
+            return notice + words.render_proposal(proposal, approvable=False)
         self._hold(conversation_id, _Pending(proposal, self._monotonic() + self._ttl))
-        return words.render_proposal(proposal)
+        return notice + words.render_proposal(proposal)
 
     # -- answering a waiting proposal --------------------------------------------------------------------------------------------------------
 
@@ -222,6 +224,7 @@ class ActionProposalService:
         """Skipping DISCARDS the proposal and builds a new one from the remaining steps (new id, new digest) - no step is edited in place."""
         old = entry.proposal
         remaining: tuple[ProposalStep, ...] = tuple(step for i, step in enumerate(old.steps, start=1) if i != number)
+        remaining = self._builder.refresh_note(old.subject, old.made_on, remaining)  # a saved plan must not list a step that was skipped
         if not remaining:
             self._drop(conversation_id, entry)
             return words.NOTHING_TO_DO
@@ -310,7 +313,7 @@ class ActionProposalService:
                 plan_steps = plan_steps_for(self.tools, actions)
             except ProposalError as exc:
                 problems.append(f"I can't do my part any more ({exc})")
-            if zone is None:
+            if zone is None and any(action.tool_name == "create_reminder" for action in actions):  # only a reminder needs the reminder zone
                 problems.append("I can't tell which time zone my reminders use")
             for action in actions:
                 if self._reminder_has_passed(action, local_now):

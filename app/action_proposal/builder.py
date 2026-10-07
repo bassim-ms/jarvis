@@ -3,8 +3,12 @@ Building a proposal from a Focus decision - deterministic, no model, no Planner.
 
 The steps come from what Focus already ranked: the first thing (and the next) are THE USER'S steps - "Your part: ..." - because Jarvis
 cannot do their work for them. The only step that can be Jarvis's is an assistive action built from a fixed template and checked by the
-existing plan validator against the live registry; today that is one: a reminder ahead of a task's own TIMED due time. Nothing is
-invented: a task with no timed deadline gets no reminder, and a proposal with no Jarvis step has nothing to approve (see service.py).
+existing plan validator against the live registry; today there are two: a reminder ahead of a task's own TIMED due time, and - only when
+the user asked for it ("... and save it as a note") - saving the plan itself as a note. Nothing is invented: a task with no timed deadline
+gets no reminder, a note is never offered unasked, and a proposal with no Jarvis step has nothing to approve (see service.py).
+
+The note's title and text are built here, once, from text the proposal ALREADY shows (the subject and the task labels), and the step shows
+them in full: what the user reads is, character for character, what would be saved. They are never rebuilt after approval.
 
 Every referent is fingerprinted (`task_stamp`) so the proposal can be recognised as stale later.
 """
@@ -22,6 +26,8 @@ from app.action_proposal.base import (
     MAX_ARGUMENT_TEXT,
     MAX_STEP_TEXT,
     MAX_STEPS,
+    NOTE_CONTENT_LIMIT,
+    NOTE_TITLE_LIMIT,
     ActionProposal,
     ProposalRef,
     ProposalStep,
@@ -45,6 +51,8 @@ from app.orchestration.base import PlanStep, RetryPolicy
 from app.orchestration.validator import PlanValidationError, validate_plan
 from app.tasks.base import TaskStatus
 
+NOTE_TOOL = "save_note"
+NOTE_STEP_LIMIT = NOTE_TITLE_LIMIT + NOTE_CONTENT_LIMIT + 100  # the note step is shown IN FULL, so its text bound covers its two arguments
 REMINDER_LEAD = timedelta(minutes=30)  # a reminder this long before a task's own timed due time
 MIN_REMINDER_AHEAD = timedelta(minutes=2)  # ... and only if that moment is still comfortably ahead
 _DATE_ONLY = re.compile(r"\d{4}-\d{2}-\d{2}")
@@ -96,6 +104,10 @@ def plan_steps_for(tools, actions: list[ToolAction]) -> list[PlanStep]:
     return steps
 
 
+def is_note_step(step: ProposalStep) -> bool:
+    return step.action is not None and step.action.tool_name == NOTE_TOOL
+
+
 def _why(candidate) -> str:
     phrases = [_DUE_WORDS[r] for r in candidate.reasons if r in _DUE_WORDS]
     if REASON_PRIORITY_HIGH in candidate.reasons:
@@ -113,8 +125,9 @@ class ProposalBuilder:
         self.tools = tools
         self._clock = clock
 
-    def build(self, decision: FocusDecision, conversation_id: str) -> ActionProposal | None:
-        """A proposal for a PICK decision, or None if there is nothing concrete to propose. Reads the tasks it will refer to."""
+    def build(self, decision: FocusDecision, conversation_id: str, *, note: bool = False) -> ActionProposal | None:
+        """A proposal for a PICK decision, or None if there is nothing concrete to propose. Reads the tasks it will refer to. `note` is True
+        only when the user asked for the plan to be saved as a note."""
         now = self._now()
         zone = reminder_zone(self.tools)
         local_now = now.astimezone(zone) if zone is not None else now  # reminder times are the reminder service's zone's
@@ -140,6 +153,11 @@ class ProposalBuilder:
         if reminder is not None and len(steps) < MAX_STEPS:
             steps.append(reminder)
         subject = safe_text(decision.project or decision.subject, MAX_ARGUMENT_TEXT)
+        made_on = local_now.date().isoformat()
+        if note and len(steps) < MAX_STEPS:
+            note_step = self._note_step(subject, made_on, steps)
+            if note_step is not None:
+                steps.append(note_step)
         frozen = tuple(steps)
         return ActionProposal(
             id=uuid.uuid4().hex,
@@ -147,8 +165,17 @@ class ProposalBuilder:
             subject=subject,
             steps=frozen,
             digest=proposal_digest(subject, frozen),
-            made_on=local_now.date().isoformat(),
+            made_on=made_on,
         )
+
+    def refresh_note(self, subject: str, made_on: str, steps: tuple[ProposalStep, ...]) -> tuple[ProposalStep, ...]:
+        """`steps` after one was skipped: a note step is rebuilt from the steps that REMAIN (its text listed the skipped one), or dropped if
+        it cannot be. Every other step is untouched."""
+        kept = [step for step in steps if not is_note_step(step)]
+        if len(kept) == len(steps):
+            return steps
+        note_step = self._note_step(subject, made_on, kept)
+        return tuple(kept) + ((note_step,) if note_step is not None else ())
 
     # -- helpers ---------------------------------------------------------------------------------------------------------------------
 
@@ -164,6 +191,32 @@ class ProposalBuilder:
         except Exception:  # noqa: BLE001 - an unreadable task is simply not part of the proposal
             return None
         return task if task is not None and task.status is TaskStatus.TODO else None
+
+    def _note_step(self, subject: str, made_on: str, steps: list[ProposalStep]) -> ProposalStep | None:
+        """"Save this plan as a note" - its title and text built from what the user is already shown, shown in full, or no step at all. The
+        text names only the user's own steps: it says nothing about what Jarvis has done, because nothing has been done yet."""
+        mine = [step for step in steps if step.action is None and step.refs]
+        if not mine:
+            return None
+        parts = [
+            f"{'work on' if position == 0 else 'then'} {safe_text(step.refs[0].label, 60)}" for position, step in enumerate(mine)
+        ]
+        about = f" for {safe_text(subject, 60)}" if subject else ""
+        title = safe_text(f"Plan: {subject}", NOTE_TITLE_LIMIT) if subject else "Plan"
+        content = f"Plan{about} ({made_on}): " + "; ".join(parts) + "."
+        text = f'My part: I\'ll save this plan as a note titled {quoted(title)} saying {quoted(content)}'
+        if len(content) > NOTE_CONTENT_LIMIT or len(text) > NOTE_STEP_LIMIT or safe_text(content, NOTE_CONTENT_LIMIT) != content:
+            return None  # never shown or saved cut short
+        shown = safe_text(text, NOTE_STEP_LIMIT)
+        if shown != text:
+            return None
+        action = ToolAction(NOTE_TOOL, tuple(sorted({"title": title, "content": content}.items())))
+        try:
+            plan_steps_for(self.tools, [action])
+        except ProposalError:
+            return None  # the notes tool is not there or not valid right now: no note step, rather than one that cannot run
+        refs = tuple({ref.ref: ref for step in mine for ref in step.refs}.values())
+        return ProposalStep(text=text, action=action, refs=refs, why="so you have a written copy of the plan to come back to")
 
     def _reminder_step(self, task, now: datetime) -> ProposalStep | None:
         """A reminder ahead of the task's own TIMED due time - or nothing. A date-only or missing due date has no time to remind before."""

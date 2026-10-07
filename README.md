@@ -172,7 +172,7 @@ jarvis/
       context.py           - FreshContextBuilder: the run's context, read anew every time from the existing Context Engine + memory facts
       adapter.py           - ScheduledExecutionAdapter: occurrence -> ONE ordinary PENDING Job, atomically with its ledger row
     orchestration/profiles.py - (Slice 2) run profiles: `unattended_v1`, a READ-only REDUCTION of what a Job may use (grants nothing)
-    action_proposal/       - (Productivity Action Loop, Slice 2) a temporary, in-memory plan the user can approve: honest 'Your part / My part' steps; no Job, no model, no store
+    action_proposal/       - (Productivity Action Loop, Slices 2-5) a temporary, in-memory plan the user can approve: honest 'Your part / My part' steps (My part: a reminder, or - if asked - saving the plan as a note); no Job until approval, no model; the verified one-time result report
     focus/                 - (Productivity Action Loop, Slice 1) read-only Focus: recognition / service (matching + deterministic ranking) / render; the last chat door, no state, no model
     scheduled_operations/  - (Scheduled Jobs V1, Slice 4 - creating, approving and managing them from chat; wired through main.py alone)
       language.py          - the fixed grammar: "every morning at 8, research X" / "what scheduled jobs do I have?" (no model; timing words are the reminders')
@@ -276,7 +276,7 @@ jarvis/
     test_scheduled_operations.py   - (Slice 4) request -> proposal -> existing confirmation -> atomic approval -> scheduler -> ordinary Job; management; security
     test_scheduled_operations_boundaries.py - (Slices 4-5) the layer cannot plan/run/launch/settle, imports no Handle This, adds no scheduler or store
     test_focus_recognition.py / test_focus_ranking.py / test_focus_service.py / test_focus_door.py / test_focus_interaction_precedence.py / test_focus_presentation.py - (Focus, Slice 1) the grammar boundary, the pure ranking, Tests A-D + untrusted text + bounds, door gating / precedence + package boundaries, a waiting question or confirmation always wins
-    test_action_proposal_recognition.py / _service.py / _door.py / _handoff.py / _execution.py / _result.py - (Action Proposal, Slices 2-4) the grammars, building / follow-ups / approval / revalidation, precedence in the real core, the store handoff and package boundary, the exact approved plan run by the real JobEngine (allow-list, refusals, failure, restart, pause/resume, no re-planning), and the verified one-time result report (truth, conversation binding, exactly-once, bounds, hook safety)
+    test_action_proposal_recognition.py / _service.py / _door.py / _handoff.py / _execution.py / _result.py / _notes.py - (Action Proposal, Slices 2-5) the grammars, building / follow-ups / approval / revalidation, precedence in the real core, the store handoff and package boundary, the exact approved plan run by the real JobEngine (allow-list, refusals, failure, restart, pause/resume, no re-planning), the verified one-time result report (truth, conversation binding, exactly-once, bounds, hook safety), and the optional note step (grammar, shown in full, exact handoff, mixed outcomes, interruption)
     test_scheduled_jobs_final.py   - (Slice 5) Run Now, result presentation, renewal, the full lifecycle, and the final security review
     test_automation_store.py       - unit tests for SQLiteAutomationStore (persistence, trigger/condition/action round-trip)
     test_automation_conditions.py  - unit tests for FactEqualsCondition/TimeWindowCondition/condition_from_dict
@@ -1583,6 +1583,31 @@ stops: `one approval -> one execution -> one verification -> one result -> an op
 - **Read-only, no continuation.** It only reads a Job by id: it never creates a Job, runs a tool, approves or builds a proposal or retries
   anything. The suggestion after a success is one sentence (ask what to focus on - nothing runs unless you approve it); acting on it goes back
   through the Action Proposal and its approval.
+
+### Slice 5: a plan may also be saved as a note
+
+A second tool joins `create_reminder` on the allow-list (`app/action_proposal/base.py`): **`save_note`**, a SAFE_ACTION that appends one row to
+the notes store (separate from memory and the World Model). Nothing else was added - every other tool is still refused by the proposal
+builder, the service's revalidation and the handoff.
+
+- **Only when asked.** A note step is offered only when the plan request says so: "make a plan for my Arduino project **and write it in a
+  note**" (also "and put it in a note", "and make a note of it", "and note it down", "with a note"; "help me plan ..." works the same). A
+  plain "make a plan" never offers one. The wordings are a closed set the existing capability router leaves as ordinary conversation:
+  "save it / store it / keep it ..." requests are routed to the Job path before the proposal door sees them (unchanged), so they are not
+  part of this grammar. If the note was asked for but cannot be offered (no notes tool), the reply says so.
+- **Shown in full, saved exactly.** The step reads `My part: I'll save this plan as a note titled "<title>" saying "<text>"`. Title and text are
+  built once from text the proposal already shows (the subject and the task labels), single-line, bounded (100 / 400 characters), and say
+  nothing about what Jarvis will have done. Those exact strings become the `PlanStep` arguments and are written as-is - never rebuilt,
+  summarised or regenerated after approval. Skipping a task rewrites the note step from the steps that remain; skipping the note removes it.
+- **Strict handoff.** Each allowed tool has its own fixed argument names; a note must be exactly a non-blank title and text, one clean line,
+  within bounds, and a plan carries at most one (a note is not idempotent). Task and project text is data in quoted slots: it can never name
+  a tool or add an argument. Provenance (`source_job_id`, `source_step_id`) is added by the engine, not the plan.
+- **Unchanged guarantees.** One approval pops one proposal and starts one RUNNING Job; a single attempt, no retry, no re-planning, no model;
+  an interrupted step is never re-run. A note-only plan no longer needs reminder-zone data (only a reminder does). A reminder plus a note
+  that partly fails is reported step by step by Slice 4 from what each tool actually stored; an interrupted step is reported as "I can't
+  tell whether it happened - I did not retry it" (a restart can interrupt a write whose outcome is unknown). Report lines go through the existing
+  credential filter unchanged: a saved note's result line carries its record id, which that filter hides, so the step is still verified from
+  the stored result but its line may read as hidden.
 
 ## Persistent Automation Engine (M8)
 
