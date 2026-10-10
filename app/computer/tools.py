@@ -30,6 +30,14 @@ M15 Job execution - that wiring, and any confirmation-flow changes it
 implies, is deliberately left to M17.1-B/C. Today they exist only to be
 constructed and exercised directly (e.g. in tests), against either
 WindowsComputerBackend or a fake backend.
+
+COMPUTER INPUT GATE (app/computer/gate.py): the six INPUT tools here - type_text, press_key, move_mouse, click_mouse, double_click and
+open_application - are still SAFE_ACTION (so ToolRegistry asks for no confirmation), but the real backend enforces the Input Gate ITSELF: the switch is
+OFF by default and one rate limit is shared by all six (and by every backend instance in the process). The gate enforces at EXECUTION time, inside the
+backend, immediately before the OS call, so a direct `execute`, a registry call or a chained command cannot skip it, and neither can a backend built
+somewhere the factory never saw. Each tool's `validate_arguments` additionally calls `_preflight_input`, a
+non-consuming pre-check, so a whole command is turned away before its first step runs; that is a convenience, not the enforcement. All six are also
+`automatable = False`: until now they were kept away from automations only by living in a separate registry.
 """
 
 from collections.abc import Callable
@@ -48,6 +56,19 @@ from app.computer.base import (
     validate_window_query,
 )
 from app.tools.base import PermissionLevel, Tool, ToolArgumentError, ToolParameter, ToolResult
+
+
+def _preflight_input(backend: ComputerBackend, action: str) -> None:
+    """The Input Gate's NON-CONSUMING pre-check, for `validate_arguments`: turn a command away before any of its steps run when computer input is
+    switched off or the limit is already reached. It records nothing and is never the enforcement (that is the backend's own `admit`, at execution
+    time). A backend with no gate (a test double) has nothing to pre-check."""
+    check = getattr(backend, "check_input", None)
+    if check is None:
+        return
+    try:
+        check(action)
+    except ComputerControlError as exc:
+        raise ToolArgumentError(str(exc)) from exc
 
 
 class GetActiveWindowTool(Tool):
@@ -127,6 +148,7 @@ class OpenApplicationTool(Tool):
         + ", ".join(_ALLOWED_APPLICATION_NAMES)
     )
     permission = PermissionLevel.SAFE_ACTION
+    automatable = False  # Computer Input Gate: an input tool is never run by a schedule or an automation (it used to be kept away only by living in another registry)
 
     def __init__(self, backend: ComputerBackend):
         self.backend = backend
@@ -142,6 +164,7 @@ class OpenApplicationTool(Tool):
         ]
 
     def validate_arguments(self, app: str) -> None:
+        _preflight_input(self.backend, "open_application")
         try:
             AllowedApplication(app)
         except ValueError:
@@ -325,6 +348,7 @@ class TypeTextTool(Tool):
     name = "type_text"
     description = "Type text via the keyboard into whatever currently has focus."
     permission = PermissionLevel.SAFE_ACTION
+    automatable = False  # Computer Input Gate: an input tool is never run by a schedule or an automation (it used to be kept away only by living in another registry)
 
     def __init__(self, backend: ComputerBackend):
         self.backend = backend
@@ -336,6 +360,7 @@ class TypeTextTool(Tool):
             )]
 
     def validate_arguments(self, text: str) -> None:
+        _preflight_input(self.backend, "type_text")
         try:
             validate_text(text)
         except ComputerControlError as exc:
@@ -364,6 +389,7 @@ class PressKeyTool(Tool):
         "alt+tab)."
     )
     permission = PermissionLevel.SAFE_ACTION
+    automatable = False  # Computer Input Gate: an input tool is never run by a schedule or an automation (it used to be kept away only by living in another registry)
 
     def __init__(self, backend: ComputerBackend):
         self.backend = backend
@@ -373,6 +399,7 @@ class PressKeyTool(Tool):
         return [ToolParameter(name="key", type="string", description="The key to press")]
 
     def validate_arguments(self, key: str) -> None:
+        _preflight_input(self.backend, "press_key")
         try:
             normalize_key_input(key)
         except ComputerControlError as exc:
@@ -406,6 +433,7 @@ class MoveMouseTool(Tool):
     name = "move_mouse"
     description = "Move the mouse cursor to screen coordinates (x, y)."
     permission = PermissionLevel.SAFE_ACTION
+    automatable = False  # Computer Input Gate: an input tool is never run by a schedule or an automation (it used to be kept away only by living in another registry)
 
     def __init__(self, backend: ComputerBackend):
         self.backend = backend
@@ -418,6 +446,7 @@ class MoveMouseTool(Tool):
         ]
 
     def validate_arguments(self, x: int, y: int) -> None:
+        _preflight_input(self.backend, "move_mouse")
         try:
             _validate_coordinates(self.backend, x, y)
         except ComputerControlError as exc:
@@ -447,6 +476,7 @@ class ClickMouseTool(Tool):
     name = "click_mouse"
     description = "Click the mouse (left/right/middle) at (x, y)."
     permission = PermissionLevel.SAFE_ACTION
+    automatable = False  # Computer Input Gate: an input tool is never run by a schedule or an automation (it used to be kept away only by living in another registry)
 
     def __init__(self, backend: ComputerBackend):
         self.backend = backend
@@ -468,6 +498,7 @@ class ClickMouseTool(Tool):
     def validate_arguments(
         self, x: int, y: int, button: str = MouseButton.LEFT.value
     ) -> None:
+        _preflight_input(self.backend, "click_mouse")
         try:
             _validate_coordinates(self.backend, x, y)
         except ComputerControlError as exc:
@@ -511,6 +542,7 @@ class DoubleClickTool(Tool):
     name = "double_click"
     description = "Double-click the mouse (left/right/middle) at (x, y)."
     permission = PermissionLevel.SAFE_ACTION
+    automatable = False  # Computer Input Gate: an input tool is never run by a schedule or an automation (it used to be kept away only by living in another registry)
 
     def __init__(self, backend: ComputerBackend):
         self.backend = backend
@@ -532,6 +564,7 @@ class DoubleClickTool(Tool):
     def validate_arguments(
         self, x: int, y: int, button: str = MouseButton.LEFT.value
     ) -> None:
+        _preflight_input(self.backend, "double_click")
         try:
             _validate_coordinates(self.backend, x, y)
         except ComputerControlError as exc:

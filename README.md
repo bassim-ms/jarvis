@@ -128,6 +128,7 @@ jarvis/
   app/
     __init__.py       - marks app/ as a Python package
     main.py            - the FastAPI app, /health and /chat endpoints
+    host_guard.py      - (Computer Input Gate slice) loopback-only Host check: every route answers 403 unless Host is localhost / 127.x.x.x / [::1] (optional port); an additional safeguard, not authentication
     config.py          - all configuration, read from environment variables
     core.py            - Jarvis Core: dispatches a chat request DIRECT (AIProvider) or SEARCH (WebSearchTool + SearchAnswerGenerator)
     capability.py       - Capability/CapabilityDecision/CapabilityRouter: the DIRECT/SEARCH decision layer Core dispatches on
@@ -276,6 +277,7 @@ jarvis/
     test_scheduled_operations.py   - (Slice 4) request -> proposal -> existing confirmation -> atomic approval -> scheduler -> ordinary Job; management; security
     test_scheduled_operations_boundaries.py - (Slices 4-5) the layer cannot plan/run/launch/settle, imports no Handle This, adds no scheduler or store
     test_focus_recognition.py / test_focus_ranking.py / test_focus_service.py / test_focus_door.py / test_focus_interaction_precedence.py / test_focus_presentation.py - (Focus, Slice 1) the grammar boundary, the pure ranking, Tests A-D + untrusted text + bounds, door gating / precedence + package boundaries, a waiting question or confirmation always wins
+    test_computer_gate.py / test_host_guard.py - (Computer Input Gate) the switch (off by default) and the ONE shared 10-per-rolling-minute limit with its exact boundaries, enforcement at execution time through direct, registry and chained calls (concurrency-safe), the production wiring, audit logs that never carry a value; and the loopback-only Host check (IPv4 / localhost / IPv6, ports, every production route)
     test_action_proposal_recognition.py / _service.py / _door.py / _handoff.py / _execution.py / _result.py / _notes.py / _tasks.py / _complete.py - (Action Proposal, Slices 2-7) the grammars, building / follow-ups / approval / revalidation, precedence in the real core, the store handoff and package boundary, the exact approved plan run by the real JobEngine (allow-list, refusals, failure, restart, pause/resume, no re-planning), the verified one-time result report (truth, conversation binding, exactly-once, bounds, hook safety), and the optional note step (grammar, shown in full, exact handoff, mixed outcomes, interruption)
     test_scheduled_jobs_final.py   - (Slice 5) Run Now, result presentation, renewal, the full lifecycle, and the final security review
     test_automation_store.py       - unit tests for SQLiteAutomationStore (persistence, trigger/condition/action round-trip)
@@ -740,6 +742,50 @@ persisted, on its own daemon thread, its text is sanitised (single line, no
 control characters, bounded, always starting with "Goal:"), and any failure -
 or a notifier that hangs - cannot change the Job. The persisted Job is the
 source of truth; a notification is never sent twice for one Job.
+
+### Computer Input Gate
+
+Six computer tools send **input** to the desktop: `type_text`, `press_key`, `move_mouse`, `click_mouse`, `double_click` and `open_application`. They are
+SAFE_ACTION, so the registry asked for no confirmation - and one anonymous chat message could press Win+R, type a command and press Enter (`use tool
+press_key win+r, then use tool type_text ..., then use tool press_key enter`). The **Computer Input Gate** (`app/computer/gate.py`) closes that path
+without adding any capability:
+
+- **Off by default.** `JARVIS_COMPUTER_INPUT_ENABLED` (default `false`) is read on **every** call. Off, none of the six reaches the desktop.
+- **One shared limit.** `JARVIS_COMPUTER_INPUT_ACTIONS_PER_MINUTE` (default `10`) is a single budget for all six tools together - not ten each. It is a
+  *rolling* 60-second window: an admitted action stops counting at **exactly** 60 seconds after it happened (at 59.999 s it still counts; at 60 s its
+  slot is free). A refused attempt - switched off or over the limit - uses up **no** slot; an attempt that passed the gate counts even if the OS then
+  failed, so a failing loop cannot spin. The limit is read live too; a value that is not a plain non-negative whole number allows nothing.
+- **Enforced by the real backend itself, when the action runs.** `WindowsComputerBackend` calls the gate immediately before each OS call that sends input,
+  so it does not matter how an instance was obtained: any `WindowsComputerBackend()` - built by the factory or by any other code - is switched off by default
+  and shares **one process-wide gate**, hence one budget, with every other instance (a caller can deliberately hand it a gate of its own, as a test does). A
+  direct tool `execute`, a `ToolRegistry.execute` call, a chained command, or a caller that never validated anything all meet the same gate; a request that
+  fails validation is turned away before the gate and uses no slot. Counting and recording an action is one step under a lock, so concurrent calls admit at
+  most the limit. (`GatedComputerBackend` does the same job for any *other* backend that does not gate itself, such as a test double; it refuses to wrap
+  one that does, so an action can never be counted twice.) The tools' `validate_arguments` also *pre-checks* (consuming nothing), which turns a
+  whole command away before its first step runs when input is off or the budget is already spent ("nothing was executed"); that is a convenience, never
+  the enforcement. A chain longer than the remaining budget therefore runs the steps that fit, stops at the first refused one and says which steps were
+  not run.
+- **Audit log, never a value.** Every admitted and every refused attempt is logged (logger `jarvis.computer.input`) with the tool name, the outcome, the
+  reason and the count - plus, at most, a coarse shape (`chars=12`, `parts=3`). **Never** typed text, key names, coordinates, application names or any other
+  argument value, and never an error message from the desktop. A refused three-step command leaves one line per refused step.
+- **The input tools are also `automatable = False`** (they used to be kept from automations only by living in a separate registry).
+- **Unchanged:** the read-only tools, the Job allowlist (`open_url`, `scroll`, `switch_window`, `get_active_window`, observation) and every permission level.
+  The input tools are still SAFE_ACTION: the control is the gate, not a confirmation prompt.
+
+**Loopback-only Host check** (`app/host_guard.py`, added to `app/main.py`): every route answers 403 unless the `Host` header is `localhost`, a `127.x.x.x`
+address or `[::1]`, each with an optional port (`localhost:8000`, `[::1]:8000`). `localhost` is matched exactly (not `localhost.` and not a name that
+merely resolves to 127.0.0.1); IPv4 must be four plain decimal fields; IPv6 must be bracketed and exactly `::1`; ports are 1-65535; a missing or repeated
+Host is refused. This closes the DNS-rebinding route to the anonymous `/chat` for **every** tool. It is an *additional* safeguard only: the server must still
+be started bound to the loopback interface (`uvicorn app.main:app --host 127.0.0.1`; the README's own `uvicorn app.main:app --reload` binds
+`127.0.0.1:8000` because that is uvicorn's default - 0.32.1, pinned in `requirements.txt` - whereas the `host = "0.0.0.0"` default in `config.py` is read by
+nothing and would NOT be loopback if it ever were), and anything that needs to be trusted still needs authentication (`/device/chat`). The guard judges only
+the `Host` header, never the client's address: a client on another machine that simply sends `Host: localhost` is not stopped by it, so it is no substitute
+for loopback binding - a loopback Host proves nothing about who is calling.
+
+What this does **not** do: it does not authenticate `/chat`; the interactive `open_url` still accepts any http/https address including `localhost`
+(the Job variant does not); and the counter is per process and in memory (a restart forgets it - the switch is off by default anyway). Tests pin that
+production builds the real backend in exactly one place, that nothing else in the application calls the OS input functions, and that every OS input call
+in the real backend sits behind a gate admission in the same method.
 
 ### Search Routing (M6.9)
 

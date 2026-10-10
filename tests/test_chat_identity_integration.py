@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 from app import main
 from app.providers.base import AIProvider
 
-client = TestClient(main.app)
+client = TestClient(main.app, base_url="http://localhost")
 
 
 class _RecordingProvider(AIProvider):

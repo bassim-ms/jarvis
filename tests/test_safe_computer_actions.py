@@ -896,7 +896,7 @@ def test_an_authenticated_pc_asks_in_plain_language_and_the_job_opens_observes_s
     chain.core.capability_router = ObjectiveAwareCapabilityRouter(chain.core.capability_router)
     monkeypatch.setattr(live, "device_gateway", chain.env.gateway)
     monkeypatch.setattr(live, "core", chain.core)
-    client = TestClient(live.app)
+    client = TestClient(live.app, base_url="http://localhost")
     pc, credential = chain.env.add("PC", trust=True)
     stored_before, facts_before = chain.on_disk_outside_devices(), chain.memory.get_facts()
 

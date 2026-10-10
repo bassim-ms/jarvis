@@ -37,6 +37,7 @@ from app.computer.base import (
     ScreenInfo,
 )
 from app.computer.defaults import create_computer_tools_registry
+from app.computer.gate import InputGate
 from app.computer.windows_backend import WindowsComputerBackend
 from app.core import JarvisCore
 from app.memory.sqlite_store import SQLiteMemoryStore
@@ -105,7 +106,9 @@ def fake_desktop():
 
 @pytest.fixture
 def backend():
-    return WindowsComputerBackend()
+    # These tests are about WHAT the backend forwards to the OS, not about the Computer Input Gate (that is tests/test_computer_gate.py): they pass an
+    # explicit, always-open gate. A bare `WindowsComputerBackend()` is gated by default - switched off - so it would refuse every input call here.
+    return WindowsComputerBackend(gate=InputGate(enabled=lambda: True, limit=lambda: 10**9))
 
 
 # --- open_application: no shell execution, no arbitrary paths ------------

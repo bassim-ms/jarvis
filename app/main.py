@@ -44,6 +44,7 @@ from app.context_planning.factory import create_default_context_planner
 from app.context_reasoning.factory import create_default_context_reasoner
 from app.action_proposal import ActionProposalService, ExecutionHandoff, ResultReports
 from app.focus import FocusService
+from app.host_guard import LoopbackHostMiddleware
 from app.handle_this.base import GoalFamily
 from app.handle_this.boundary import DEFAULT_BOUNDARY
 from app.handle_this.continuation import ObjectiveContinuer, plausible_input_answer
@@ -592,6 +593,12 @@ async def _lifespan(app: FastAPI):
 
 
 app = FastAPI(title=settings.app_name, lifespan=_lifespan)
+
+# Loopback-only Host check (app/host_guard.py): every route answers only a request addressed to localhost / 127.x.x.x / [::1], which closes the DNS-rebinding
+# route to the anonymous /chat. It is an ADDITIONAL safeguard only: the server must still be bound to the loopback interface
+# (`uvicorn app.main:app --host 127.0.0.1`; the unused `host` default in config.py is not what binds it) and anything that needs trust still needs
+# authentication (/device/chat).
+app.add_middleware(LoopbackHostMiddleware)
 
 @app.get("/dev/ping")
 def dev_ping() -> str:

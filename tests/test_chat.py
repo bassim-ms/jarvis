@@ -14,7 +14,7 @@ from app import main
 from app.providers.base import ProviderError
 from app.search.answer import SearchSource
 
-client = TestClient(main.app)
+client = TestClient(main.app, base_url="http://localhost")
 
 
 def test_chat_returns_provider_reply(monkeypatch):

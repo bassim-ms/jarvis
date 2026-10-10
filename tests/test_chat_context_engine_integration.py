@@ -26,7 +26,7 @@ from app.world_model.factory import create_default_world_model_service, create_d
 from app.world_model.service import WorldModelService
 from app.world_model.sqlite_store import SQLiteWorldModelStore
 
-client = TestClient(main.app)
+client = TestClient(main.app, base_url="http://localhost")
 
 
 class _RecordingProvider(AIProvider):

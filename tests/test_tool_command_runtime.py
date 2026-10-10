@@ -683,7 +683,7 @@ def chat_client(monkeypatch):
     monkeypatch.setattr(
         main.core, "computer_tools", create_computer_tools_registry(backend=backend)
     )
-    return TestClient(main.app), backend
+    return TestClient(main.app, base_url="http://localhost"), backend
 
 
 def test_chat_endpoint_runs_the_regression_sequence_through_the_real_pipeline(chat_client):

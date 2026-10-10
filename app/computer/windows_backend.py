@@ -50,6 +50,7 @@ from app.computer.base import (
     validate_text,
     validate_url,
 )
+from app.computer.gate import InputGate, default_input_gate
 
 # PyAutoGUI's own safety net: moving the mouse into a screen corner
 # raises pyautogui.FailSafeException, giving a human a way to abort any
@@ -205,7 +206,20 @@ def _bring_to_foreground(hwnd: int) -> None:
 
 class WindowsComputerBackend(ComputerBackend):
     """The default, real ComputerBackend - see app/computer/factory.py
-    for how it's constructed for the running application."""
+    for how it's constructed for the running application.
+
+    COMPUTER INPUT GATE (app/computer/gate.py): this class enforces the gate ITSELF, at the exact line before each call that would send input to the
+    desktop - `open_application`, `type_text`, `press_key`, `move_mouse`, `click_mouse`, `double_click`. So it does not matter how an instance was
+    obtained: any `WindowsComputerBackend()`, built by the factory or by any other code, is switched off by default and shares ONE process-wide rate
+    limit with every other instance (unless a caller deliberately passes its own `gate`, as a test does). A request that fails validation is turned
+    away BEFORE the gate and uses no slot; one the gate admits counts even if the OS then fails. Construction itself touches nothing."""
+
+    def __init__(self, gate: InputGate | None = None):
+        self.gate = gate if gate is not None else default_input_gate()
+
+    def check_input(self, action: str) -> None:
+        """What the tools call from `validate_arguments`: the gate's non-consuming pre-check (the enforcement is in the methods below)."""
+        self.gate.check(action)
 
     def get_active_window(self) -> WindowInfo:
         hwnd = win32gui.GetForegroundWindow()
@@ -254,6 +268,7 @@ class WindowsComputerBackend(ComputerBackend):
             raise ComputerControlError(f"Unknown application: {app!r}")
 
         command = _APP_LAUNCH_COMMANDS[app]
+        self.gate.admit("open_application")
         try:
             subprocess.Popen(command, shell=False)
         except (OSError, FileNotFoundError) as exc:
@@ -317,10 +332,12 @@ class WindowsComputerBackend(ComputerBackend):
 
     def type_text(self, text: str) -> None:
         validate_text(text)
+        self.gate.admit("type_text", f"chars={len(text)}")
         pyautogui.write(text)
 
     def press_key(self, key: str) -> None:
         tokens = normalize_key_input(key)
+        self.gate.admit("press_key", f"parts={len(tokens)}")
         if len(tokens) == 1:
             pyautogui.press(tokens[0])
         else:
@@ -328,6 +345,7 @@ class WindowsComputerBackend(ComputerBackend):
 
     def move_mouse(self, x: int, y: int) -> None:
         validate_coordinates(x, y, self.get_screen_info())
+        self.gate.admit("move_mouse")
         pyautogui.moveTo(x, y)
 
     def click_mouse(
@@ -336,15 +354,18 @@ class WindowsComputerBackend(ComputerBackend):
         if not isinstance(button, MouseButton):
             raise ComputerControlError(f"Unknown mouse button: {button!r}")
         if x is None and y is None:
+            self.gate.admit("click_mouse")
             pyautogui.click(button=button.value)
         else:
             validate_coordinates(x, y, self.get_screen_info())
+            self.gate.admit("click_mouse")
             pyautogui.click(x=x, y=y, button=button.value)
 
     def double_click(self, x: int, y: int, button: MouseButton) -> None:
         if not isinstance(button, MouseButton):
             raise ComputerControlError(f"Unknown mouse button: {button!r}")
         validate_coordinates(x, y, self.get_screen_info())
+        self.gate.admit("double_click")
         # PyAutoGUI's own dedicated double-click primitive - never
         # `click(clicks=2)`, which would expose an arbitrary click count
         # this milestone deliberately doesn't (see app/computer/tools.py:

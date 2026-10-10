@@ -488,7 +488,7 @@ def test_jarvis_identifies_itself_as_jarvis_at_runtime():
 
     import app.main as live
 
-    assert TestClient(live.app).get("/health").json()["app"] == "Jarvis"
+    assert TestClient(live.app, base_url="http://localhost").get("/health").json()["app"] == "Jarvis"
     from app.reminders.notifier import WindowsToastNotifier
 
     assert WindowsToastNotifier.__init__.__defaults__[0] == "Jarvis"  # the toast notifier's application id

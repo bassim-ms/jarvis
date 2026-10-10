@@ -20,7 +20,7 @@ from app.self_development.base import SessionStage
 from app.self_development.factory import create_default_self_development_engine
 from app.providers.base import AIProvider
 
-client = TestClient(main.app)
+client = TestClient(main.app, base_url="http://localhost")
 
 
 class _PlanProvider(AIProvider):

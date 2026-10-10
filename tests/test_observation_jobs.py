@@ -361,7 +361,7 @@ def test_an_authenticated_pc_request_reaches_core_runs_the_job_observes_verifies
     chain.core.capability_router = TaskRouter()
     monkeypatch.setattr(live, "device_gateway", chain.env.gateway)
     monkeypatch.setattr(live, "core", chain.core)
-    client = TestClient(live.app)
+    client = TestClient(live.app, base_url="http://localhost")
     pc, credential = chain.env.add("PC", trust=True)
     stored_before = chain.on_disk_outside_devices()
     facts_before = chain.memory.get_facts()

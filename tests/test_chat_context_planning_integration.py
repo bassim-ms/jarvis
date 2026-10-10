@@ -28,7 +28,7 @@ from app.world_model.factory import (
     create_default_world_model_store,
 )
 
-client = TestClient(main.app)
+client = TestClient(main.app, base_url="http://localhost")
 
 
 class _RecordingProvider(AIProvider):

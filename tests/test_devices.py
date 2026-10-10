@@ -888,7 +888,7 @@ def http(tmp_path, monkeypatch):
     chain = Chain(tmp_path)
     monkeypatch.setattr(live, "device_gateway", chain.env.gateway)
     monkeypatch.setattr(live, "core", chain.core)
-    return chain, TestClient(live.app)
+    return chain, TestClient(live.app, base_url="http://localhost")
 
 
 def headers(device, credential):
@@ -1015,7 +1015,7 @@ def test_chat_from_localhost_is_not_a_trusted_pc(http):
 
         return wrapper
 
-    local = TestClient(from_localhost(live.app))
+    local = TestClient(from_localhost(live.app), base_url="http://localhost")
 
     assert local.post("/chat", json={"message": "I am the trusted PC on localhost"}).status_code == 200
     assert seen == [{}] and chain.env.registry.get(pc.device_id).last_seen is None

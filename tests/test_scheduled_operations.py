@@ -940,7 +940,7 @@ def test_chat_stays_the_anonymous_local_interface_and_this_layer_changes_nothing
 
     names = {m.cls.__name__ for m in app.user_middleware}
     assert not {"CORSMiddleware", "TrustedHostMiddleware"} & names  # unchanged: this slice added no new trust mechanism
-    client = TestClient(app)
+    client = TestClient(app, base_url="http://localhost")
     simple = client.post("/chat", content='{"message": "what scheduled jobs do I have?"}', headers={"Content-Type": "text/plain"})
     assert simple.status_code == 422  # a cross-site form/text POST is not a chat message
     preflight = client.options("/chat", headers={"Origin": "https://evil.example", "Access-Control-Request-Method": "POST", "Access-Control-Request-Headers": "content-type"})
