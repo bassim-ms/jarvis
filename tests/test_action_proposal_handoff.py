@@ -239,8 +239,8 @@ def test_what_runs_is_what_was_shown_and_never_re_planned(tmp_path):
 # =============================================== what a proposal may ever ask for =========================================================
 
 
-def test_only_a_reminder_a_note_or_a_task_may_be_proposed_and_only_as_a_safe_action():
-    assert ALLOWED_TOOLS == frozenset({"create_reminder", "save_note", "create_task"}) and ALLOWED_PERMISSIONS == frozenset({"safe_action"})
+def test_only_a_reminder_a_note_a_task_or_one_completion_may_be_proposed_and_only_as_a_safe_action():
+    assert ALLOWED_TOOLS == frozenset({"create_reminder", "save_note", "create_task", "complete_task"}) and ALLOWED_PERMISSIONS == frozenset({"safe_action"})
 
 
 def test_the_registry_is_asked_every_time(tmp_path):
@@ -250,7 +250,7 @@ def test_the_registry_is_asked_every_time(tmp_path):
 
     assert [s.tool_name for s in plan_steps_for(registry, [good])] == ["create_reminder"]
     with pytest.raises(ProposalError):
-        plan_steps_for(registry, [ToolAction("complete_task", (("task_id", "x"),))])  # real and safe - but not a tool a proposal may name
+        plan_steps_for(registry, [ToolAction("cancel_task", (("task_id", "x"),))])  # real and safe - but not a tool a proposal may name
     with pytest.raises(ProposalError):
         plan_steps_for(registry, [ToolAction("create_event", (("title", "x"),))])  # needs confirmation
     with pytest.raises(ProposalError):

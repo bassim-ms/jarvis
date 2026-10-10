@@ -8,7 +8,8 @@ or "My part:". Nothing here says Jarvis will do something it has no tool for.
 
 from __future__ import annotations
 
-from app.action_proposal.base import ActionProposal
+from app.action_proposal.base import AMBIGUOUS, COMPLETION_TEXT_LIMIT, NO_MATCH, UNSHOWABLE, ActionProposal
+from app.morning_brief.gather import safe_text
 
 MAX_CHARS = 2000  # room for the user's two steps, a reminder, and a note step shown in full - the user must see exactly what a yes covers
 
@@ -110,6 +111,33 @@ UNWIRED = "Understood - but I can't carry out my part yet, so nothing has been s
 FAILED = "Something went wrong, so nothing was started. Say \"make a plan\" to try again."
 
 
-def changed(problems: list[str]) -> str:
+PLAN_AGAIN = 'Say "make a plan" for a fresh one.'
+COMPLETE_AGAIN = 'Say it again with the task\'s exact words in quotes - for example: Mark "<the task>" as done.'
+
+
+def changed(problems: list[str], again: str = PLAN_AGAIN) -> str:
     listed = "\n".join(f"- {problem}" for problem in problems[:4])
-    return f'Things changed since I showed you the plan, so I haven\'t done anything:\n{listed}\nSay "make a plan" for a fresh one.'
+    return f"Things changed since I showed you the plan, so I haven't done anything:\n{listed}\n{again}"
+
+
+# -- marking one named task done: why there is no proposal (stateless: nothing is held, nothing was changed) ------------------------------------
+
+
+def _called(words: str) -> str:
+    """How to name the task the user asked for: `called "<their words>"` - only if their words come back unchanged - otherwise `with those words`."""
+    shown = safe_text(words, COMPLETION_TEXT_LIMIT)
+    return f'called "{shown}"' if shown and shown == words else "with those words"
+
+
+def completion_none(reason: str, words: str, matches: int = 0) -> str:
+    called = _called(words)
+    if reason == NO_MATCH:
+        return (
+            f"I don't see an open task {called}. I only mark a task done when its exact words are in quotes and exactly one open task "
+            f"has them - nothing was changed. {COMPLETE_AGAIN}"
+        )
+    if reason == AMBIGUOUS:
+        return f"I found {matches} open tasks {called}, so I can't tell which one you mean - nothing was changed."
+    if reason == UNSHOWABLE:
+        return "I found that task, but I can't show its words back to you exactly, so I haven't marked anything - nothing was changed."
+    return "I can't mark tasks done right now, so nothing was changed."

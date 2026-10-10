@@ -115,9 +115,27 @@ class ListTasksTool(Tool):
         return ToolResult.success(data=[_task_to_dict(t) for t in tasks])
 
 
+_TITLE_LIMIT = 100
+
+
+def _title(task: Task | None, fallback: str) -> str:
+    """How a result names a task: its own words (whitespace collapsed to single spaces, so one line; bounded) - or `fallback` (its id) when the
+    task could not be read, or has no words to show (blank text). Only the MESSAGE is normalised: the stored text is never touched. A task's id
+    is an opaque 32-hex string that says nothing to the user, and that any report which filters credential-looking text would hide."""
+    if task is None:
+        return fallback
+    words = " ".join(task.text.split())
+    if not words:
+        return fallback
+    return words if len(words) <= _TITLE_LIMIT else words[: _TITLE_LIMIT - 3].rstrip() + "..."
+
+
 class CompleteTaskTool(Tool):
     """Marks a task DONE. SAFE_ACTION: it only ever changes that one
-    task's own status."""
+    task's own status. Its success message, and its "not open" failure, name the task by
+    its own words (read just before the completion; the completion itself is
+    the one atomic store call), so a report says WHICH task - not only an
+    opaque id. An id that matches no task is still reported by that id."""
 
     name = "complete_task"
     description = "Mark a task as done, by its ID."
@@ -133,8 +151,13 @@ class CompleteTaskTool(Tool):
         ]
 
     def execute(self, task_id: str) -> ToolResult:
+        task = self.store.get(task_id)
         if self.store.complete(task_id):
-            return ToolResult.success(message=f"Task '{task_id}' completed.")
+            return ToolResult.success(message=f"Task '{_title(task, task_id)}' completed.")
+        if task is not None:  # it exists but is not open (done or cancelled, e.g. changed since it was shown): name it, so a report says WHICH
+            return ToolResult.error(
+                f"Task '{_title(task, task_id)}' is not open (it is already completed or cancelled), so nothing was changed."
+            )
         return ToolResult.error(
             f"Task '{task_id}' not found or already completed/cancelled."
         )

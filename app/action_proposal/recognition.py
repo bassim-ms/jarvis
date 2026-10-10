@@ -1,13 +1,15 @@
 """
 Reading what the user said to (or about) an Action Proposal - deterministic, bounded, whole-message, no model.
 
-Two small grammars, both closed:
+Three small grammars, all closed:
 
   * a REQUEST for a plan: "make a plan", "make a plan for my Arduino project", "help me plan my Arduino project" - optionally followed by
     "and write it in a note" (the only way a note step is ever offered) and then, last, by "and add a task to <what>" (the only way a task
     step is ever offered; the task's own words run to the end of the message, so nothing can follow them);
   * a reply while a proposal is WAITING: approve, reject, a not-quite-yes ("ok"), a question ABOUT the plan, "skip step N", an
-    unsupported change, or anything else (= unrelated).
+    unsupported change, or anything else (= unrelated);
+  * a request to mark ONE task done, with the task's own words in quotes: `Mark "wire the joystick" as done` (the only way a completion is
+    ever offered - see `parse_completion_request`).
 
 A longer sentence that merely contains these words is not one of them. In particular a yes with a "but" ("yes but skip step 2") is
 NOT an approval: it matches nothing here, so it is "unrelated" and the pending proposal is dropped rather than guessed at.
@@ -16,9 +18,10 @@ NOT an approval: it matches nothing here, so it is "unrelated" and the pending p
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 
-from app.action_proposal.base import TASK_TEXT_CHARS, TASK_TEXT_LIMIT
+from app.action_proposal.base import COMPLETION_TEXT_LIMIT, TASK_TEXT_CHARS, TASK_TEXT_LIMIT
 from app.focus.recognition import MAX_SUBJECT_TOKENS
 
 MAX_MESSAGE_CHARS = 120
@@ -233,3 +236,56 @@ def parse_plan_request(message: object) -> PlanRequest | None:
     if len(text) > MAX_MESSAGE_CHARS and not match.group("task"):
         return None  # only a request that carries a task may be longer than any other message
     return _request(match, (match.groupdict().get("subject") or "").strip())
+
+
+# --- naming a task to mark done ----------------------------------------------------------------------------------------------------------
+
+#: ONE closed form: `Mark "<exact words>" as done` - the words in quotes, then "as done / complete / completed / finished", and nothing else
+#: in the message. The quotes are the whole point: they say where the task's name starts and stops, so no part of the sentence is ever
+#: guessed to be a name. Unquoted names ("mark the joystick done"), statements ("I finished wiring the joystick"), paraphrases, ids and
+#: every other sentence are NOT this grammar: they stay ordinary conversation, as they always were. The words between the quotes are only
+#: ever COMPARED with tasks that exist (builder.py); they are never read as anything else.
+#:
+#: Two things are enforced IN THE PATTERN, not after it: (1) each opening quote is paired, as one alternative, with ITS closing quote only -
+#: straight ' with ', straight " with ", curly “ with ”, curly ‘ with ’ - so a mismatched pair cannot match at all; (2) the words are made only
+#: of TASK_TEXT_CHARS (the one definition of what a task's words may contain: letters, digits, spaces and a little plain punctuation), so a
+#: character outside it - a quote of the other kind, a tab, a brace, a semicolon, a backslash, an emoji - is not this grammar. Nothing is
+#: normalised or rewritten: the words come back exactly as typed, with only runs of spaces collapsed to one (which is also all `same_words`
+#: ignores besides case).
+_QUOTE_PAIRS = (("'", "'"), ('"', '"'), ("“", "”"), ("‘", "’"))
+_NAMED_WORDS = rf" *\w{TASK_TEXT_CHARS}*"
+_QUOTED = "|".join(f"{re.escape(opener)}(?P<words{index}>{_NAMED_WORDS}){re.escape(closer)}" for index, (opener, closer) in enumerate(_QUOTE_PAIRS))
+_CLOSING = "".join(re.escape(closer) for closer in {closer for _, closer in _QUOTE_PAIRS})
+_DONE = r"(?:done|complete|completed|finished)"
+_COMPLETE = re.compile(
+    _LEAD + _POLITE + r"mark\s+(?:the\s+task\s+)?" + rf"(?:{_QUOTED})" + rf"\s+as\s+{_DONE}\s*[.!?]*\s*$",
+    re.IGNORECASE,
+)
+
+
+_EMBEDDED_REQUEST = re.compile(rf"[{_CLOSING}]\s+as\s+{_DONE}\b", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class CompletionRequest:
+    text: str  # the words between the quotes, whitespace collapsed - to be COMPARED with open tasks, never interpreted
+
+
+def parse_completion_request(message: object) -> CompletionRequest | None:
+    """The task the user named in quotes to be marked done, or None. Never raises. The whole message must be the one closed form; the quotes must
+    match each other (the pattern pairs each opener with its own closer); the words must be one clean line of at most COMPLETION_TEXT_LIMIT
+    characters, made only of TASK_TEXT_CHARS (so no control or invisible characters, and no embedded newline)."""
+    if not isinstance(message, str):
+        return None
+    text = message.strip()
+    if not text or len(text) > MAX_REQUEST_CHARS or len(text.splitlines()) != 1:  # one line: no \n, \r, \v, \f, U+0085, U+2028 or U+2029
+        return None
+    match = _COMPLETE.match(text)
+    if match is None:
+        return None
+    words = " ".join(next(group for group in match.groups() if group is not None).split())
+    if not words or len(words) > COMPLETION_TEXT_LIMIT or any(unicodedata.category(ch) in ("Cc", "Cf", "Zl", "Zp") for ch in words):
+        return None
+    if _EMBEDDED_REQUEST.search(words):
+        return None  # a second "... as done" inside the quotes is two requests in one sentence: not understood, so not acted on
+    return CompletionRequest(words)

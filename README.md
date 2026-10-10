@@ -172,7 +172,7 @@ jarvis/
       context.py           - FreshContextBuilder: the run's context, read anew every time from the existing Context Engine + memory facts
       adapter.py           - ScheduledExecutionAdapter: occurrence -> ONE ordinary PENDING Job, atomically with its ledger row
     orchestration/profiles.py - (Slice 2) run profiles: `unattended_v1`, a READ-only REDUCTION of what a Job may use (grants nothing)
-    action_proposal/       - (Productivity Action Loop, Slices 2-6) a temporary, in-memory plan the user can approve: honest 'Your part / My part' steps (My part: a reminder, or - if asked - saving the plan as a note and/or adding one task the user named); no Job until approval, no model; the verified one-time result report
+    action_proposal/       - (Productivity Action Loop, Slices 2-7) a temporary, in-memory plan the user can approve: honest 'Your part / My part' steps (My part: a reminder, or - if asked - saving the plan as a note and/or adding one task the user named), or - when a task is named in quotes - marking that one open task done; no Job until approval, no model; the verified one-time result report
     focus/                 - (Productivity Action Loop, Slice 1) read-only Focus: recognition / service (matching + deterministic ranking) / render; the last chat door, no state, no model
     scheduled_operations/  - (Scheduled Jobs V1, Slice 4 - creating, approving and managing them from chat; wired through main.py alone)
       language.py          - the fixed grammar: "every morning at 8, research X" / "what scheduled jobs do I have?" (no model; timing words are the reminders')
@@ -276,7 +276,7 @@ jarvis/
     test_scheduled_operations.py   - (Slice 4) request -> proposal -> existing confirmation -> atomic approval -> scheduler -> ordinary Job; management; security
     test_scheduled_operations_boundaries.py - (Slices 4-5) the layer cannot plan/run/launch/settle, imports no Handle This, adds no scheduler or store
     test_focus_recognition.py / test_focus_ranking.py / test_focus_service.py / test_focus_door.py / test_focus_interaction_precedence.py / test_focus_presentation.py - (Focus, Slice 1) the grammar boundary, the pure ranking, Tests A-D + untrusted text + bounds, door gating / precedence + package boundaries, a waiting question or confirmation always wins
-    test_action_proposal_recognition.py / _service.py / _door.py / _handoff.py / _execution.py / _result.py / _notes.py / _tasks.py - (Action Proposal, Slices 2-6) the grammars, building / follow-ups / approval / revalidation, precedence in the real core, the store handoff and package boundary, the exact approved plan run by the real JobEngine (allow-list, refusals, failure, restart, pause/resume, no re-planning), the verified one-time result report (truth, conversation binding, exactly-once, bounds, hook safety), and the optional note step (grammar, shown in full, exact handoff, mixed outcomes, interruption)
+    test_action_proposal_recognition.py / _service.py / _door.py / _handoff.py / _execution.py / _result.py / _notes.py / _tasks.py / _complete.py - (Action Proposal, Slices 2-7) the grammars, building / follow-ups / approval / revalidation, precedence in the real core, the store handoff and package boundary, the exact approved plan run by the real JobEngine (allow-list, refusals, failure, restart, pause/resume, no re-planning), the verified one-time result report (truth, conversation binding, exactly-once, bounds, hook safety), and the optional note step (grammar, shown in full, exact handoff, mixed outcomes, interruption)
     test_scheduled_jobs_final.py   - (Slice 5) Run Now, result presentation, renewal, the full lifecycle, and the final security review
     test_automation_store.py       - unit tests for SQLiteAutomationStore (persistence, trigger/condition/action round-trip)
     test_automation_conditions.py  - unit tests for FactEqualsCondition/TimeWindowCondition/condition_from_dict
@@ -1645,6 +1645,51 @@ engine are unchanged.
   automatic continuation. Slice 4 reports the tool's own stored result unchanged ("Step 3: Task 'order the servo' created."): a failure is
   reported as a failure, and an interrupted step as "I can't tell whether it happened - I did not retry it" - so a restart can leave zero or one
   new task, never two.
+
+### Slice 7: mark ONE named task done
+
+A fourth tool joins the allow-list (`app/action_proposal/base.py`): **`complete_task`**, with exactly one argument, `task_id`. Completion cannot be
+undone (a finished task never reopens, and there is no reopen tool), so this is the narrowest slice of all: Jarvis marks a task done only when the
+user NAMES it, in quotes, and the exact words belong to exactly ONE open task. Nothing is ever guessed. `cancel_task`, `list_tasks`, ids typed in
+a sentence, paraphrases and every other tool remain unreachable from a proposal; the Planner, JobEngine, ToolRegistry, TaskStore, Focus and the
+credential filter are unchanged.
+
+- **One closed form.** `Mark "wire the joystick" as done` - also `... as complete / completed / finished`, "mark the task ...", "please / could
+  you mark ...", with straight or curly quotes. The quotes say where the name starts and stops, and must PAIR: ' with ', " with ", “ with ” and
+  ‘ with ’ only (each opener is matched with its own closer inside the pattern, so `"wire the joystick'` is not this grammar). The name may
+  contain only the characters a task's words may (`TASK_TEXT_CHARS`: letters, digits, spaces and `' , - . / : + # ( ) % @`), starting with a letter,
+  digit or underscore - so a tab, a quote of the other kind, `; & < > { } $ \ !` and the like are not this grammar, and a task whose title holds
+  such a character cannot be named. The whole message must be this form and nothing else (one line - an embedded line break is rejected - at
+  most 100 characters of name, no second "... as done" inside the quotes). "I finished wiring the
+  joystick", "mark the joystick done", "complete the joystick task", unquoted names and task ids are NOT this grammar: they stay ordinary
+  conversation, exactly as before. The general capability router is untouched.
+- **One rule for "the same words" (`same_words`).** Equal after whitespace is collapsed and case is folded - nothing else. `wire the joystick`
+  is `Wire   the joystick`; it is NOT `wire the joystick.`, `wiring the joystick`, `wire the joysticks`, `wire joystick`, `finish wiring the
+  joystick`, or the words reordered. No punctuation is ignored, nothing is stemmed, scored, fuzzy-matched or semantically matched, no model is
+  asked, and Focus's word-overlap matcher is deliberately not used: it ranks relevance for prioritising, which is not identity.
+- **Exactly one OPEN task.** Only open (TODO) tasks are candidates; finished and cancelled ones are ignored. No match -> no proposal. Two or more
+  -> no proposal, and the reply says how many and that nothing was changed (a plain answer: nothing is held, so there is no new state). One whose
+  words cannot be shown back unchanged (too long, hidden as a credential, invisible characters) -> no proposal.
+- **Shown, then frozen.** The one step reads `My part: I'll mark the task "<its words>" as done. That can't be undone.` Its referent freezes the
+  task's id, its stamp (`task_stamp`) and its words; the proposal digest binds them. The id is a 32-character hex string, validated exactly, and the
+  words are display and verification only - never an instruction.
+- **Revalidation at the yes.** Beyond the existing digest, age, day and stamp checks: the step carries exactly `{"task_id": <id>}`; that id is
+  the one task its single referent names; the task still exists, is still open, still has the same words (`same_words`), and still has the stamp.
+  Any failure creates no Job and calls no tool: "the task changed - say it again with its exact words in quotes".
+- **Strict handoff.** `complete_task` takes exactly `task_id` (32 lower-case hex characters) and that id must be the step's one referent; one such
+  step per plan, and a plan that has one does nothing else. Existing checks (fresh step, one attempt, no dependencies, safe action) are unchanged.
+- **The task tool names the task.** `CompleteTaskTool`'s result used to carry only the opaque id, which the credential filter hides from any
+  report (a 32-hex id looks like a secret), so Slice 4 could only say "(details hidden - it looks like a credential)". Its success message and
+  its "not open" failure now name the task by its own words (whitespace collapsed to one line, at most 100 characters), read just before the one
+  atomic completion: "Task 'wire the joystick' completed." / "Task 'wire the joystick' is not open (it is already completed or cancelled), so
+  nothing was changed." The stored text, the id, the stamp and the store are untouched, and the message still passes through Slice 4's existing
+  safe-text / credential filtering, which is unchanged. An id that matches no task is still reported by that id; `cancel_task` is untouched.
+  Slice 4 itself is unchanged.
+- **Unchanged guarantees.** One approval pops one proposal and starts one RUNNING Job; one attempt, no retry, no replan, no model, no automatic
+  continuation. Skipping the step drops the plan. A step found mid-run after a restart is never run again and is reported as "I can't tell whether
+  it happened - I did not retry it" (the update is a single atomic write, but Slice 4 does not re-read the task to find out; you can check your list).
+  If someone completes the task between your yes and the engine, the step fails honestly, naming the task, and nothing is repeated. Proposals still
+  expire with the day, like every other plan.
 
 ## Persistent Automation Engine (M8)
 

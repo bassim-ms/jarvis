@@ -579,7 +579,7 @@ def test_a_note_step_must_be_fresh_and_independent(overrides):
 @pytest.mark.parametrize(
     "tool,permission",
     [
-        ("complete_task", "safe_action"), ("cancel_task", "safe_action"), ("list_notes", "read"),
+        ("cancel_task", "safe_action"), ("list_notes", "read"),
         ("complete_reminder", "safe_action"), ("cancel_reminder", "safe_action"), ("pause_reminder", "safe_action"),
         ("create_event", "confirm"), ("update_event", "confirm"), ("delete_event", "dangerous"), ("create_job", "safe_action"),
         ("run_automation", "safe_action"), ("remember", "safe_action"), ("set_goal", "safe_action"), ("open_url", "safe_action"),
@@ -592,12 +592,13 @@ def test_every_tool_but_the_two_is_refused_even_with_a_valid_looking_note(tool, 
     assert ExecutionHandoff(spy)(make_approved(tool=tool, args=dict(GOOD_NOTE), permission=permission)) == REFUSED and spy.calls == []
 
 
-def test_the_allow_list_is_the_three_tools_with_fixed_arguments():
-    assert ALLOWED_TOOLS == frozenset({"create_reminder", "save_note", "create_task"})
+def test_the_allow_list_is_the_four_tools_with_fixed_arguments():
+    assert ALLOWED_TOOLS == frozenset({"create_reminder", "save_note", "create_task", "complete_task"})
     assert ALLOWED_ARGUMENTS == {
         "create_reminder": frozenset({"at", "day", "text"}),
         "save_note": frozenset({"title", "content"}),
         "create_task": frozenset({"text"}),
+        "complete_task": frozenset({"task_id"}),
     }
     assert set(ALLOWED_ARGUMENTS) == ALLOWED_TOOLS
 

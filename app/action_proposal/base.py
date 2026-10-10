@@ -37,9 +37,31 @@ ALLOWED_ARGUMENTS = {
     "create_reminder": frozenset({"at", "day", "text"}),
     "save_note": frozenset({"title", "content"}),
     "create_task": frozenset({"text"}),  # never a priority, a due date or an id: the tool's own defaults apply
+    "complete_task": frozenset({"task_id"}),  # the one id the user was shown by its exact words, and nothing else
 }
-ALLOWED_TOOLS = frozenset({"create_reminder", "save_note", "create_task"})
+ALLOWED_TOOLS = frozenset({"create_reminder", "save_note", "create_task", "complete_task"})
 ALLOWED_PERMISSIONS = frozenset({"safe_action"})
+
+#: Why a named task was not turned into a proposal (builder -> service -> the words the user is told).
+NO_MATCH = "no_match"  # no OPEN task has exactly those words (a finished or cancelled one is not one)
+AMBIGUOUS = "ambiguous"  # two or more open tasks do: never a guess
+UNSHOWABLE = "unshowable"  # exactly one does, but its words cannot be shown back unchanged (too long, hidden, odd characters)
+UNAVAILABLE = "unavailable"  # the tasks could not be read, or the tool is not there / not valid right now
+
+COMPLETION_TEXT_LIMIT = 100  # a task named in quotes, and the longest title a completion may ever show (the same bound as any other label)
+TASK_ID = re.compile(r"[0-9a-f]{32}")  # what the Tasks store makes (`uuid4().hex`): the only shape of id a completion may carry
+
+
+def task_id_ok(value: object) -> bool:
+    """Exactly an id the Tasks store could have made: 32 lower-case hex characters, nothing around them."""
+    return isinstance(value, str) and TASK_ID.fullmatch(value) is not None
+
+
+def same_words(a: object, b: object) -> bool:
+    """THE matching rule for naming a task, and the only one: equal after whitespace is collapsed and case is folded. No punctuation is
+    ignored, no word is stemmed, added, removed or reordered, and nothing is scored: "wire the joystick" is "Wire   the joystick" and
+    nothing else - not "wire the joystick.", "wiring the joystick", "wire joystick" or "finish wiring the joystick"."""
+    return isinstance(a, str) and isinstance(b, str) and " ".join(a.split()).casefold() == " ".join(b.split()).casefold()
 
 #: What a task the user asks for may be made of: words, digits and a little plain punctuation - and nothing that could be mistaken for
 #: markup, a quotation, a command separator or a second clause. The ONE definition: the request grammar, the builder and the handoff all use it.

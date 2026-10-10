@@ -17,6 +17,11 @@ everything else. It is NOT checked against the tasks the user already has: Tasks
 words - a chore that comes round again), so identical text does not prove a duplicate, and nothing here decides that it does. What stops one
 approval creating two tasks is the pop-once approval and the single-attempt Job (service.py, handoff.py), not a comparison of text.
 
+A task is marked done only when the user NAMED it, in quotes, and exactly one OPEN task has those exact words (`same_words`: whitespace
+collapsed and case folded - nothing else is ignored, scored or guessed; Focus's word-overlap ranking is deliberately not used, because it
+orders things by relevance and completion cannot be undone). Zero matches, two or more, or a title that cannot be shown exactly give NO
+proposal. The one step freezes the task's id, its stamp and its words; none of them is looked up again after approval.
+
 Every referent is fingerprinted (`task_stamp`) so the proposal can be recognised as stale later.
 """
 
@@ -24,6 +29,7 @@ from __future__ import annotations
 
 import re
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -31,16 +37,23 @@ from app.action_proposal.base import (
     ALLOWED_ARGUMENTS,
     ALLOWED_PERMISSIONS,
     ALLOWED_TOOLS,
+    AMBIGUOUS,
+    COMPLETION_TEXT_LIMIT,
     MAX_ARGUMENT_TEXT,
     MAX_STEP_TEXT,
     MAX_STEPS,
     NOTE_CONTENT_LIMIT,
     NOTE_TITLE_LIMIT,
+    NO_MATCH,
+    UNAVAILABLE,
+    UNSHOWABLE,
     ActionProposal,
     ProposalRef,
     ProposalStep,
     ToolAction,
     proposal_digest,
+    same_words,
+    task_id_ok,
     task_stamp,
     task_text_ok,
 )
@@ -62,6 +75,7 @@ from app.tasks.base import TaskStatus
 
 NOTE_TOOL = "save_note"
 TASK_TOOL = "create_task"
+COMPLETE_TOOL = "complete_task"
 NOTE_STEP_LIMIT = NOTE_TITLE_LIMIT + NOTE_CONTENT_LIMIT + 100  # the note step is shown IN FULL, so its text bound covers its two arguments
 REMINDER_LEAD = timedelta(minutes=30)  # a reminder this long before a task's own timed due time
 MIN_REMINDER_AHEAD = timedelta(minutes=2)  # ... and only if that moment is still comfortably ahead
@@ -128,6 +142,19 @@ def is_task_step(step: ProposalStep) -> bool:
     return step.action is not None and step.action.tool_name == TASK_TOOL
 
 
+def is_completion_step(step: ProposalStep) -> bool:
+    return step.action is not None and step.action.tool_name == COMPLETE_TOOL
+
+
+@dataclass(frozen=True)
+class CompletionOutcome:
+    """A proposal to mark one named task done, or the reason there is none (`matches` is how many open tasks had those exact words)."""
+
+    proposal: ActionProposal | None = None
+    reason: str = ""
+    matches: int = 0
+
+
 def _why(candidate) -> str:
     phrases = [_DUE_WORDS[r] for r in candidate.reasons if r in _DUE_WORDS]
     if REASON_PRIORITY_HIGH in candidate.reasons:
@@ -192,6 +219,50 @@ class ProposalBuilder:
             digest=proposal_digest(subject, frozen),
             made_on=made_on,
         )
+
+    def build_completion(self, words: str, conversation_id: str) -> CompletionOutcome:
+        """The proposal to mark done the ONE open task whose words are exactly `words` (`same_words`), or why there is none. Reads the open tasks;
+        changes nothing. Never picks among candidates and never looks at anything but those exact words."""
+        try:
+            open_tasks = [task for task in self.tasks.list(TaskStatus.TODO) if task.status is TaskStatus.TODO]
+        except Exception:  # noqa: BLE001 - tasks that cannot be read are not tasks that can be completed
+            return CompletionOutcome(reason=UNAVAILABLE)
+        found = [task for task in open_tasks if same_words(task.text, words)]
+        if not found:
+            return CompletionOutcome(reason=NO_MATCH)
+        if len(found) > 1:
+            return CompletionOutcome(reason=AMBIGUOUS, matches=len(found))
+        task = found[0]
+        label = " ".join(task.text.split())  # the task's own words, whitespace collapsed: shown exactly and frozen as the step's referent
+        if not label or len(label) > COMPLETION_TEXT_LIMIT or safe_text(label, COMPLETION_TEXT_LIMIT) != label or not task_id_ok(task.id):
+            return CompletionOutcome(reason=UNSHOWABLE, matches=1)
+        action = ToolAction(COMPLETE_TOOL, (("task_id", task.id),))
+        try:
+            plan_steps_for(self.tools, [action])
+        except ProposalError:
+            return CompletionOutcome(reason=UNAVAILABLE, matches=1)  # the tool is not there or not valid right now: nothing that cannot run
+        shown = f"My part: I'll mark the task {quoted(label)} as done. That can't be undone."
+        if safe_text(shown, MAX_STEP_TEXT + 40) != shown:
+            return CompletionOutcome(reason=UNSHOWABLE, matches=1)
+        step = ProposalStep(
+            text=shown,
+            action=action,
+            refs=(ProposalRef(f"task:{task.id}", task_stamp(task), label),),
+            why="because you named it in quotes, and it is the only open task with those exact words",
+        )
+        now = self._now()
+        zone = reminder_zone(self.tools)
+        local_now = now.astimezone(zone) if zone is not None else now  # the day, read exactly as the service's revalidation reads it
+        steps = (step,)
+        proposal = ActionProposal(
+            id=uuid.uuid4().hex,
+            conversation_id=conversation_id,
+            subject=label,
+            steps=steps,
+            digest=proposal_digest(label, steps),
+            made_on=local_now.date().isoformat(),
+        )
+        return CompletionOutcome(proposal=proposal, matches=1)
 
     def refresh_note(self, subject: str, made_on: str, steps: tuple[ProposalStep, ...]) -> tuple[ProposalStep, ...]:
         """`steps` after one was skipped: a note step is rebuilt, in the same place, from the steps that REMAIN (its text listed the skipped

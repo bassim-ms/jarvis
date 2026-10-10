@@ -643,11 +643,15 @@ def test_the_task_that_appears_between_proposal_and_approval_does_not_make_it_st
     assert "Things changed" not in reply and len(rig.made()) == 2  # two rows: the semantics of Tasks, not a decision made here
 
 
-def test_nothing_reads_the_existing_tasks_to_decide_whether_to_offer_one():
+def test_nothing_reads_the_existing_tasks_to_decide_whether_to_offer_a_new_one():
+    """Adding a task never looks at the list. (Slice 7 reads it in exactly one place - `build_completion`, to find the ONE task a user named in
+    quotes - and test_action_proposal_complete.py pins that to that one function.)"""
+    package = Path(__file__).resolve().parent.parent / "app" / "action_proposal"
     for name in ("builder.py", "service.py"):
-        tree = ast.parse((Path(__file__).resolve().parent.parent / "app" / "action_proposal" / name).read_text(encoding="utf-8"))
-        called = {n.func.attr for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
-        assert "list" not in called, name  # only `get` of a task a step already refers to: never a search of the list for the same words
+        tree = ast.parse((package / name).read_text(encoding="utf-8"))
+        for fn in (n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name in ("build", "_task_step", "_create", "refresh_note")):
+            called = {n.func.attr for n in ast.walk(fn) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
+            assert "list" not in called, (name, fn.name)
 
 
 # ============================================================ skip: the user's steps and the task step are independent ====================
@@ -1039,8 +1043,6 @@ def test_a_task_step_is_attempted_once():
 @pytest.mark.parametrize(
     "tool,permission,args",
     [
-        ("complete_task", "safe_action", {"task_id": "abc"}),
-        ("complete_task", "safe_action", dict(GOOD_TASK)),
         ("cancel_task", "safe_action", {"task_id": "abc"}),
         ("cancel_task", "safe_action", dict(GOOD_TASK)),
         ("list_tasks", "read", {}),
@@ -1075,8 +1077,8 @@ def test_every_other_tool_is_refused_even_with_a_valid_looking_task(tool, permis
 
 def test_the_allow_list_names_create_task_with_exactly_one_argument():
     assert "create_task" in ALLOWED_TOOLS and ALLOWED_ARGUMENTS["create_task"] == frozenset({"text"})
-    assert not {"complete_task", "cancel_task", "list_tasks"} & ALLOWED_TOOLS
-    assert not {"priority", "due_date", "task_id"} & set().union(*ALLOWED_ARGUMENTS.values())
+    assert not {"cancel_task", "list_tasks"} & ALLOWED_TOOLS
+    assert not {"priority", "due_date"} & set().union(*ALLOWED_ARGUMENTS.values())
 
 
 def test_the_existing_reminder_and_note_checks_are_unchanged():
@@ -1108,7 +1110,6 @@ def test_the_registry_accepts_create_task_with_text_only(rig):
         ToolAction("create_task", (("text", TASK), ("priority", "low"), ("due_date", "2026-01-01"))),
         ToolAction("create_task", (("text", TASK), ("task_id", "x"))),
         ToolAction("create_task", (("text", 7),)),  # not a string
-        ToolAction("complete_task", (("task_id", "x"),)),
         ToolAction("cancel_task", (("task_id", "x"),)),
         ToolAction("list_tasks", ()),
         ToolAction("list_tasks", (("status", "todo"),)),
@@ -1315,7 +1316,7 @@ def _strings(path):
 
 
 def test_no_other_task_tool_or_task_argument_is_named_anywhere_in_the_package_code():
-    named = {"complete_task", "cancel_task", "list_tasks", "update_task", "delete_task", "priority", "due_date", "task_id"}
+    named = {"cancel_task", "list_tasks", "update_task", "delete_task", "priority", "due_date"}  # (complete_task: Slice 7, see its own tests)
     for path in PACKAGE.glob("*.py"):
         assert not named & _strings(path), (path.name, named & _strings(path))
 
@@ -1330,7 +1331,7 @@ def test_nothing_reads_or_writes_a_task_in_the_package_outside_the_one_read_it_a
     for path in PACKAGE.glob("*.py"):
         tree = ast.parse(path.read_text(encoding="utf-8"))
         calls = {n.func.attr for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
-        assert not calls & {"create", "complete", "cancel", "list", "update", "delete"}, (path.name, calls)
+        assert not calls & {"create", "complete", "cancel", "update", "delete"}, (path.name, calls)  # (`list`: Slice 7's one resolver only)
 
 
 def test_result_presentation_knows_no_tool_by_name():

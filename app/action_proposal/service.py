@@ -39,9 +39,19 @@ from app.action_proposal.base import (
     ApprovedProposal,
     ProposalStep,
     proposal_digest,
+    same_words,
+    task_id_ok,
     task_stamp,
 )
-from app.action_proposal.builder import ProposalBuilder, ProposalError, is_note_step, is_task_step, plan_steps_for, reminder_zone
+from app.action_proposal.builder import (
+    ProposalBuilder,
+    ProposalError,
+    is_completion_step,
+    is_note_step,
+    is_task_step,
+    plan_steps_for,
+    reminder_zone,
+)
 from app.action_proposal.recognition import (
     ACK,
     APPROVE,
@@ -55,6 +65,7 @@ from app.action_proposal.recognition import (
     SKIP,
     FollowUp,
     classify_follow_up,
+    parse_completion_request,
     parse_plan_request,
 )
 from app.focus.base import PICK
@@ -120,9 +131,10 @@ class ActionProposalService:
             if reply is not None:
                 return reply
             request = parse_plan_request(message)
-            if request is None:
-                return None
-            return self._create(request.subject, conversation_id, note=request.save_note, task_text=request.task_text)
+            if request is not None:
+                return self._create(request.subject, conversation_id, note=request.save_note, task_text=request.task_text)
+            named = parse_completion_request(message)
+            return None if named is None else self._complete(named.text, conversation_id)
         except Exception:  # noqa: BLE001 - a fault here is "not a proposal message": nothing was created
             return None
 
@@ -165,6 +177,16 @@ class ActionProposalService:
             return notice + words.render_proposal(proposal, approvable=False)
         self._hold(conversation_id, _Pending(proposal, self._monotonic() + self._ttl))
         return notice + words.render_proposal(proposal)
+
+    def _complete(self, task_words: str, conversation_id: str) -> str:
+        """The user named ONE task in quotes to be marked done. Either exactly one open task has those exact words - a one-step proposal, shown
+        and held like any other, completing nothing until a yes - or there is no proposal and they are told why. Nothing is held for a refusal:
+        it is a plain answer, and nothing was changed."""
+        outcome = self._builder.build_completion(task_words, conversation_id)
+        if outcome.proposal is None:
+            return words.completion_none(outcome.reason, task_words, outcome.matches)
+        self._hold(conversation_id, _Pending(outcome.proposal, self._monotonic() + self._ttl))
+        return words.render_proposal(outcome.proposal)
 
     # -- answering a waiting proposal --------------------------------------------------------------------------------------------------------
 
@@ -252,7 +274,8 @@ class ActionProposalService:
         proposal = entry.proposal
         problems, plan_steps = self._revalidate(proposal)
         if problems:
-            return words.changed(problems)
+            naming = any(is_completion_step(step) for step in proposal.steps)
+            return words.changed(problems, words.COMPLETE_AGAIN) if naming else words.changed(problems)
         approved = ApprovedProposal(
             proposal_id=proposal.id,
             conversation_id=proposal.conversation_id,
@@ -321,7 +344,30 @@ class ActionProposalService:
             for action in actions:
                 if self._reminder_has_passed(action, local_now):
                     problems.append("the reminder time has already passed")
+        for step in proposal.steps:
+            if is_completion_step(step):
+                for problem in self._completion_problems(step):
+                    if problem not in problems:
+                        problems.append(problem)
         return problems, plan_steps
+
+    def _completion_problems(self, step: ProposalStep) -> list[str]:
+        """What must still hold for a step that marks ONE task done, beyond the stamp every referent already has: it carries exactly an id, and
+        that id is the one task it refers to; the task still exists, is still open, and still has the words the user named."""
+        arguments = step.action.as_arguments()
+        task_id = arguments.get("task_id")
+        if set(arguments) != {"task_id"} or not task_id_ok(task_id) or len(step.refs) != 1 or step.refs[0].ref != f"task:{task_id}":
+            return ["what I would mark done is not the task I showed you"]
+        ref = step.refs[0]
+        try:
+            task = self.tasks.get(task_id)
+        except Exception:  # noqa: BLE001
+            return [f"I couldn't re-check {quoted(ref.label)}"]
+        if task is None or task.status is not TaskStatus.TODO:
+            return [f"{quoted(ref.label)} is no longer open"]
+        if not same_words(task.text, ref.label):
+            return [f"{quoted(ref.label)} has changed"]
+        return []
 
     @staticmethod
     def _reminder_has_passed(action, now: datetime) -> bool:
