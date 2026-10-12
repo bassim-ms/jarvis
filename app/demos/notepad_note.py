@@ -1,0 +1,469 @@
+"""
+The Notepad demonstration: open Notepad, write one short note, save it to a NEW file in a dedicated test directory, and prove from the disk that the
+file exists and holds the note.
+
+    python -m app.demos.notepad_note --dir C:\\...\\jarvis_demo_run1            # a dry run: checks everything, touches nothing
+    python -m app.demos.notepad_note --dir C:\\...\\jarvis_demo_run1 --run      # the real desktop run
+
+It is plumbing between parts that already exist, not a new capability:
+
+    preflight (refuse early)  ->  a fixed, validated plan  ->  a Job born RUNNING  ->  the existing JobEngine  ->  the existing tools  ->  the gate
+                                                                                                                  ->  an independent look at the disk
+
+  * THE GATE IS NEVER BYPASSED OR CONFIGURED HERE. The input tools are the real ones over the real backend, which asks the process-wide Computer Input
+    Gate before every OS call. This module never switches input on, never changes the limit and never builds a gate of its own. With input switched
+    off the first input step is refused by the backend and nothing else runs. The owner enables input for one run (`JARVIS_COMPUTER_INPUT_ENABLED=true`
+    in that process's environment).
+  * ONE ATTEMPT PER INPUT ACTION. Opening Notepad, each keystroke and typed text, the save: `max_attempts=1`, so nothing is ever repeated blindly. Only
+    READ steps (is the right window in front? has the dialog appeared? is the file there yet?) are retried, and that is how the demo waits.
+  * FOCUS IS VERIFIED IMMEDIATELY BEFORE EVERY KEYSTROKE AFTER THE LAUNCH: the step right before ctrl+n, the note, ctrl+s, the file name and the final
+    Enter is a read of the foreground window - its process must be notepad.exe, and before the file name and the Enter the Save As dialog's title must
+    be in front too (otherwise the path would land in the note). Each read is one existing, fail-closed check (a process that cannot be resolved is
+    "unknown", which never matches); if the window cannot be established, nothing is typed. There is no "assume it is fine" path.
+  * THE NOTE IS READ BACK BEFORE ANYTHING IS SAVED. `type_text` succeeding only means the keystrokes were queued; Notepad's editor has dropped some of
+    them in live runs. So right after the note is typed, `verify_document_text` reads the visible editor of the window in front (notepad_reader.py: read-only,
+    bounded window messages, hidden tabs ignored) and compares the WHOLE text with the note. Any difference - or any failure to read - stops the plan before
+    Ctrl+S: nothing is repaired, retyped or retried, no Save As is opened, no file is created. That step is also the last foreground check before Ctrl+S.
+  * NO OVERWRITE, AND NO ANSWERING A PROMPT. The directory must be fresh (new or empty) and the file name unique. Right before the Enter that saves,
+    `verify_demo_target_free` re-checks from the disk that the directory is still an empty, real directory and the target still does not exist. After the
+    Enter, the save only counts if the file on disk holds the note AND Notepad's own title now shows the new file's name. Jarvis never presses a key to
+    answer an overwrite (or any other) prompt - the plan has exactly one Enter - and never relies on which button such a prompt defaults to: if one
+    appears, the title check fails, the Job fails, and the prompt is left on the screen unanswered for the owner.
+  * RESIDUAL RACE (cannot be removed with this architecture). Notepad, not Jarvis, creates the file at the instant of the Enter, and Jarvis cannot reserve
+    the name without creating a file itself. So another process that can write to the fresh directory could still create the target between the last
+    check and Notepad's save. The effects are bounded: the one Enter would raise an overwrite prompt (left unanswered, so nothing is replaced by Jarvis),
+    the title check fails, and the report says so. The directory is brand new and created by this run, so this needs something else on the machine
+    deliberately writing there in that window. Do not point the demo at a shared, synced or watched folder.
+  * NO MODEL, NO REPLANNING, NO CLEAN-UP. The plan is fixed; the planner is never asked; a failed step fails the Job and its dependants are skipped.
+    Jarvis does not close Notepad, delete anything or try again - the report says what was left on the screen.
+  * CONFINED: the directory rules and the one file tool are in file_check.py. Nothing is read, changed or deleted anywhere else.
+
+The Job allowlist (`JOB_COMPUTER_TOOL_NAMES`) is untouched: the registry built here is private to this module.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+import time
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+from app.computer.base import ComputerBackend, ComputerControlError
+from app.computer.gate import InputGate, default_input_gate
+from app.computer.tools import OpenApplicationTool, PressKeyTool, SwitchWindowTool, TypeTextTool
+from app.demos.file_check import (
+    CheckDemoTargetFreeTool,
+    DemoPathError,
+    VerifyDemoFileTool,
+    check_target,
+    new_target,
+    validate_directory,
+    validate_note,
+)
+from app.demos.notepad_reader import DocumentReadError, read_visible_editor_text
+from app.observation.base import ObservationError, scrub
+from app.observation.engine import ObservationEngine
+from app.observation.page import FetchedPage, PageFetcher
+from app.observation.tools import VerifyObservationTool
+from app.orchestration.base import TERMINAL_JOB_STATUSES, AutonomyLevel, Job, JobStatus, RetryPolicy, StepStatus
+from app.orchestration.engine import JobEngine
+from app.orchestration.planner import Planner
+from app.orchestration.sqlite_store import SQLiteJobStore
+from app.orchestration.validator import validate_plan
+from app.tools.base import PermissionLevel, Tool, ToolRequirements, ToolResult
+from app.tools.registry import ToolRegistry
+
+#: open_application, ctrl+n, the note, ctrl+s, the file name, enter - the gated actions one successful run takes.
+INPUT_ACTIONS_NEEDED = 6
+NOTEPAD_PROCESS = "notepad.exe"
+DEFAULT_NOTE = "Jarvis demo note: written by Jarvis."
+DEFAULT_SAVE_DIALOG_TITLE = "Save As"  # Windows shows this title in English; pass --save-dialog-title for another display language
+MAX_STEPS = 20
+#: Each settling pause, and the ceiling `SettleTool` enforces. Three pauses (after the new tab, after the Save As dialog appears, after the file name is
+#: typed) give Notepad time to finish handling the keys just sent before the next one arrives.
+SETTLE_SECONDS = 1.5
+MAX_SETTLE_SECONDS = 5.0
+#: Reading the disk for the saved file. The shared plan validator allows at most 5 attempts per step (validator.py `_MAX_ALLOWED_ATTEMPTS`), and this demo
+#: does not raise that shared limit; the window is widened with a longer delay instead: 5 looks, 3 s apart = a wait of about 12 s (it was 4 looks, 1.5 s
+#: apart = about 4.5 s).
+FILE_CHECK_ATTEMPTS = 5
+FILE_CHECK_DELAY_SECONDS = 3.0
+MAX_WAIT_SECONDS = 240.0
+MAX_TICKS = 400
+INPUT_TOOLS = frozenset({"open_application", "type_text", "press_key"})
+
+
+class DemoRefused(Exception):
+    """The demo will not start (nothing was done to the desktop or the disk). The message says why."""
+
+
+@dataclass(frozen=True)
+class DemoSetup:
+    directory: Path
+    path: Path
+    note: str
+    save_dialog_title: str = DEFAULT_SAVE_DIALOG_TITLE
+
+
+@dataclass(frozen=True)
+class DemoReport:
+    succeeded: bool
+    text: str
+    job: Job | None = None
+
+
+# ============================================================ preflight: refuse early, change nothing ================================================
+
+
+def real_window_list() -> list[tuple[int, str, str]]:
+    """(hwnd, title, process) of the visible top-level windows, read-only - the same list `switch_window` chooses from."""
+    from app.computer.windows_backend import _list_switchable_windows
+
+    return _list_switchable_windows()
+
+
+def check_ready(
+    directory: object,
+    note: str = DEFAULT_NOTE,
+    *,
+    save_dialog_title: str = DEFAULT_SAVE_DIALOG_TITLE,
+    gate: InputGate | None = None,
+    list_windows: Callable[[], list[tuple[int, str, str]]] | None = None,
+    now: datetime | None = None,
+    token: str | None = None,
+) -> DemoSetup:
+    """Everything that can be checked WITHOUT touching the desktop or the disk. Raises DemoRefused (with the reason) or returns what a run would do."""
+    try:
+        note = validate_note(note)
+        folder = validate_directory(directory)
+        if not isinstance(save_dialog_title, str) or not save_dialog_title.strip() or len(save_dialog_title) > 60 or not save_dialog_title.isprintable():
+            raise DemoPathError("The Save As dialog title must be a short printable string.")
+        path = new_target(folder, now=now, token=token)
+    except DemoPathError as exc:
+        raise DemoRefused(str(exc)) from None
+
+    gate = gate if gate is not None else default_input_gate()
+    try:
+        gate.check("open_application")  # non-consuming: why input would be refused right now (switched off, limit reached)
+    except ComputerControlError as exc:
+        raise DemoRefused(str(exc)) from None
+    remaining = gate.remaining()
+    if remaining < INPUT_ACTIONS_NEEDED:
+        raise DemoRefused(
+            f"The demo takes {INPUT_ACTIONS_NEEDED} input actions in a row but only {remaining} remain in the current minute "
+            f"(or the per-minute limit is lower than {INPUT_ACTIONS_NEEDED}); it will not start a task its budget cannot finish."
+        )
+
+    try:
+        windows = (list_windows or real_window_list)()
+    except Exception:  # noqa: BLE001 - if the open windows cannot be listed, "none of them is Notepad" cannot be shown
+        raise DemoRefused("Could not list the open windows to confirm Notepad is not already running, so nothing was started.") from None
+    in_the_way = [w for w in windows if "notepad" in str(w[1]).lower() or str(w[2]).lower() == NOTEPAD_PROCESS]
+    if in_the_way:
+        raise DemoRefused(
+            f"{len(in_the_way)} open window(s) look like Notepad (or have 'Notepad' in their title). Close them first (including on other desktops): "
+            "the demo must not type into, or save over the work in, a window that is not its own."
+        )
+    return DemoSetup(directory=folder, path=path, note=note, save_dialog_title=save_dialog_title)
+
+
+# ================================================================== the plan =======================================================================
+
+
+def _step(step_id: str, tool: str, arguments: dict[str, Any], after: str | None, *, attempts: int = 1, delay: float = 0.0) -> dict[str, Any]:
+    raw: dict[str, Any] = {"id": step_id, "tool": tool, "arguments": arguments, "depends_on": [after] if after else []}
+    raw["max_attempts"] = attempts
+    raw["retry_delay_seconds"] = delay
+    return raw
+
+
+def build_raw_plan(setup: DemoSetup) -> list[dict[str, Any]]:
+    """The fixed plan. Each step depends on the one before it, so the first failure skips everything after it. Input steps: one attempt. READ steps: a
+    few bounded attempts, which is how the demo waits for Notepad, the dialog and the file."""
+
+    def in_front() -> dict[str, Any]:
+        return {"check": "window_process_is", "value": NOTEPAD_PROCESS}
+
+    chain = [
+        ("open_notepad", "open_application", {"app": "notepad"}, 1, 0.0),
+        ("front_notepad", "switch_window", {"title": "Notepad"}, 5, 2.0),
+        ("verify_notepad", "verify_observation", in_front(), 3, 1.0),
+        ("new_document", "press_key", {"key": "ctrl+n"}, 1, 0.0),
+        ("settle_after_new_tab", SETTLE_TOOL_NAME, {}, 1, 0.0),  # the new tab must be ready before the note arrives (the first live run lost characters here)
+        ("verify_focus_for_note", "verify_observation", in_front(), 2, 1.0),
+        ("type_note", "type_text", {"text": setup.note}, 1, 0.0),
+        # Read the document back BEFORE any save. This step is also the last foreground check before Ctrl+S (the reader refuses unless the window in front is
+        # notepad.exe, and it reads THAT window's visible editor), so it takes the place of the old process check at this spot. ONE attempt: never re-read, never repair.
+        ("verify_document_text", DOCUMENT_TOOL_NAME, {}, 1, 0.0),
+        ("open_save_as", "press_key", {"key": "ctrl+s"}, 1, 0.0),
+        ("verify_save_dialog", "verify_observation", {"check": "window_title_contains", "value": setup.save_dialog_title}, 5, 1.0),
+        ("settle_after_dialog", SETTLE_TOOL_NAME, {}, 1, 0.0),  # the dialog has a title before its file name box is ready for keys
+        ("verify_focus_for_name", "verify_observation", in_front(), 2, 1.0),
+        ("type_file_name", "type_text", {"text": str(setup.path)}, 1, 0.0),
+        ("settle_before_save", SETTLE_TOOL_NAME, {}, 1, 0.0),  # let the dialog finish taking the typed path (and its suggestion list settle) before Enter
+        # Everything that can be checked, checked again right before the one Enter that saves - the process (the read nearest the keystroke) last.
+        ("verify_target_free", "verify_demo_target_free", {}, 1, 0.0),
+        ("verify_dialog_before_save", "verify_observation", {"check": "window_title_contains", "value": setup.save_dialog_title}, 2, 1.0),
+        ("verify_focus_before_save", "verify_observation", in_front(), 2, 1.0),
+        ("confirm_save", "press_key", {"key": "enter"}, 1, 0.0),
+        ("verify_file", "verify_demo_file", {}, FILE_CHECK_ATTEMPTS, FILE_CHECK_DELAY_SECONDS),
+        # Notepad itself must now show the new file: an overwrite or error prompt in front (whose title is not the file's) fails here and is left alone.
+        ("verify_saved_title", "verify_observation", {"check": "window_title_contains", "value": setup.path.stem}, 3, 1.0),
+    ]
+    steps: list[dict[str, Any]] = []
+    previous: str | None = None
+    for step_id, tool, arguments, attempts, delay in chain:
+        steps.append(_step(step_id, tool, arguments, previous, attempts=attempts, delay=delay))
+        previous = step_id
+    return steps
+
+
+class _NoPages(PageFetcher):
+    """The demo only looks at windows; it never fetches a page."""
+
+    def fetch(self, url: str) -> FetchedPage:
+        raise ObservationError("this demo does not read pages")
+
+
+class _NoPlanner(Planner):
+    """The plan is fixed. If anything ever asked a model to change it, that is a bug, and it stops here."""
+
+    def plan(self, goal, *, available_tools, context, autonomy, replan_context=None):
+        raise RuntimeError("the Notepad demo has a fixed plan; nothing may re-plan it")
+
+
+SETTLE_TOOL_NAME = "demo_settle"
+
+
+def _checked_seconds(seconds: object) -> float:
+    if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or not 0 < seconds <= MAX_SETTLE_SECONDS:
+        raise ValueError(f"A settling pause must be more than 0 and at most {MAX_SETTLE_SECONDS:g} seconds.")
+    return float(seconds)
+
+
+class SettleTool(Tool):
+    """READ-only: wait a short, FIXED time so the application can finish handling the keys just sent. It sends no input, reads nothing and takes no arguments,
+    so a plan cannot choose how long to wait; the duration is fixed when the tool is built and may never exceed MAX_SETTLE_SECONDS. The sleep is injected so
+    tests never really wait. Private to this module's registry - it is in no shared registry and no Job allowlist."""
+
+    name = SETTLE_TOOL_NAME
+    description = "Wait a short, fixed time so the application can finish handling the keys just sent. Takes no arguments. Sends no input and reads nothing."
+    permission = PermissionLevel.READ
+    requirements = ToolRequirements()
+    automatable = False
+
+    def __init__(self, seconds: float = SETTLE_SECONDS, *, sleep: Callable[[float], None] = time.sleep):
+        self._seconds = _checked_seconds(seconds)
+        self._sleep = sleep
+
+    def execute(self) -> ToolResult:
+        self._sleep(self._seconds)
+        return ToolResult.success(data={"waited_seconds": self._seconds}, message=f"Waited {self._seconds:g} s for the application to settle.")
+
+
+DOCUMENT_TOOL_NAME = "verify_document_text"
+
+
+class VerifyDocumentTextTool(Tool):
+    """READ-only, run right after the note is typed and BEFORE any save: does the visible Notepad document hold exactly the expected note? It waits one fixed
+    settling pause (so Notepad can finish handling the keys just sent), then reads the editor ONCE through `read_document` and compares the whole text. Any
+    difference, and any failure to read (no editor, ambiguous editor, not Notepad, no answer in time, an API error), is a failure; a failure here stops the plan
+    before Ctrl+S. It never repairs, retypes or re-reads. It takes no arguments, sends no input, and reports only match / mismatch and the two LENGTHS - never
+    the document's text, which can hold anything that was already in Notepad. Private to this module's registry."""
+
+    name = DOCUMENT_TOOL_NAME
+    description = "Check that the visible Notepad document holds exactly the expected note, before saving. Takes no arguments. Read-only; reports lengths, not text."
+    permission = PermissionLevel.READ
+    requirements = ToolRequirements()
+    automatable = False
+
+    def __init__(self, expected: str, read_document: Callable[[], str], *, sleep: Callable[[float], None] = time.sleep, settle_seconds: float = SETTLE_SECONDS):
+        self._expected = validate_note(expected)
+        self._read = read_document
+        self._sleep = sleep
+        self._settle = _checked_seconds(settle_seconds)
+
+    def execute(self) -> ToolResult:
+        self._sleep(self._settle)
+        try:
+            actual = self._read()
+        except DocumentReadError as exc:
+            return ToolResult.error(f"Document check failed: {exc}. Save As was not opened and nothing was saved.")
+        except Exception as exc:  # noqa: BLE001 - never echo the exception's own text: it could carry window content
+            return ToolResult.error(f"Document check failed: the Notepad editor could not be read ({exc.__class__.__name__}). Save As was not opened and nothing was saved.")
+        if not isinstance(actual, str):
+            return ToolResult.error("Document check failed: the editor did not return text. Save As was not opened and nothing was saved.")
+        if actual != self._expected:
+            return ToolResult.error(
+                f"Document check failed: the document does not hold the expected note (expected {len(self._expected)} characters, found {len(actual)}). "
+                "Nothing was repaired or retyped, Save As was not opened and nothing was saved."
+            )
+        return ToolResult.success(data={"verified": True, "characters": len(actual)}, message=f"Verified: the document holds exactly the expected {len(actual)} characters.")
+
+
+def build_registry(
+    backend: ComputerBackend,
+    setup: DemoSetup,
+    *,
+    sleep: Callable[[float], None] = time.sleep,
+    read_document: Callable[[], str] | None = None,
+) -> ToolRegistry:
+    """A PRIVATE registry: the three input tools and switch_window over `backend`, window verification, the settling pause, and the two file checks bound to
+    this run's directory and file. It is registered nowhere else, so it widens nothing. `read_document` is how the document is read back before the save;
+    the default is the real read-only reader, and tests always pass a fake."""
+    registry = ToolRegistry()
+    registry.register(SettleTool(sleep=sleep))
+    registry.register(VerifyDocumentTextTool(setup.note, read_document if read_document is not None else (lambda: read_visible_editor_text()), sleep=sleep))
+    observer = ObservationEngine(fetcher=_NoPages(), backend=backend)
+    registry.register(OpenApplicationTool(backend))
+    registry.register(PressKeyTool(backend))
+    registry.register(TypeTextTool(backend))
+    registry.register(SwitchWindowTool(backend))
+    registry.register(VerifyObservationTool(observer))
+    registry.register(CheckDemoTargetFreeTool(setup.directory, setup.path))
+    registry.register(VerifyDemoFileTool(setup.directory, setup.path, setup.note))
+    return registry
+
+
+# ================================================================== running it =====================================================================
+
+
+def run_demo(
+    setup: DemoSetup,
+    backend: ComputerBackend,
+    *,
+    sleep: Callable[[float], None] = time.sleep,
+    read_document: Callable[[], str] | None = None,
+) -> DemoReport:
+    """Run the plan through the existing JobEngine and report what really happened. `backend` must be the gated one (`create_default_computer_backend()`)."""
+    try:
+        directory = validate_directory(setup.directory)
+        if not directory.exists():
+            directory.mkdir()  # one level; the parent was checked to exist
+        check_target(directory, setup.path, must_not_exist=True)  # re-checked now: never save over a file that appeared since the preflight
+    except (DemoPathError, OSError) as exc:
+        raise DemoRefused(str(exc) if isinstance(exc, DemoPathError) else f"The directory could not be prepared ({exc.__class__.__name__}).") from None
+
+    registry = build_registry(backend, setup, sleep=sleep, read_document=read_document)
+    steps = validate_plan(build_raw_plan(setup), registry, max_steps=MAX_STEPS, default_retry=RetryPolicy())
+    for step in steps:
+        if step.tool_name in INPUT_TOOLS and step.retry_policy.max_attempts != 1:
+            raise DemoRefused(f"Internal check failed: input step '{step.id}' would be attempted more than once.")
+
+    store = SQLiteJobStore(":memory:")  # nothing is persisted: the run lives and dies with this process
+    job = store.create_running_job("Notepad demo: write a short note and save it to a new file", steps, autonomy=AutonomyLevel.ASSISTED)
+    engine = JobEngine(
+        store=store, tools=registry, planner=_NoPlanner(), max_steps=MAX_STEPS, max_total_steps=2 * MAX_STEPS, max_retries_per_step=1,
+        max_replans=0, retry_delay_seconds=0.0, poll_interval_seconds=1000.0, sleep=sleep,
+    )
+    deadline = time.monotonic() + MAX_WAIT_SECONDS
+    for _ in range(MAX_TICKS):
+        engine.tick()
+        job = store.get(job.id)
+        if job.status in TERMINAL_JOB_STATUSES or time.monotonic() > deadline:
+            break
+    return build_report(job, setup)
+
+
+# ================================================================== the report =====================================================================
+
+
+def build_report(job: Job, setup: DemoSetup) -> DemoReport:
+    steps = list(job.plan.steps) if job.plan else []
+    by_id = {s.id: s for s in steps}
+
+    def status(step_id: str) -> StepStatus | None:
+        return by_id[step_id].status if step_id in by_id else None
+
+    ok = job.status is JobStatus.COMPLETED and status("verify_file") is StepStatus.SUCCEEDED and status("verify_saved_title") is StepStatus.SUCCEEDED
+    lines = [f"Notepad demo: {'SUCCEEDED' if ok else 'DID NOT SUCCEED'}", f"Target file: {setup.path}", "Steps:"]
+    for number, step in enumerate(steps, start=1):
+        detail = ""
+        if step.status is StepStatus.FAILED and step.error:
+            detail = f" - {scrub(step.error, 220)}"
+        lines.append(f"  {number:>2}. {step.id} ({step.tool_name}): {step.status.value}, {step.attempts} attempt(s){detail}")
+    if ok:
+        lines.append("Checked from the disk, not from the keystrokes: " + scrub((by_id["verify_file"].result or {}).get("message", ""), 200))
+        return DemoReport(True, "\n".join(lines), job)
+
+    failed = next((s for s in steps if s.status is StepStatus.FAILED), None)
+    skipped = [s.id for s in steps if s.status is StepStatus.SKIPPED]
+    if failed is not None:
+        lines.append(f"Stopped at '{failed.id}'." + (f" Not run: {', '.join(skipped)}." if skipped else ""))
+    else:
+        lines.append(f"The Job ended as '{job.status.value}' without finishing the plan.")
+    left: list[str] = []
+    if status("open_notepad") is StepStatus.SUCCEEDED:
+        left.append("Notepad was opened and is still open (Jarvis does not close it)")
+    if status("type_note") is StepStatus.SUCCEEDED:
+        left.append("the note text was typed into a Notepad document that may be unsaved")
+    if status("verify_document_text") is StepStatus.FAILED:
+        left.append(
+            "the typed note was NOT confirmed in the Notepad document (the step's error gives the lengths), so Save As was never opened and nothing was saved - "
+            "look at the document yourself, then close it or fix it by hand"
+        )
+    if status("open_save_as") is StepStatus.SUCCEEDED and status("confirm_save") is not StepStatus.SUCCEEDED:
+        left.append(
+            "the Save As dialog may still be open with the note unsaved"
+            + (" and the file path typed into it - Enter was NOT pressed, so nothing was saved" if status("type_file_name") is StepStatus.SUCCEEDED else "")
+        )
+    if status("confirm_save") is StepStatus.SUCCEEDED and status("verify_file") is not StepStatus.SUCCEEDED:
+        left.append(
+            "Enter was pressed in the Save As dialog, but the file was not confirmed on disk - a pressed Enter is not a saved file: the dialog may still be open "
+            "with the text unsaved, and if you finish the save yourself the file will hold whatever Notepad's document contains, which may differ from the note"
+            " - look at Notepad for a message or a prompt"
+        )
+    if status("confirm_save") is StepStatus.SUCCEEDED and status("verify_saved_title") is not StepStatus.SUCCEEDED:
+        left.append(
+            "after the one Enter Notepad's title did not show the new file's name, so a prompt (for example an overwrite confirmation) or an error may be open - "
+            "Jarvis pressed nothing to answer it and will not; deal with it yourself and check the directory before trusting any file in it"
+        )
+    lines.append("Left on the screen: " + ("; ".join(left) + "." if left else "nothing was started."))
+    lines.append("Nothing was retried, closed or deleted by Jarvis. Input actions are never repeated; review the screen and the directory yourself.")
+    lines.append("A typed path or a pressed Enter is not a saved file - only the check of the disk counts. Check the text in Notepad before saving anything by hand.")
+    return DemoReport(False, "\n".join(lines), job)
+
+
+# ====================================================================== CLI =====================================================================
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="python -m app.demos.notepad_note",
+        description="Open Notepad, write a note, save it to a NEW file, verify it from the disk.",
+        allow_abbrev=False,  # "--r" must never be read as "--run": the real desktop run needs the whole flag, spelled out
+    )
+    parser.add_argument("--dir", required=True, help="the dedicated directory (absolute; its own name must start with 'jarvis_demo')")
+    parser.add_argument("--note", default=DEFAULT_NOTE, help="the one-line ASCII note to write")
+    parser.add_argument("--save-dialog-title", default=DEFAULT_SAVE_DIALOG_TITLE, help="the Save As window title in your Windows display language")
+    parser.add_argument("--run", action="store_true", help="really do it on the desktop (without this, only the dry run happens)")
+    args = parser.parse_args(argv)
+
+    try:
+        setup = check_ready(args.dir, args.note, save_dialog_title=args.save_dialog_title)
+    except DemoRefused as exc:
+        print(f"Not started: {exc}")
+        return 2
+    plan = build_raw_plan(setup)
+    print(f"Ready. Directory: {setup.directory}\nNew file: {setup.path.name}\nNote: {setup.note}\nPlan: {len(plan)} steps, {INPUT_ACTIONS_NEEDED} input actions.")
+    if not args.run:
+        print("Dry run only: nothing was opened, typed, created or saved. Add --run to do it for real.")
+        return 0
+
+    from app.computer.factory import create_default_computer_backend
+
+    try:
+        report = run_demo(setup, create_default_computer_backend())
+    except DemoRefused as exc:
+        print(f"Not started: {exc}")
+        return 2
+    print(report.text)
+    return 0 if report.succeeded else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
