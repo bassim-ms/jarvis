@@ -6,6 +6,8 @@ Nothing sensitive is hard-coded here — see .env.example for the list of
 variables Jarvis understands.
 """
 
+import os
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -167,6 +169,22 @@ class Settings(BaseSettings):
     # local SQLite file, deliberately separate from memory/facts and the
     # World Model.
     notes_db_path: str = "jarvis_notes.db"
+
+    # Workspace Files (see app/workspace/) - ONE folder in which Jarvis may list
+    # and read text files and CREATE new ones (never overwrite, never delete).
+    # The folder is created on the first write, not at startup. It lives in the
+    # user's Documents, not the project folder, so generated files can never be
+    # committed by accident. `workspace_enabled` is a kill switch read on EVERY
+    # call; off, all three workspace tools refuse. The bounds are ceilings, not
+    # targets: one file at most `workspace_max_file_bytes`, the folder at most
+    # `workspace_max_files` files / `workspace_max_total_bytes` bytes, and at
+    # most `workspace_writes_per_minute` new files per minute.
+    workspace_enabled: bool = True
+    workspace_dir: str = os.path.join(os.path.expanduser("~"), "Documents", "Jarvis Workspace")
+    workspace_max_file_bytes: int = 64 * 1024
+    workspace_max_files: int = 200
+    workspace_max_total_bytes: int = 20 * 1024 * 1024
+    workspace_writes_per_minute: int = 10
 
     # Orchestration (M15 - goal-driven Jobs: plan -> validate -> execute
     # through the existing tool system, see app/orchestration/) - local

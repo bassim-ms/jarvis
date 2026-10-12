@@ -72,6 +72,9 @@ from app.tools.analyze import AnalyzeTool
 from app.tools.registry import ToolRegistry
 from app.orchestration.interactions import InteractionStore
 from app.tools.web_search import WebSearchTool
+from app.workspace.base import Workspace
+from app.workspace.factory import create_default_workspace
+from app.workspace.tools import workspace_tools
 
 
 def register_default_tools(
@@ -85,6 +88,7 @@ def register_default_tools(
     note_store: NoteStore | None = None,
     analysis_provider: AIProvider | None = None,
     interaction_store: InteractionStore | None = None,
+    workspace: Workspace | None = None,
 ) -> AutomationEngine:
     """Register every tool Jarvis ships with by default onto `registry`,
     and return the AutomationEngine built alongside the automation tools
@@ -224,6 +228,11 @@ def register_default_tools(
     registry.register(ListNotesTool(store=note_store))
     if analysis_provider is not None:
         registry.register(AnalyzeTool(provider=analysis_provider))
+
+    # Workspace Files (app/workspace/): list / read (READ) and CREATE-only write (SAFE_ACTION, not automatable) in ONE folder. Building the
+    # default Workspace touches no disk - the folder is created by the first write.
+    for workspace_tool in workspace_tools(workspace or create_default_workspace()):
+        registry.register(workspace_tool)
 
     return engine
 

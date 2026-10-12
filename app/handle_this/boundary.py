@@ -4,7 +4,8 @@ KINDS of objective Handle This may attempt.
 
     RESEARCH           finding/gathering current or external information
     ANALYSIS           reasoning over information already available
-    ORGANIZATION       tasks, reminders, notes and calendar organization
+    ORGANIZATION       tasks, reminders, notes, calendar organization, and listing / reading / CREATING new text files in the
+                       one Jarvis workspace folder (never changing, replacing or deleting an existing file)
     COMPUTER_WORKFLOW  approved browser / Windows computer-control workflows
 
 For each family this module lists the EXISTING tools that family is built on.
@@ -52,6 +53,9 @@ _DECLARED_TOOLS: dict[GoalFamily, frozenset[str]] = {
             "cancel_reminder",
             "save_note",
             "list_notes",
+            "list_workspace_files",
+            "read_workspace_file",
+            "write_workspace_file",
             "list_events",
             "create_event",
             "update_event",

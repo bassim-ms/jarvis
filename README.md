@@ -175,6 +175,7 @@ jarvis/
     orchestration/profiles.py - (Slice 2) run profiles: `unattended_v1`, a READ-only REDUCTION of what a Job may use (grants nothing)
     action_proposal/       - (Productivity Action Loop, Slices 2-7) a temporary, in-memory plan the user can approve: honest 'Your part / My part' steps (My part: a reminder, or - if asked - saving the plan as a note and/or adding one task the user named), or - when a task is named in quotes - marking that one open task done; no Job until approval, no model; the verified one-time result report
     focus/                 - (Productivity Action Loop, Slice 1) read-only Focus: recognition / service (matching + deterministic ranking) / render; the last chat door, no state, no model
+    workspace/             - (Automation Slice A1) Workspace Files: base.py `Workspace` (the whole policy: safe names, one folder, create-only, bounds, read-back check) / tools.py (list_workspace_files, read_workspace_file, write_workspace_file) / factory.py; ordinary tools on the ordinary ToolRegistry, no store, no planner, no GUI
     scheduled_operations/  - (Scheduled Jobs V1, Slice 4 - creating, approving and managing them from chat; wired through main.py alone)
       language.py          - the fixed grammar: "every morning at 8, research X" / "what scheduled jobs do I have?" (no model; timing words are the reminders')
       service.py           - ScheduledJobService: propose -> (approval) -> ACTIVE, and pause / resume / cancel / look, all on the Slice 1 policy and store's CAS
@@ -279,6 +280,7 @@ jarvis/
     test_focus_recognition.py / test_focus_ranking.py / test_focus_service.py / test_focus_door.py / test_focus_interaction_precedence.py / test_focus_presentation.py - (Focus, Slice 1) the grammar boundary, the pure ranking, Tests A-D + untrusted text + bounds, door gating / precedence + package boundaries, a waiting question or confirmation always wins
     test_computer_gate.py / test_host_guard.py - (Computer Input Gate) the switch (off by default) and the ONE shared 10-per-rolling-minute limit with its exact boundaries, enforcement at execution time through direct, registry and chained calls (concurrency-safe), the production wiring, audit logs that never carry a value; and the loopback-only Host check (IPv4 / localhost / IPv6, ports, every production route)
     test_action_proposal_recognition.py / _service.py / _door.py / _handoff.py / _execution.py / _result.py / _notes.py / _tasks.py / _complete.py - (Action Proposal, Slices 2-7) the grammars, building / follow-ups / approval / revalidation, precedence in the real core, the store handoff and package boundary, the exact approved plan run by the real JobEngine (allow-list, refusals, failure, restart, pause/resume, no re-planning), the verified one-time result report (truth, conversation binding, exactly-once, bounds, hook safety), and the optional note step (grammar, shown in full, exact handoff, mixed outcomes, interruption)
+    test_workspace_policy.py / _tools.py / _jobs.py / _handle_this.py - (Automation Slice A1) the Workspace rules (every unsafe name / path / link / control character, create-only, bounds, kill switch, read-back check), the tools and where they are and are not reachable, real JobEngine runs (research -> analyze -> write, read -> analyze -> write, hostile file text), and Handle This's treatment of file requests
     test_scheduled_jobs_final.py   - (Slice 5) Run Now, result presentation, renewal, the full lifecycle, and the final security review
     test_automation_store.py       - unit tests for SQLiteAutomationStore (persistence, trigger/condition/action round-trip)
     test_automation_conditions.py  - unit tests for FactEqualsCondition/TimeWindowCondition/condition_from_dict
@@ -786,6 +788,48 @@ What this does **not** do: it does not authenticate `/chat`; the interactive `op
 (the Job variant does not); and the counter is per process and in memory (a restart forgets it - the switch is off by default anyway). Tests pin that
 production builds the real backend in exactly one place, that nothing else in the application calls the OS input functions, and that every OS input call
 in the real backend sits behind a gate admission in the same method.
+
+### Workspace Files (Automation Slice A1)
+
+A Job (or an explicit chat command) can now end in a file you can open, and start from a file you wrote: "Research CoreXY frames and write a
+summary into a file called corexy-summary.md", "Prepare a study checklist from physics-notes.md". Three ordinary tools on the ordinary
+`ToolRegistry` (`app/workspace/`) - no new store, planner, executor, permission rule or GUI control:
+
+| Tool | Permission | What it does |
+|---|---|---|
+| `list_workspace_files` | READ | the plain text files in the folder: `{name, bytes, modified}` |
+| `read_workspace_file` | READ | one file as **data**: `{name, bytes, text, redacted}` (secret-shaped strings become `[redacted]`) |
+| `write_workspace_file` | SAFE_ACTION, `automatable = False` | CREATE one **new** file; never overwrites, appends, renames or deletes |
+
+- **One folder.** `JARVIS_WORKSPACE_DIR`, by default `Documents\Jarvis Workspace` (deliberately NOT inside the project, so generated files can
+  never be committed by accident). It is created by the first write, never at startup. `JARVIS_WORKSPACE_ENABLED=false` is a kill switch read on
+  **every** call: off, all three tools refuse at once.
+- **The name is the whole path.** A plain filename of at most 64 characters - letters, digits, `. _ - space`, starting with a letter or digit -
+  ending in `.txt`, `.md`, `.csv` or `.json` (inert text; nothing a double-click could run). So there is no separator, drive, `:` (alternate data
+  stream), `..`, subfolder, trailing dot or space, or Windows device name (`CON`, `NUL`, `COM1`...). A refused name creates nothing, not even the folder.
+- **Create-only.** The file is made with an exclusive create, so it can only succeed if nothing by that name exists (also on a case-insensitive disk);
+  racing writers produce exactly one file. The bytes are read back and compared before success is reported; a failed or unverifiable write removes
+  only the file that call created. Existing files are never touched - to change one, you do it.
+- **Nothing outside the folder.** A symlink, junction or other reparse point is refused - as the folder itself and as an entry (it is neither
+  listed, read, nor written through) - and the resolved parent of every path is checked once more.
+- **Bounded.** One file at most 64 KB (`JARVIS_WORKSPACE_MAX_FILE_BYTES`), 200 files (`..._MAX_FILES`), 20 MB in total (`..._MAX_TOTAL_BYTES`), 10 new files
+  per minute (`..._WRITES_PER_MINUTE`); a folder with more than 2000 entries is treated as full. Text must be non-empty UTF-8 without control,
+  zero-width or bidirectional-override characters (newline, tab and carriage return are fine). A file over the bound is **refused when read, never
+  read in part**.
+- **Results name a file and a size, never a path** (`Created 'corexy-summary.md' (3412 bytes).`) and no raw OS error is ever shown.
+- **Who can reach them.** A Job's Planner is offered all three (the existing plan validator rejects any argument they do not declare - no `path`,
+  no `overwrite`). An explicit chat command works too (`use tool write_workspace_file notes.md hello`). A scheduled run, the unattended profile and
+  an automation can use none of them (`write_workspace_file` is not automatable; the unattended list is unchanged). Handle This lists them under
+  its ORGANIZATION family and its interpreter now counts reading and creating *new* files there, while changing, replacing or deleting existing
+  files stays unsupported.
+- **Limits that come from the tools they are chained with.** `analyze` takes only structured material of at most 8000 characters, so pass it the
+  whole `read_workspace_file` result (`data`), and a larger file cannot be analysed in one step. A value handed between steps is bounded to
+  12000 characters and never cut, so copying a longer file by reference fails visibly (no partial file); `analyze` caps its own reply at 6000
+  characters with a visible `...[truncated]` marker. A longer text can still be written by giving it directly.
+- **What it does not promise.** Content is written as given (it is your request or the model's answer, in a folder you own); secret-shaped strings
+  are redacted on **read**, not blocked on write. Reading is not private from the AI: text read here can be passed to the configured AI provider by a
+  later step such as `analyze`. This is file I/O only: it adds no keyboard, mouse, window or process control and leaves the computer-control and
+  observation tools, their isolation and their allowlists exactly as they were.
 
 ### Search Routing (M6.9)
 
