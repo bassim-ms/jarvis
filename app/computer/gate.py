@@ -133,6 +133,18 @@ class InputGate:
             logger.warning("computer_input refused action=%s reason=%s stage=preflight", action, "disabled" if reason is SWITCHED_OFF else "rate_limited")
             raise ComputerControlError(reason)
 
+    def remaining(self) -> int:
+        """READ-ONLY: how many more actions would be admitted if they were attempted right now - 0 while input is switched off or the limit cannot be
+        read. It records nothing, logs nothing and takes no slot, so it can never be what limits anyone and is never the enforcement (`admit` is). A
+        caller that needs several actions in a row (a multi-step task) can use it to refuse to START one the budget cannot finish; the answer is a
+        snapshot, and `admit` still decides each action when it happens."""
+        with self._lock:
+            now = self._clock()
+            self._expire(now)
+            if not self._is_enabled():
+                return 0
+            return max(0, self._current_limit() - len(self._events))
+
     def admit(self, action: str, shape: str = "") -> None:
         """THE enforcement. Atomically: refuse (raising ComputerControlError, consuming nothing) or record one action and return."""
         with self._lock:

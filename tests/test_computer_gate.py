@@ -723,7 +723,7 @@ class RecordingOS:
     def size(self):
         return (1920, 1080)
 
-    def write(self, text):
+    def write(self, text, interval=0.0):  # the real backend now paces typing (windows_backend.TYPING_INTERVAL_SECONDS); what is recorded is still just the text
         self._record("write", text)
 
     def press(self, key):

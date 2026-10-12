@@ -38,6 +38,7 @@ from app.computer.base import (
 )
 from app.computer.defaults import create_computer_tools_registry
 from app.computer.gate import InputGate
+from app.computer import windows_backend
 from app.computer.windows_backend import WindowsComputerBackend
 from app.core import JarvisCore
 from app.memory.sqlite_store import SQLiteMemoryStore
@@ -258,7 +259,8 @@ def test_type_text_forwards_validated_text(backend):
     with patch("app.computer.windows_backend.pyautogui.write") as write:
         backend.type_text("hello")
 
-    write.assert_called_once_with("hello")
+    write.assert_called_once_with("hello", interval=windows_backend.TYPING_INTERVAL_SECONDS)
+    assert windows_backend.TYPING_INTERVAL_SECONDS == 0.03
 
 
 def test_type_text_rejects_invalid_text_before_touching_pyautogui(backend):

@@ -57,9 +57,12 @@ from app.computer.gate import InputGate, default_input_gate
 # in-progress automation. Left at its library default (True) - never
 # disabled here.
 pyautogui.FAILSAFE = True
-# No artificial delay between PyAutoGUI calls beyond the library's own
-# default pause - this backend doesn't change PyAutoGUI's global timing
-# behavior.
+# This backend doesn't change PyAutoGUI's global timing behavior (its
+# default pause applies once after each call). `write()` is the exception
+# that needed care: left alone it sends every character back-to-back with
+# no delay at all, which a busy application (e.g. the Windows 11 Notepad
+# editor) can drop characters from. So `type_text` passes this interval.
+TYPING_INTERVAL_SECONDS = 0.03
 
 #: The ENTIRE closed mapping from an `AllowedApplication` member to its
 #: one, fixed launch command - see this module's own docstring. Every
@@ -333,7 +336,7 @@ class WindowsComputerBackend(ComputerBackend):
     def type_text(self, text: str) -> None:
         validate_text(text)
         self.gate.admit("type_text", f"chars={len(text)}")
-        pyautogui.write(text)
+        pyautogui.write(text, interval=TYPING_INTERVAL_SECONDS)
 
     def press_key(self, key: str) -> None:
         tokens = normalize_key_input(key)
