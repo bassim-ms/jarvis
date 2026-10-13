@@ -42,15 +42,18 @@ from app.computer.base import (
     MouseButton,
     ScreenInfo,
     WindowInfo,
+    exact_window_matches,
     is_switchable,
     normalize_key_input,
-    validate_window_query,
     validate_coordinates,
+    validate_exact_window_title,
+    validate_process_name,
     validate_scroll_amount,
     validate_text,
     validate_url,
 )
-from app.computer.gate import InputGate, default_input_gate
+from app.computer.authority import InputGrant
+from app.computer.gate import InputGate, admit_input, default_input_gate, require_input_gate
 
 # PyAutoGUI's own safety net: moving the mouse into a screen corner
 # raises pyautogui.FailSafeException, giving a human a way to abort any
@@ -63,6 +66,9 @@ pyautogui.FAILSAFE = True
 # no delay at all, which a busy application (e.g. the Windows 11 Notepad
 # editor) can drop characters from. So `type_text` passes this interval.
 TYPING_INTERVAL_SECONDS = 0.03
+#: `type_text` is SENT in chunks of at most this many characters and rechecked before each (gate.py: IN FLIGHT), so at ~0.03 s a character a revocation, an expiry or a
+#: switch-off is seen within about 1.5 s of typing (plus pyautogui's own pause), instead of after up to 30 s. Smaller means a quicker stop and more rechecks.
+TYPING_CHUNK_CHARACTERS = 50
 
 #: The ENTIRE closed mapping from an `AllowedApplication` member to its
 #: one, fixed launch command - see this module's own docstring. Every
@@ -211,18 +217,26 @@ class WindowsComputerBackend(ComputerBackend):
     """The default, real ComputerBackend - see app/computer/factory.py
     for how it's constructed for the running application.
 
-    COMPUTER INPUT GATE (app/computer/gate.py): this class enforces the gate ITSELF, at the exact line before each call that would send input to the
-    desktop - `open_application`, `type_text`, `press_key`, `move_mouse`, `click_mouse`, `double_click`. So it does not matter how an instance was
-    obtained: any `WindowsComputerBackend()`, built by the factory or by any other code, is switched off by default and shares ONE process-wide rate
-    limit with every other instance (unless a caller deliberately passes its own `gate`, as a test does). A request that fails validation is turned
-    away BEFORE the gate and uses no slot; one the gate admits counts even if the OS then fails. Construction itself touches nothing."""
+    COMPUTER INPUT GATE (app/computer/gate.py): this class enforces the gate ITSELF, at the exact line before each call that would act on the desktop -
+    `open_application`, `type_text`, `press_key`, `move_mouse`, `click_mouse`, `double_click`, `scroll`, `open_url` and `switch_window`. So it does not matter how an instance was
+    obtained: any `WindowsComputerBackend()`, built by the factory or by any other code, is switched off by default, admits NOTHING without an authorization
+    grant it was explicitly handed (`authority=`; none by default) and shares ONE process-wide rate limit with every other instance (unless a caller deliberately
+    passes its own `InputGate`, as a test does; anything else is refused). A request that fails validation is turned away BEFORE the gate and uses no slot or grant entry; one the gate admits
+    counts even if the OS then fails. Construction itself touches nothing.
 
-    def __init__(self, gate: InputGate | None = None):
-        self.gate = gate if gate is not None else default_input_gate()
+    `open_url` binds the EXACT URL and `switch_window` the EXACT window title and the EXACT process name; the gate is asked BEFORE the browser is opened or any window is
+    listed. `switch_window` lists the windows once, and only an exact title-plus-process match is switched to: no match, or more than one, is an error with no focus
+    operation, no fallback and no second look, and the entry stays spent. A grant binds the title and process, NOT a window instance."""
+
+    def __init__(self, gate: InputGate | None = None, authority: InputGrant | None = None):
+        self.gate = require_input_gate(gate) if gate is not None else default_input_gate()  # only a real InputGate (TypeError otherwise): no stand-in whose admit says yes
+        # The authorization this INSTANCE carries, if anyone handed it one. The shared production backend carries none, so it admits no input whatever the switch
+        # says; authority is a reference passed to a backend, never ambient context (see app/computer/authority.py).
+        self._authority = authority
 
     def check_input(self, action: str) -> None:
         """What the tools call from `validate_arguments`: the gate's non-consuming pre-check (the enforcement is in the methods below)."""
-        self.gate.check(action)
+        self.gate.check(action, authority=self._authority)
 
     def get_active_window(self) -> WindowInfo:
         hwnd = win32gui.GetForegroundWindow()
@@ -271,7 +285,7 @@ class WindowsComputerBackend(ComputerBackend):
             raise ComputerControlError(f"Unknown application: {app!r}")
 
         command = _APP_LAUNCH_COMMANDS[app]
-        self.gate.admit("open_application")
+        admit_input(self.gate, self._authority, "open_application", app)
         try:
             subprocess.Popen(command, shell=False)
         except (OSError, FileNotFoundError) as exc:
@@ -281,6 +295,7 @@ class WindowsComputerBackend(ComputerBackend):
 
     def open_url(self, url: str) -> None:
         validate_url(url)
+        admit_input(self.gate, self._authority, "open_url", url)  # BEFORE the browser: the grant binds this exact string
         opened = webbrowser.open(url)
         if not opened:
             raise ComputerControlError(f"Could not open URL: {url!r}")
@@ -319,28 +334,50 @@ class WindowsComputerBackend(ComputerBackend):
                 "the active window."
             )
 
-    def switch_window(self, title: str) -> WindowInfo:
-        """Composes the helpers `open_url` already uses (`_bring_to_foreground`, `_foreground_window`): the topmost
-        matching local window is activated, and success is only claimed once Windows really made it foreground."""
-        query = validate_window_query(title).lower()
-        matches = [w for w in _list_switchable_windows() if query in w[1].lower()]
+    def switch_window(self, title: str, process: str) -> WindowInfo:
+        """Composes the helpers `open_url` already uses (`_bring_to_foreground`, `_foreground_window`). Order: validate, ADMIT, list the windows ONCE, take the exact match,
+        activate it. The grant binds the exact `title` and the exact `process`; the entry is spent at admission, so a lookup that finds nothing, or finds several windows with
+        that exact title and process, is an error with no focus operation, no fallback and no second look - and a retry needs a new entry. Success is only claimed once Windows
+        really made the window foreground. (The grant does not identify one window: two matching windows are an error, never a choice.)"""
+        exact_title, exact_process = validate_exact_window_title(title), validate_process_name(process)
+        admit_input(self.gate, self._authority, "switch_window", exact_title, exact_process)  # BEFORE any window is listed or touched
+        matches = exact_window_matches(_list_switchable_windows(), exact_title, exact_process)
         if not matches:
-            raise ComputerControlError(f"No visible window title contains {title!r}.")
-        hwnd, window_title, process = matches[0]
+            raise ComputerControlError("No visible window has exactly that title and process.")
+        if len(matches) > 1:
+            raise ComputerControlError("More than one visible window has exactly that title and process; none was chosen.")
+        hwnd, window_title, process_name = matches[0]
         if _foreground_window() != hwnd:
             _bring_to_foreground(hwnd)
         if _foreground_window() != hwnd:
             raise ComputerControlError(f"Windows did not let '{window_title}' become the active window.")
-        return WindowInfo(title=window_title, process_name=process, is_maximized=self._is_maximized(hwnd))
+        return WindowInfo(title=window_title, process_name=process_name, is_maximized=self._is_maximized(hwnd))
 
     def type_text(self, text: str) -> None:
+        """Type `text` (at most MAX_TEXT_LENGTH characters) as ONE gated action: one grant entry and one rate-limit slot for the whole text, matched against the grant by the
+        exact text, as before. It is SENT in chunks of at most TYPING_CHUNK_CHARACTERS, and before every chunk the admission is rechecked without consuming anything, so a
+        revoked or expired grant, or a switch turned off, stops the typing at the next chunk boundary. Characters already sent to the operating system cannot be recalled;
+        the stop is observed at the next recheck, so at most the chunk in progress completes. A failure part-way (an OS error) ends the typing too; the admission stays spent."""
         validate_text(text)
-        self.gate.admit("type_text", f"chars={len(text)}")
-        pyautogui.write(text, interval=TYPING_INTERVAL_SECONDS)
+        ticket = admit_input(self.gate, self._authority, "type_text", text, keep_open=True)
+        try:
+            for start in range(0, len(text), TYPING_CHUNK_CHARACTERS):
+                try:
+                    ticket.still_authorized()
+                except ComputerControlError:
+                    if start == 0:
+                        raise  # nothing was typed at all
+                    raise ComputerControlError(
+                        "Typing was stopped part-way because its authorization ended (revoked, expired, or computer input switched off). "
+                        "Characters already sent to the operating system cannot be recalled."
+                    ) from None
+                pyautogui.write(text[start : start + TYPING_CHUNK_CHARACTERS], interval=TYPING_INTERVAL_SECONDS)
+        finally:
+            ticket.close()
 
     def press_key(self, key: str) -> None:
         tokens = normalize_key_input(key)
-        self.gate.admit("press_key", f"parts={len(tokens)}")
+        admit_input(self.gate, self._authority, "press_key", tokens)
         if len(tokens) == 1:
             pyautogui.press(tokens[0])
         else:
@@ -348,7 +385,7 @@ class WindowsComputerBackend(ComputerBackend):
 
     def move_mouse(self, x: int, y: int) -> None:
         validate_coordinates(x, y, self.get_screen_info())
-        self.gate.admit("move_mouse")
+        admit_input(self.gate, self._authority, "move_mouse", x, y)
         pyautogui.moveTo(x, y)
 
     def click_mouse(
@@ -357,18 +394,18 @@ class WindowsComputerBackend(ComputerBackend):
         if not isinstance(button, MouseButton):
             raise ComputerControlError(f"Unknown mouse button: {button!r}")
         if x is None and y is None:
-            self.gate.admit("click_mouse")
+            admit_input(self.gate, self._authority, "click_mouse", None, None, button)
             pyautogui.click(button=button.value)
         else:
             validate_coordinates(x, y, self.get_screen_info())
-            self.gate.admit("click_mouse")
+            admit_input(self.gate, self._authority, "click_mouse", x, y, button)
             pyautogui.click(x=x, y=y, button=button.value)
 
     def double_click(self, x: int, y: int, button: MouseButton) -> None:
         if not isinstance(button, MouseButton):
             raise ComputerControlError(f"Unknown mouse button: {button!r}")
         validate_coordinates(x, y, self.get_screen_info())
-        self.gate.admit("double_click")
+        admit_input(self.gate, self._authority, "double_click", x, y, button)
         # PyAutoGUI's own dedicated double-click primitive - never
         # `click(clicks=2)`, which would expose an arbitrary click count
         # this milestone deliberately doesn't (see app/computer/tools.py:
@@ -377,4 +414,5 @@ class WindowsComputerBackend(ComputerBackend):
 
     def scroll(self, amount: int) -> None:
         validate_scroll_amount(amount)
+        admit_input(self.gate, self._authority, "scroll", amount)
         pyautogui.scroll(amount)

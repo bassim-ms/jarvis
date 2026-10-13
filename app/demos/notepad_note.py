@@ -14,8 +14,19 @@ It is plumbing between parts that already exist, not a new capability:
     Gate before every OS call. This module never switches input on, never changes the limit and never builds a gate of its own. With input switched
     off the first input step is refused by the backend and nothing else runs. The owner enables input for one run (`JARVIS_COMPUTER_INPUT_ENABLED=true`
     in that process's environment).
-  * ONE ATTEMPT PER INPUT ACTION. Opening Notepad, each keystroke and typed text, the save: `max_attempts=1`, so nothing is ever repeated blindly. Only
-    READ steps (is the right window in front? has the dialog appeared? is the file there yet?) are retried, and that is how the demo waits.
+  * THE SWITCH IS NOT ENOUGH: THE RUN CARRIES ITS OWN GRANT. `--run` is the explicit authorization. It derives the seven exact input actions (with their exact
+    arguments - for the window switch, the exact title and the exact process name) from the SAME plan the Job then runs, mints one grant for exactly that ordered list (valid 120 s, single-use entries, app/computer/authority.py),
+    hands it to ONE backend instance, and revokes it when the run ends, however it ends. A different action, different text or a different order is refused AND ends
+    the grant; the shared backend the rest of Jarvis uses carries no grant and admits nothing. Nothing here authorizes chat, Jobs, schedulers or automations.
+  * ONE ATTEMPT PER INPUT ACTION. Opening Notepad, bringing it forward, each keystroke and typed text, the save: `max_attempts=1`, so nothing is ever repeated
+    blindly. Only READ steps (is the right window in front? has the dialog appeared? is the file there yet?) are retried, and that is how the demo waits.
+  * BRINGING NOTEPAD FORWARD IS AN AUTHORIZED ACTION TOO (`front_notepad`, tool `demo_front_notepad`). Windows does not bring a launched Notepad forward, and the
+    window needs a moment to exist, so this one step first LOOKS for it - up to five read-only looks, two seconds apart, that change no focus and send no input and
+    never touch the gated action - and only when exactly one window has Notepad's exact title and process does it make the ONE gated `switch_window` call. The grant binds
+    that exact title (`--notepad-title`, default "Untitled - Notepad") and the exact process `notepad.exe`; the backend admits first and then looks for an exact match
+    ONCE. So: no window after five looks, or more than one, fails the step WITHOUT calling the backend - that entry is not spent and nothing is typed; once the backend
+    is called, its entry is spent whatever the lookup finds, and it is never retried. The failure report lists the expected title and the titles of the visible
+    notepad.exe windows, read-only. A grant binds a title and a process, not a window instance: two matching windows are an error, never a choice.
   * FOCUS IS VERIFIED IMMEDIATELY BEFORE EVERY KEYSTROKE AFTER THE LAUNCH: the step right before ctrl+n, the note, ctrl+s, the file name and the final
     Enter is a read of the foreground window - its process must be notepad.exe, and before the file name and the Enter the Save As dialog's title must
     be in front too (otherwise the path would land in the note). Each read is one existing, fail-closed check (a process that cannot be resolved is
@@ -52,9 +63,19 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from app.computer.base import ComputerBackend, ComputerControlError
-from app.computer.gate import InputGate, default_input_gate
-from app.computer.tools import OpenApplicationTool, PressKeyTool, SwitchWindowTool, TypeTextTool
+from app.computer.authority import AuthorityError, InputStep
+from app.computer.base import (
+    AllowedApplication,
+    ComputerBackend,
+    ComputerControlError,
+    exact_window_matches,
+    normalize_key_input,
+    validate_exact_window_title,
+    validate_process_name,
+    windows_of_process,
+)
+from app.computer.gate import GATED_METHODS, InputGate, default_input_gate
+from app.computer.tools import OpenApplicationTool, PressKeyTool, TypeTextTool
 from app.demos.file_check import (
     CheckDemoTargetFreeTool,
     DemoPathError,
@@ -74,15 +95,20 @@ from app.orchestration.engine import JobEngine
 from app.orchestration.planner import Planner
 from app.orchestration.sqlite_store import SQLiteJobStore
 from app.orchestration.validator import validate_plan
-from app.tools.base import PermissionLevel, Tool, ToolRequirements, ToolResult
+from app.tools.base import PermissionLevel, Tool, ToolParameter, ToolRequirements, ToolResult
 from app.tools.registry import ToolRegistry
 
-#: open_application, ctrl+n, the note, ctrl+s, the file name, enter - the gated actions one successful run takes.
-INPUT_ACTIONS_NEEDED = 6
+#: open_application, switch_window (Notepad, by its exact title and process), ctrl+n, the note, ctrl+s, the file name, enter - the gated actions one successful run takes.
+INPUT_ACTIONS_NEEDED = 7
 NOTEPAD_PROCESS = "notepad.exe"
+#: The EXACT title the freshly opened Notepad window is expected to show (Windows 11 Notepad, English). The grant binds this exact string, so a Notepad that shows anything
+#: else - a restored session, another display language - is never switched to; pass --notepad-title with what your Notepad really shows.
+DEFAULT_NOTEPAD_TITLE = "Untitled - Notepad"
 DEFAULT_NOTE = "Jarvis demo note: written by Jarvis."
 DEFAULT_SAVE_DIALOG_TITLE = "Save As"  # Windows shows this title in English; pass --save-dialog-title for another display language
 MAX_STEPS = 20
+#: How long the run's authorization grant lives: the demo takes well under a minute; the library caps any grant at 300 s.
+DEMO_GRANT_SECONDS = 120.0
 #: Each settling pause, and the ceiling `SettleTool` enforces. Three pauses (after the new tab, after the Save As dialog appears, after the file name is
 #: typed) give Notepad time to finish handling the keys just sent before the next one arrives.
 SETTLE_SECONDS = 1.5
@@ -94,7 +120,12 @@ FILE_CHECK_ATTEMPTS = 5
 FILE_CHECK_DELAY_SECONDS = 3.0
 MAX_WAIT_SECONDS = 240.0
 MAX_TICKS = 400
-INPUT_TOOLS = frozenset({"open_application", "type_text", "press_key"})
+#: The step that brings Notepad forward: a read-only wait for the window, then ONE gated switch_window. It is an input step like the others (one attempt, in the grant).
+FRONT_TOOL_NAME = "demo_front_notepad"
+FRONT_CHECKS = 5  # up to five read-only looks for the window ...
+FRONT_CHECK_DELAY_SECONDS = 2.0  # ... two seconds apart: a wait of at most 8 s, which is what the old five-attempt retry of this step amounted to
+MAX_CANDIDATES = 5  # the Notepad window titles a failure report lists
+INPUT_TOOLS = frozenset({"open_application", "type_text", "press_key", FRONT_TOOL_NAME})
 
 
 class DemoRefused(Exception):
@@ -107,6 +138,7 @@ class DemoSetup:
     path: Path
     note: str
     save_dialog_title: str = DEFAULT_SAVE_DIALOG_TITLE
+    notepad_title: str = DEFAULT_NOTEPAD_TITLE
 
 
 @dataclass(frozen=True)
@@ -131,6 +163,7 @@ def check_ready(
     note: str = DEFAULT_NOTE,
     *,
     save_dialog_title: str = DEFAULT_SAVE_DIALOG_TITLE,
+    notepad_title: str = DEFAULT_NOTEPAD_TITLE,
     gate: InputGate | None = None,
     list_windows: Callable[[], list[tuple[int, str, str]]] | None = None,
     now: datetime | None = None,
@@ -145,13 +178,17 @@ def check_ready(
         path = new_target(folder, now=now, token=token)
     except DemoPathError as exc:
         raise DemoRefused(str(exc)) from None
+    try:
+        notepad_title = validate_exact_window_title(notepad_title)  # exactly as it will be requested and bound: no padding, no repeated spaces, at most 100 characters
+    except ComputerControlError as exc:
+        raise DemoRefused(f"The Notepad window title is not usable ({exc})") from None
 
     gate = gate if gate is not None else default_input_gate()
     try:
-        gate.check("open_application")  # non-consuming: why input would be refused right now (switched off, limit reached)
+        gate.check_budget()  # non-consuming: why input would be refused right now (switched off, limit reached); the grant is minted only at --run
     except ComputerControlError as exc:
         raise DemoRefused(str(exc)) from None
-    remaining = gate.remaining()
+    remaining = gate.budget_remaining()
     if remaining < INPUT_ACTIONS_NEEDED:
         raise DemoRefused(
             f"The demo takes {INPUT_ACTIONS_NEEDED} input actions in a row but only {remaining} remain in the current minute "
@@ -168,10 +205,29 @@ def check_ready(
             f"{len(in_the_way)} open window(s) look like Notepad (or have 'Notepad' in their title). Close them first (including on other desktops): "
             "the demo must not type into, or save over the work in, a window that is not its own."
         )
-    return DemoSetup(directory=folder, path=path, note=note, save_dialog_title=save_dialog_title)
+    return DemoSetup(directory=folder, path=path, note=note, save_dialog_title=save_dialog_title, notepad_title=notepad_title)
 
 
 # ================================================================== the plan =======================================================================
+
+
+def plan_input_steps(plan: list[dict[str, Any]]) -> list[InputStep]:
+    """The exact, ordered input actions this plan will perform, in the canonical form the backend will present: the ONE source of what the run's grant covers, taken from
+    the same plan the Job runs. `press_key` uses the normalized key tokens and `open_application` the enum member, exactly as the backend does."""
+    steps: list[InputStep] = []
+    for raw in plan:
+        tool, arguments = raw["tool"], raw["arguments"]
+        if tool == "open_application":
+            steps.append(InputStep("open_application", (AllowedApplication(arguments["app"]),)))
+        elif tool == "press_key":
+            steps.append(InputStep("press_key", (normalize_key_input(arguments["key"]),)))
+        elif tool == "type_text":
+            steps.append(InputStep("type_text", (arguments["text"],)))
+        elif tool == FRONT_TOOL_NAME:
+            steps.append(InputStep("switch_window", (validate_exact_window_title(arguments["title"]), validate_process_name(arguments["process"]))))
+        elif tool in INPUT_TOOLS or tool in GATED_METHODS:  # any input action this function does not know how to describe cannot be authorized
+            raise AuthorityError("the plan contains an input action that cannot be authorized.")
+    return steps
 
 
 def _step(step_id: str, tool: str, arguments: dict[str, Any], after: str | None, *, attempts: int = 1, delay: float = 0.0) -> dict[str, Any]:
@@ -190,7 +246,7 @@ def build_raw_plan(setup: DemoSetup) -> list[dict[str, Any]]:
 
     chain = [
         ("open_notepad", "open_application", {"app": "notepad"}, 1, 0.0),
-        ("front_notepad", "switch_window", {"title": "Notepad"}, 5, 2.0),
+        ("front_notepad", FRONT_TOOL_NAME, {"title": setup.notepad_title, "process": NOTEPAD_PROCESS}, 1, 0.0),  # waits read-only INSIDE the step; ONE gated switch
         ("verify_notepad", "verify_observation", in_front(), 3, 1.0),
         ("new_document", "press_key", {"key": "ctrl+n"}, 1, 0.0),
         ("settle_after_new_tab", SETTLE_TOOL_NAME, {}, 1, 0.0),  # the new tab must be ready before the note arrives (the first live run lost characters here)
@@ -265,6 +321,104 @@ class SettleTool(Tool):
         return ToolResult.success(data={"waited_seconds": self._seconds}, message=f"Waited {self._seconds:g} s for the application to settle.")
 
 
+class DemoFrontNotepadTool(Tool):
+    """Bring the demo's own Notepad window forward: a bounded READ-only wait for it, then ONE gated `switch_window`. Private to this module's registry - it is in no shared
+    registry and no Job allowlist, and the shared `SwitchWindowTool` is neither used nor changed.
+
+    It adds no authority and no matching rule of its own:
+      * The ONLY gated call it makes is `backend.switch_window(title, process)` - the same backend method every caller goes through. The backend asks the gate (the exact
+        title and process must be what the run's grant binds, in order) BEFORE it lists any window, then looks for an exact match once.
+      * What counts as a match is `exact_window_matches` (app/computer/base.py), the very function the backend uses; this tool compares nothing itself.
+      * It is bound at construction to ONE title and ONE process; asked for any other, it refuses before the backend is touched. It calls the backend at most once.
+
+    The wait is the part that is not gated: up to FRONT_CHECKS looks through `list_windows` (a read-only listing), FRONT_CHECK_DELAY_SECONDS apart, through an injected
+    sleep. It changes no focus and sends no input. No exact match after the last look, or more than one at any look, fails the step WITHOUT calling the backend, so the
+    grant entry is not spent and nothing is typed. Once the backend is called (exactly one match was seen), its entry is spent whatever it then finds - a window that vanished,
+    two windows, Windows refusing - and the step is never retried. A failure says what was expected and which notepad.exe windows are visible, read-only."""
+
+    name = FRONT_TOOL_NAME
+    description = "Bring the demo's Notepad window forward by its exact title and process: a short read-only wait for it, then one authorized switch. Sends no input."
+    permission = PermissionLevel.SAFE_ACTION
+    requirements = ToolRequirements()
+    automatable = False
+
+    def __init__(
+        self,
+        backend: ComputerBackend,
+        title: str,
+        process: str,
+        list_windows: Callable[[], list[tuple[int, str, str]]],
+        *,
+        sleep: Callable[[float], None] = time.sleep,
+    ):
+        self._backend = backend
+        self._title = validate_exact_window_title(title)
+        self._process = validate_process_name(process)
+        self._list_windows = list_windows
+        self._sleep = sleep
+        self._called_backend = False
+
+    @property
+    def parameters(self) -> list[ToolParameter]:
+        return [
+            ToolParameter(name="title", type="string", description="The exact title of the Notepad window", free_text=True),
+            ToolParameter(name="process", type="string", description="The exact process file name, notepad.exe"),
+        ]
+
+    def _expected(self) -> str:
+        return f"Expected a window titled exactly {scrub(self._title, 100)!r} of {self._process}"
+
+    def _candidates(self, windows: list[tuple[int, str, str]]) -> str:
+        titles = [scrub(str(w[1]), 100) for w in windows_of_process(windows, self._process)][:MAX_CANDIDATES]
+        return "Visible " + self._process + " windows: " + ("; ".join(repr(t) for t in titles) if titles else "none") + "."
+
+    def _listing(self) -> list[tuple[int, str, str]] | None:
+        try:
+            return list(self._list_windows())
+        except Exception:  # noqa: BLE001 - a listing that fails is "cannot tell", and nothing is switched
+            return None
+
+    def execute(self, title: str, process: str) -> ToolResult:
+        if self._called_backend:
+            return ToolResult.error("This step already asked for the window once; it is never asked again, and no further entry of the grant is used.")
+        try:
+            asked = (validate_exact_window_title(title), validate_process_name(process))
+        except ComputerControlError as exc:
+            return ToolResult.error(f"Not asked: {exc}")
+        if asked != (self._title, self._process):
+            return ToolResult.error("This step can only bring its own Notepad window forward; it was asked for a different title or process, so nothing was done.")
+        windows: list[tuple[int, str, str]] = []
+        matches: list = []
+        for look in range(FRONT_CHECKS):  # the READ-only wait: no focus change, no input, no gated call
+            listed = self._listing()
+            if listed is None:
+                return ToolResult.error("The open windows could not be listed, so no window was brought forward and no entry of the grant was used.")
+            windows = listed
+            matches = exact_window_matches(windows, self._title, self._process)
+            if len(matches) > 1:
+                return ToolResult.error(
+                    f"{self._expected()}, but {len(matches)} windows have exactly that title and process, so none was chosen and no entry of the grant was used. "
+                    f"{self._candidates(windows)}"
+                )
+            if matches:
+                break
+            if look < FRONT_CHECKS - 1:
+                self._sleep(FRONT_CHECK_DELAY_SECONDS)
+        if not matches:
+            return ToolResult.error(
+                f"{self._expected()}, and none appeared in {FRONT_CHECKS} looks, so nothing was brought forward and no entry of the grant was used. "
+                f"{self._candidates(windows)} If your Notepad shows another title, pass it with --notepad-title."
+            )
+        self._called_backend = True  # from here the gated action is in play: whatever it does, it is not repeated
+        try:
+            window = self._backend.switch_window(self._title, self._process)
+        except ComputerControlError as exc:
+            after = self._listing()
+            return ToolResult.error(f"{self._expected()}. The authorized switch failed: {scrub(str(exc), 160)} {self._candidates(after) if after is not None else ''}".strip())
+        shown = {"title": scrub(window.title, 120), "process_name": scrub(window.process_name, 60)}
+        return ToolResult.success(data=shown, message=f"Brought '{shown['title']}' ({shown['process_name']}) forward.")
+
+
 DOCUMENT_TOOL_NAME = "verify_document_text"
 
 
@@ -311,8 +465,9 @@ def build_registry(
     *,
     sleep: Callable[[float], None] = time.sleep,
     read_document: Callable[[], str] | None = None,
+    list_windows: Callable[[], list[tuple[int, str, str]]] | None = None,
 ) -> ToolRegistry:
-    """A PRIVATE registry: the three input tools and switch_window over `backend`, window verification, the settling pause, and the two file checks bound to
+    """A PRIVATE registry: the three input tools and the demo's own window step over `backend`, window verification, the settling pause, and the two file checks bound to
     this run's directory and file. It is registered nowhere else, so it widens nothing. `read_document` is how the document is read back before the save;
     the default is the real read-only reader, and tests always pass a fake."""
     registry = ToolRegistry()
@@ -322,7 +477,7 @@ def build_registry(
     registry.register(OpenApplicationTool(backend))
     registry.register(PressKeyTool(backend))
     registry.register(TypeTextTool(backend))
-    registry.register(SwitchWindowTool(backend))
+    registry.register(DemoFrontNotepadTool(backend, setup.notepad_title, NOTEPAD_PROCESS, list_windows if list_windows is not None else real_window_list, sleep=sleep))
     registry.register(VerifyObservationTool(observer))
     registry.register(CheckDemoTargetFreeTool(setup.directory, setup.path))
     registry.register(VerifyDemoFileTool(setup.directory, setup.path, setup.note))
@@ -338,8 +493,10 @@ def run_demo(
     *,
     sleep: Callable[[float], None] = time.sleep,
     read_document: Callable[[], str] | None = None,
+    list_windows: Callable[[], list[tuple[int, str, str]]] | None = None,
 ) -> DemoReport:
-    """Run the plan through the existing JobEngine and report what really happened. `backend` must be the gated one (`create_default_computer_backend()`)."""
+    """Run the plan through the existing JobEngine and report what really happened. `backend` must be the AUTHORIZED one (`create_authorized_computer_backend(grant)`): the
+    default backend carries no grant and admits nothing."""
     try:
         directory = validate_directory(setup.directory)
         if not directory.exists():
@@ -348,7 +505,7 @@ def run_demo(
     except (DemoPathError, OSError) as exc:
         raise DemoRefused(str(exc) if isinstance(exc, DemoPathError) else f"The directory could not be prepared ({exc.__class__.__name__}).") from None
 
-    registry = build_registry(backend, setup, sleep=sleep, read_document=read_document)
+    registry = build_registry(backend, setup, sleep=sleep, read_document=read_document, list_windows=list_windows)
     steps = validate_plan(build_raw_plan(setup), registry, max_steps=MAX_STEPS, default_retry=RetryPolicy())
     for step in steps:
         if step.tool_name in INPUT_TOOLS and step.retry_policy.max_attempts != 1:
@@ -384,7 +541,7 @@ def build_report(job: Job, setup: DemoSetup) -> DemoReport:
     for number, step in enumerate(steps, start=1):
         detail = ""
         if step.status is StepStatus.FAILED and step.error:
-            detail = f" - {scrub(step.error, 220)}"
+            detail = f" - {scrub(step.error, 600 if step.id == 'front_notepad' else 220)}"  # the window step lists the expected title and what is visible
         lines.append(f"  {number:>2}. {step.id} ({step.tool_name}): {step.status.value}, {step.attempts} attempt(s){detail}")
     if ok:
         lines.append("Checked from the disk, not from the keystrokes: " + scrub((by_id["verify_file"].result or {}).get("message", ""), 200))
@@ -440,27 +597,44 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dir", required=True, help="the dedicated directory (absolute; its own name must start with 'jarvis_demo')")
     parser.add_argument("--note", default=DEFAULT_NOTE, help="the one-line ASCII note to write")
     parser.add_argument("--save-dialog-title", default=DEFAULT_SAVE_DIALOG_TITLE, help="the Save As window title in your Windows display language")
+    parser.add_argument(
+        "--notepad-title", default=DEFAULT_NOTEPAD_TITLE,
+        help="the EXACT title of the Notepad window a fresh launch shows (case-sensitive, at most 100 characters, no padding); the run's grant binds this exact string",
+    )
     parser.add_argument("--run", action="store_true", help="really do it on the desktop (without this, only the dry run happens)")
     args = parser.parse_args(argv)
 
     try:
-        setup = check_ready(args.dir, args.note, save_dialog_title=args.save_dialog_title)
+        setup = check_ready(args.dir, args.note, save_dialog_title=args.save_dialog_title, notepad_title=args.notepad_title)
     except DemoRefused as exc:
         print(f"Not started: {exc}")
         return 2
     plan = build_raw_plan(setup)
-    print(f"Ready. Directory: {setup.directory}\nNew file: {setup.path.name}\nNote: {setup.note}\nPlan: {len(plan)} steps, {INPUT_ACTIONS_NEEDED} input actions.")
+    print(
+        f"Ready. Directory: {setup.directory}\nNew file: {setup.path.name}\nNote: {setup.note}\n"
+        f"Notepad window it will bring forward: exactly {setup.notepad_title!r} of {NOTEPAD_PROCESS}\n"
+        f"Plan: {len(plan)} steps, {INPUT_ACTIONS_NEEDED} input actions."
+    )
     if not args.run:
         print("Dry run only: nothing was opened, typed, created or saved. Add --run to do it for real.")
         return 0
 
-    from app.computer.factory import create_default_computer_backend
+    from app.computer.factory import create_authorized_computer_backend
+    from app.computer.issuer import default_issuer
 
     try:
-        report = run_demo(setup, create_default_computer_backend())
+        issuer = default_issuer()
+        grant = issuer.issue(plan_input_steps(plan), ttl_seconds=DEMO_GRANT_SECONDS, purpose="notepad_demo", actor="cli")
+    except (AuthorityError, ComputerControlError) as exc:  # switched off, or an action that cannot be authorized: nothing was minted, nothing was started
+        print(f"Not started: {exc}")
+        return 2
+    try:
+        report = run_demo(setup, create_authorized_computer_backend(grant))
     except DemoRefused as exc:
         print(f"Not started: {exc}")
         return 2
+    finally:
+        issuer.gate.revoke(grant)  # the grant never outlives the run, whatever happened in it
     print(report.text)
     return 0 if report.succeeded else 1
 

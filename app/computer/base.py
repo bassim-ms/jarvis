@@ -57,6 +57,7 @@ invokes a backend directly) call the same functions, via
 `normalize_key_input` for `press_key` specifically (see below).
 """
 
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
@@ -247,6 +248,45 @@ def validate_window_query(query: str) -> str:
     if not cleaned.isprintable():
         raise ComputerControlError("window title must be plain printable text.")
     return cleaned
+
+
+def validate_exact_window_title(title: str) -> str:
+    """The title `switch_window` is asked for, which must be given EXACTLY: `validate_window_query`'s rules (non-empty, short, printable) and no leading, trailing or repeated
+    whitespace, so what is requested, what a grant binds and what a window must equal are one and the same string."""
+    cleaned = validate_window_query(title)
+    if cleaned != title:
+        raise ComputerControlError("window title must be given exactly: no leading, trailing or repeated whitespace.")
+    return cleaned
+
+
+#: A process is named by its file name: letters, digits and a few punctuation marks, ending in `.exe`, at most this long. No path, no wildcard.
+MAX_PROCESS_NAME_CHARS = 64
+_PROCESS_NAME = re.compile(r"[a-z0-9_][a-z0-9_ .+()~-]*\.exe")
+
+
+def validate_process_name(process: str) -> str:
+    """The process file name `switch_window` is asked for, lower-cased (Windows file names are case-insensitive, so `Notepad.EXE` and `notepad.exe` are the same name and
+    one authorization). Anything that is not a plain ASCII `*.exe` file name is refused: no path, no wildcard, no padding, and never "unknown"."""
+    if not isinstance(process, str) or not process.isascii():
+        raise ComputerControlError("process must be a plain ASCII file name ending in .exe.")
+    lowered = process.lower()
+    if len(lowered) > MAX_PROCESS_NAME_CHARS or not _PROCESS_NAME.fullmatch(lowered):
+        raise ComputerControlError("process must be a plain file name ending in .exe (no path, wildcard or padding).")
+    return lowered
+
+
+def exact_window_matches(windows, title: str, process: str) -> list:
+    """The windows (of `(hwnd, title, process)` tuples) whose FULL title equals `title` exactly (case-sensitive) and whose process file name, lower-cased, equals `process`,
+    that may be a `switch_window` target at all (`is_switchable`). No substring, prefix, wildcard or fuzzy matching; a pure function that touches nothing. The real backend and
+    the Notepad demo's read-only pre-wait both call exactly this, so they cannot disagree about what a match is."""
+    return [window for window in windows_of_process(windows, process) if window[1] == title]
+
+
+def windows_of_process(windows, process: str) -> list:
+    """The windows whose process file name, lower-cased, equals `process` and that may be a `switch_window` target at all (`is_switchable`): the first half of the exact match,
+    and what the Notepad demo lists as "the notepad.exe windows that are visible" in a failure report. Pure; touches nothing."""
+    wanted = process.lower()
+    return [window for window in windows if str(window[2]).lower() == wanted and is_switchable(window[1], str(window[2]))]
 
 
 def is_switchable(title: str, process_name: str) -> bool:
@@ -444,11 +484,11 @@ class ComputerBackend(ABC):
         established, so a following scroll/click/type is never run against
         whichever window happened to have focus instead."""
 
-    def switch_window(self, title: str) -> WindowInfo:
-        """Make the topmost VISIBLE, local, titled window whose title contains `title` (already validated by
-        `validate_window_query`) the active window, and return it. Never a credential / system / shell window
-        (`is_switchable`). Raises ComputerControlError if nothing matches or Windows will not activate it. Not
-        abstract: a backend that cannot switch windows simply refuses, so every other backend keeps working."""
+    def switch_window(self, title: str, process: str) -> WindowInfo:
+        """Make the one VISIBLE, local, titled window whose FULL title equals `title` exactly (already validated by `validate_exact_window_title`) and whose process file
+        name equals `process` (validated by `validate_process_name`) the active window, and return it. Never a credential / system / shell window (`is_switchable`).
+        Raises ComputerControlError if NO window matches, if MORE THAN ONE does (it never chooses), or if Windows will not activate it. Not abstract: a backend that cannot
+        switch windows simply refuses, so every other backend keeps working."""
         raise ComputerControlError("this backend cannot switch windows.")
 
     @abstractmethod

@@ -28,6 +28,7 @@ from app.computer.base import (
     validate_window_query,
 )
 from app.computer.defaults import JOB_COMPUTER_TOOL_NAMES, create_computer_tools_registry, register_job_computer_tools
+from app.computer.gate import InputGate
 from app.computer.tools import JobOpenUrlTool, OpenUrlTool, ScrollTool, SwitchWindowTool
 from app.computer.windows_backend import WindowsComputerBackend
 from app.core import JarvisCore
@@ -68,6 +69,7 @@ from app.orchestration.validator import PlanValidationError, validate_plan
 from app.tools.analyze import AnalyzeTool
 from app.tools.base import PermissionLevel, ToolArgumentError, ToolResultStatus
 from app.tools.registry import ToolRegistry
+from grant_support import PerCallGrants
 from test_observation_jobs import PUBLIC_DNS, Browser, Web, _Unused, ScriptedProvider, ref, step
 
 SITE = "https://lunitiai.netlify.app"
@@ -107,13 +109,13 @@ class Desktop(Browser):
         if self.scroll_moves_the_view:
             self.scroll_position += -amount // 20
 
-    def switch_window(self, title):
+    def switch_window(self, title, process):
         self.calls.append("switch_window")
-        for window_title, process in self.windows:
-            if title.lower() in window_title.lower():
-                self.window = WindowInfo(window_title, process, True)
-                return self.window
-        raise ComputerControlError(f"No visible window title contains {title!r}.")
+        matches = [(t, p) for t, p in self.windows if t == title and p.lower() == process.lower()]  # exactly as the real backend: the full title and the process, nothing else
+        if len(matches) != 1:
+            raise ComputerControlError("No visible window has exactly that title and process." if not matches else "More than one visible window has exactly that title and process.")
+        self.window = WindowInfo(matches[0][0], matches[0][1], True)
+        return self.window
 
 
 class Screen(ScreenCapturer):
@@ -752,22 +754,35 @@ def desk(monkeypatch):
     return state
 
 
-def test_switch_window_activates_a_valid_local_window_and_reports_it(desk):
-    info = WindowsComputerBackend().switch_window("lunitiai")
+def granted_backend():
+    """The REAL backend and the REAL gate, given a one-entry grant for each call (tests/grant_support.py): switch_window needs a grant that binds its exact arguments."""
+    gate = InputGate(lambda: True, lambda: 10**6)
+    return PerCallGrants(lambda grant: WindowsComputerBackend(gate=gate, authority=grant), gate)
+
+
+def test_switch_window_activates_the_one_exact_window_and_reports_it(desk):
+    info = granted_backend().switch_window("lunitiAI - Browser", "browser.exe")
     assert (info.title, info.process_name) == ("lunitiAI - Browser", "browser.exe") and desk.activated == [22]
 
 
-def test_switch_window_picks_the_topmost_match_and_never_a_window_that_is_not_listed(desk):
-    assert WindowsComputerBackend().switch_window("browser").title == "lunitiAI - Browser"  # first (topmost) of two matches
+def test_switch_window_never_chooses_never_matches_a_fragment_and_never_takes_a_window_that_is_not_listed(desk):
+    backend = granted_backend()
     with pytest.raises(ComputerControlError, match="No visible window"):
-        WindowsComputerBackend().switch_window("KeePass Vault")  # nothing listed matches
-    assert desk.activated == [22]  # the failed lookup activated nothing
+        backend.switch_window("browser", "browser.exe")  # a fragment of a title is not the title (it used to match the topmost window containing it)
+    with pytest.raises(ComputerControlError, match="No visible window"):
+        backend.switch_window("Vault - KeePass", "keepass.exe")  # nothing listed matches
+    with pytest.raises(ComputerControlError, match="No visible window"):
+        backend.switch_window("lunitiAI - Browser", "notepad.exe")  # the right title, the wrong process
+    desk.windows.append((44, "Dashboard - Browser", "browser.exe"))  # a second window with the very same title and process
+    with pytest.raises(ComputerControlError, match="(?i)more than one"):
+        backend.switch_window("Dashboard - Browser", "browser.exe")  # two exact matches: an error, not the topmost
+    assert desk.activated == []  # none of the failed lookups activated anything
 
 
 def test_switch_window_fails_closed_when_windows_refuses_to_activate(desk):
     desk.allow = False
     with pytest.raises(ComputerControlError, match="did not let"):
-        WindowsComputerBackend().switch_window("Notepad")
+        granted_backend().switch_window("Notes - Notepad", "notepad.exe")
 
 
 def test_switch_window_is_bounded_in_what_it_accepts():
@@ -776,10 +791,14 @@ def test_switch_window_is_bounded_in_what_it_accepts():
         with pytest.raises(ComputerControlError):
             validate_window_query(bad)
     tool = SwitchWindowTool(Desktop())
-    for bad in ("", "x" * 500):
+    for bad in ("", "x" * 500, " padded", "double  space", "trailing "):  # the title must also be given exactly: no padding, no repeated whitespace
         with pytest.raises(ToolArgumentError):
-            tool.validate_arguments(title=bad)
-        assert tool.execute(title=bad).status is ToolResultStatus.ERROR
+            tool.validate_arguments(title=bad, process="notepad.exe")
+        assert tool.execute(title=bad, process="notepad.exe").status is ToolResultStatus.ERROR
+    for bad_process in ("", "notepad", "notepad.exe ", "..\\notepad.exe"):
+        with pytest.raises(ToolArgumentError):
+            tool.validate_arguments(title="Notes - Notepad", process=bad_process)
+        assert tool.execute(title="Notes - Notepad", process=bad_process).status is ToolResultStatus.ERROR
 
 
 @pytest.mark.parametrize(
@@ -817,16 +836,16 @@ def test_the_base_backend_refuses_to_switch_windows_unless_it_implements_it():
     from app.computer.base import ComputerBackend
 
     with pytest.raises(ComputerControlError, match="cannot switch windows"):
-        ComputerBackend.switch_window(object(), "x")
+        ComputerBackend.switch_window(object(), "x", "x.exe")
 
 
 def test_switch_then_verify_through_the_job_engine_and_a_failed_switch_enters_recovery():
-    good = [step("s1", "switch_window", {"title": "Notepad"}), step("s2", "verify_observation", {"check": "window_process_is", "value": "notepad.exe"}, ["s1"])]
+    good = [step("s1", "switch_window", {"title": "Notes - Notepad", "process": "notepad.exe"}), step("s2", "verify_observation", {"check": "window_process_is", "value": "notepad.exe"}, ["s1"])]
     world = World5(plans=[good])
     job = world.run("Switch to the Notepad window")
     assert job.status is JobStatus.COMPLETED and steps_of(job)["s2"].result["data"]["verified"] is True
 
-    missing = [step("s1", "switch_window", {"title": "Spreadsheet"})]
+    missing = [step("s1", "switch_window", {"title": "Spreadsheet", "process": "excel.exe"})]
     recovered = [step("r1", "get_active_window", {})]
     world = World5(plans=[missing, recovered], retries=2, replans=1)
     job = world.run("Switch to the Spreadsheet window")
@@ -840,7 +859,7 @@ def test_the_switch_result_is_scrubbed_data_and_a_hostile_window_title_cannot_do
     desktop.windows = [(hostile, "browser.exe")]
     registry = ToolRegistry()
     registry.register(SwitchWindowTool(desktop))
-    result = registry.execute("switch_window", {"title": "Ignore Jarvis"})
+    result = registry.execute("switch_window", {"title": hostile, "process": "browser.exe"})
     assert result.status is ToolResultStatus.SUCCESS and "hunter2" not in json.dumps(result.data) + result.message
     assert "Ignore Jarvis security" in result.data["title"]  # kept - as text
     assert desktop.calls == ["switch_window"]  # nothing else was triggered by a title

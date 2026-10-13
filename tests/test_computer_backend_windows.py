@@ -24,7 +24,6 @@ real application, or touch the real screen. These tests instead prove:
   fixture, so no test can ever activate a real window.
 """
 
-import ctypes
 import re
 from unittest.mock import MagicMock, patch
 
@@ -45,6 +44,7 @@ from app.memory.sqlite_store import SQLiteMemoryStore
 from app.providers.base import AIProvider
 from app.tools.decision import ToolCall, ToolCallBuilder, ToolCallProvider
 from app.tools.registry import ToolRegistry
+from grant_support import PerCallGrants
 
 BROWSER_HWND = 1001
 PREVIOUSLY_FOCUSED_HWND = 2002
@@ -109,7 +109,14 @@ def fake_desktop():
 def backend():
     # These tests are about WHAT the backend forwards to the OS, not about the Computer Input Gate (that is tests/test_computer_gate.py): they pass an
     # explicit, always-open gate. A bare `WindowsComputerBackend()` is gated by default - switched off - so it would refuse every input call here.
-    return WindowsComputerBackend(gate=InputGate(enabled=lambda: True, limit=lambda: 10**9))
+    # These tests are about validation and forwarding to the OS library, not about what a grant covers (test_computer_authorization.py covers that): every input call is
+    # made through the REAL backend and the REAL gate with a one-entry grant minted for exactly that call (tests/grant_support.py).
+    return real_backend_with_a_grant_per_call()
+
+
+def real_backend_with_a_grant_per_call():
+    gate = InputGate(enabled=lambda: True, limit=lambda: 10**9)
+    return PerCallGrants(lambda grant: WindowsComputerBackend(gate=gate, authority=grant), gate)
 
 
 # --- open_application: no shell execution, no arbitrary paths ------------
@@ -606,7 +613,8 @@ def make_real_backend_jarvis():
         provider=UnusedProvider(),
         memory=SQLiteMemoryStore(":memory:"),
         tools=ToolRegistry(),
-        computer_tools=create_computer_tools_registry(backend=WindowsComputerBackend()),
+        # scroll is gated now (mouse-wheel input): a bare backend admits nothing without a grant, so this ORDER-and-arguments test gives the real backend a grant per call
+        computer_tools=create_computer_tools_registry(backend=real_backend_with_a_grant_per_call()),
         tool_call_builder=ToolCallBuilder(call_provider),
     )
     return jarvis, call_provider
@@ -666,25 +674,45 @@ def test_scroll_never_runs_when_the_browser_could_not_be_made_active(fake_deskto
 # --- scroll: the exact Win32 call, pinning direction and units ---------------
 
 
-def test_scroll_sends_one_raw_wheel_delta_equal_to_the_amount_positive_meaning_up(
-    backend, monkeypatch
-):
-    """What pyautogui.scroll(50) actually sends on Windows: ONE
-    mouse_event(MOUSEEVENTF_WHEEL, ..., dwData=50) at the cursor, with no
-    window handle involved. dwData is raw - one wheel notch is
-    WHEEL_DELTA=120, so 50 is under half a notch - and positive is
-    wheel-forward, i.e. UP, which can't move a page that just loaded at
-    its top. Pins the current contract; changing it must be deliberate."""
-    import pyautogui
+def test_scroll_hands_the_amount_to_the_input_library_unchanged_with_no_position_so_the_cursor_is_used(backend):
+    """What THIS code pins: `scroll(50)` reaches the input library as `scroll(50)` - the amount untouched (positive means wheel-forward, i.e. UP, which cannot move a
+    page that just loaded at its top) and NO x/y, so the event happens at the current cursor. How the third-party library then turns 50 into a raw
+    mouse_event(MOUSEEVENTF_WHEEL, ..., dwData=50) - one standard wheel notch is WHEEL_DELTA=120, so 50 is under half a notch - is that library's contract. It used to be
+    pinned here by loading the REAL library with only mouse_event mocked; no test may load the real input library any more (tests/conftest.py), so that last link is
+    covered by reading the library, not by running it."""
+    import pyautogui  # the fake: tests/fake_input_library.py
 
-    monkeypatch.setattr(pyautogui, "PAUSE", 0)
-    with patch("pyautogui._pyautogui_win._position", return_value=(100, 100)), patch(
-        "pyautogui._pyautogui_win._size", return_value=(1920, 1080)
-    ), patch.object(ctypes.windll.user32, "mouse_event") as mouse_event:
-        backend.scroll(50)
+    backend.scroll(50)
 
-    mouse_event.assert_called_once()
-    event_flags, _dx, _dy, wheel_delta, extra_info = mouse_event.call_args.args
-    assert event_flags == 0x0800  # MOUSEEVENTF_WHEEL
-    assert wheel_delta == 50
-    assert extra_info == 0
+    assert pyautogui.calls == [("scroll", (50,), {})]
+
+
+def test_the_input_library_sends_scroll_as_one_raw_wheel_event_whose_delta_is_the_amount_read_from_its_source_never_run():
+    """The other half of the old test, kept WITHOUT loading the real library: the installed library's source is read as TEXT (via the package metadata - nothing is imported)
+    and parsed. `_scroll` must hand `MOUSEEVENTF_WHEEL` and the caller's amount, unchanged, to ONE `_sendMouseEvent` call as `dwData`, and `_sendMouseEvent` must end in
+    `mouse_event`. So `scroll(50)` is one raw wheel event of delta 50 at the cursor (a standard notch is WHEEL_DELTA=120), positive meaning wheel-forward, i.e. UP."""
+    import ast
+    import pathlib
+    from importlib import metadata
+
+    source_path = pathlib.Path(metadata.distribution("PyAutoGUI").locate_file("pyautogui/_pyautogui_win.py"))
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    functions = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+
+    wheel_calls = [
+        call for call in ast.walk(functions["_scroll"])
+        if isinstance(call, ast.Call) and getattr(call.func, "id", None) == "_sendMouseEvent"
+    ]
+    assert len(wheel_calls) == 1
+    (call,) = wheel_calls
+    assert isinstance(call.args[0], ast.Name) and call.args[0].id == "MOUSEEVENTF_WHEEL"  # a wheel event ...
+    delta = {keyword.arg: keyword.value for keyword in call.keywords}["dwData"]
+    assert isinstance(delta, ast.Name) and delta.id == "clicks"  # ... whose delta is the caller's amount, untouched (no multiplication by 120)
+    constants = {t.id: n.value.value for n in tree.body if isinstance(n, ast.Assign) and isinstance(n.value, ast.Constant) for t in n.targets if isinstance(t, ast.Name)}
+    assert constants["MOUSEEVENTF_WHEEL"] == 0x0800
+    ends_in_mouse_event = [
+        c for c in ast.walk(functions["_sendMouseEvent"])
+        if isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute) and c.func.attr == "mouse_event"
+    ]
+    assert len(ends_in_mouse_event) == 1
+    assert not [name for name in __import__("sys").modules if name.startswith("pyautogui.")]  # and reading it imported nothing of the real library

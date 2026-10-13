@@ -293,10 +293,11 @@ class Settings(BaseSettings):
     # RunTestsTool). Tokenized with shlex.split, same as COMMAND_RUN.
     self_dev_test_command: str = "pytest -q"
 
-    # Computer Input Gate (see app/computer/gate.py): whether Jarvis may send INPUT to the desktop - type_text, press_key, move_mouse, click_mouse,
-    # double_click and open_application. OFF by default; both settings are read on EVERY call, so a change takes effect at once. The limit is ONE
-    # shared budget for all six tools: at most this many admitted actions in any rolling 60 seconds, enforced when the action runs. Reading the
-    # screen or window and the Job tools (open_url, scroll, switch_window) are not affected by either setting.
+    # Computer Input Gate (see app/computer/gate.py): whether Jarvis may ACT on the desktop - type_text, press_key, move_mouse, click_mouse,
+    # double_click, scroll, open_application, open_url and switch_window. OFF by default, and the switch alone is never enough: each of them also needs an
+    # authorization grant that covers that exact action. Both settings are read on EVERY call, so a change takes effect at once. The limit is ONE
+    # shared budget for all nine: at most this many admitted actions in any rolling 60 seconds, enforced when the action runs. Only reading the
+    # screen or the active window (get_active_window, get_screen_info) is unaffected by either setting.
     computer_input_enabled: bool = False
     computer_input_actions_per_minute: int = 10
 

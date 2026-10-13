@@ -31,12 +31,14 @@ implies, is deliberately left to M17.1-B/C. Today they exist only to be
 constructed and exercised directly (e.g. in tests), against either
 WindowsComputerBackend or a fake backend.
 
-COMPUTER INPUT GATE (app/computer/gate.py): the six INPUT tools here - type_text, press_key, move_mouse, click_mouse, double_click and
-open_application - are still SAFE_ACTION (so ToolRegistry asks for no confirmation), but the real backend enforces the Input Gate ITSELF: the switch is
-OFF by default and one rate limit is shared by all six (and by every backend instance in the process). The gate enforces at EXECUTION time, inside the
+COMPUTER INPUT GATE (app/computer/gate.py): the nine ACTING tools here - type_text, press_key, move_mouse, click_mouse, double_click, scroll,
+open_application, open_url and switch_window - are still SAFE_ACTION (so ToolRegistry asks for no confirmation), but the real backend enforces the Input Gate ITSELF: the switch
+is OFF by default, an authorization grant that covers the exact action is required, and one rate limit is shared by all nine (and by every backend instance in the process).
+`open_url` is bound to the exact URL; `switch_window` to the exact window title AND the exact process name (a grant does not identify one window: two windows with that title
+and process are an error). Registering a tool, here or in the Job allowlist, grants nothing: the shared backend carries no grant, so chat and Jobs are refused at execution. The gate enforces at EXECUTION time, inside the
 backend, immediately before the OS call, so a direct `execute`, a registry call or a chained command cannot skip it, and neither can a backend built
 somewhere the factory never saw. Each tool's `validate_arguments` additionally calls `_preflight_input`, a
-non-consuming pre-check, so a whole command is turned away before its first step runs; that is a convenience, not the enforcement. All six are also
+non-consuming pre-check, so a whole command is turned away before its first step runs; that is a convenience, not the enforcement. All of them are also
 `automatable = False`: until now they were kept away from automations only by living in a separate registry.
 """
 
@@ -50,10 +52,11 @@ from app.computer.base import (
     MouseButton,
     normalize_key_input,
     validate_coordinates,
+    validate_exact_window_title,
+    validate_process_name,
     validate_scroll_amount,
     validate_text,
     validate_url,
-    validate_window_query,
 )
 from app.tools.base import PermissionLevel, Tool, ToolArgumentError, ToolParameter, ToolResult
 
@@ -192,7 +195,7 @@ class OpenApplicationTool(Tool):
 
 class OpenUrlTool(Tool):
     """Opens a URL through the normal browser mechanism. SAFE_ACTION:
-    restricted to http/https URLs only (see `validate_url`)."""
+    restricted to http/https URLs only (see `validate_url`). It needs an authorization grant for that EXACT URL (see the module docstring): registering this tool grants nothing."""
 
     name = "open_url"
     description = "Open a URL (http/https only) in the default browser."
@@ -207,6 +210,7 @@ class OpenUrlTool(Tool):
         return [ToolParameter(name="url", type="string", description="The http/https URL to open")]
 
     def validate_arguments(self, url: str) -> None:
+        _preflight_input(self.backend, "open_url")  # non-consuming: turns a whole command away before its first step when nothing authorizes it
         try:
             validate_url(url)
         except ComputerControlError as exc:
@@ -282,6 +286,7 @@ class JobOpenUrlTool(OpenUrlTool):
             )
 
     def validate_arguments(self, url: str) -> None:
+        _preflight_input(self.backend, "open_url")
         try:
             validate_url(url)
             self._check_public(url)
@@ -298,16 +303,18 @@ class JobOpenUrlTool(OpenUrlTool):
 
 
 class SwitchWindowTool(Tool):
-    """Brings an existing, visible, local window to the front by a fragment of its title. SAFE_ACTION: bounded
-    (`validate_window_query`), never a credential / shell / system window (`is_switchable`, enforced by the backend),
-    never launches or closes anything. Success is only reported once the backend confirmed that window is active.
-    The title shown back is scrubbed: a window title is untrusted text."""
+    """Brings an existing, visible, local window to the front. SAFE_ACTION, but it needs an authorization grant for the EXACT window title AND the EXACT process name (see the
+    module docstring). The title must equal the window's full title exactly and the process must be its exact file name: no fragment, no wildcard. It is bounded
+    (`validate_exact_window_title`, `validate_process_name`), never a credential / shell / system window (`is_switchable`, enforced by the backend) and never launches or
+    closes anything. Zero matching windows, or more than one, is an error; it never chooses. A grant does not identify one window INSTANCE. Success is only reported once the
+    backend confirmed that window is active. The title shown back is scrubbed: a window title is untrusted text."""
 
     name = "switch_window"
     description = (
-        "Switch to an already open, visible window whose title contains the given text (e.g. 'Example Domain'). It "
-        "never opens, closes or starts anything and refuses password-manager, sign-in, shell and system windows. "
-        "Verify it afterwards with verify_observation (window_title_contains / window_process_is)."
+        "Switch to an already open, visible window whose FULL title equals the given title exactly (case-sensitive, e.g. 'Example Domain - Browser') and whose process file name "
+        "is the given process (e.g. 'chrome.exe'); take both from get_active_window or an observation, never guess them. It needs an authorization grant for that exact "
+        "title and process. It never opens, closes or starts anything, refuses password-manager, sign-in, shell and system windows, and fails if no window - or more than "
+        "one - matches. Verify it afterwards with verify_observation (window_title_contains / window_process_is)."
     )
     permission = PermissionLevel.SAFE_ACTION
     automatable = False
@@ -318,23 +325,24 @@ class SwitchWindowTool(Tool):
     @property
     def parameters(self) -> list[ToolParameter]:
         return [
-            ToolParameter(
-                name="title", type="string", description="Text the target window's title contains", free_text=True
-            )
+            ToolParameter(name="title", type="string", description="The target window's exact, full title", free_text=True),
+            ToolParameter(name="process", type="string", description="The target window's exact process file name, e.g. notepad.exe"),
         ]
 
-    def validate_arguments(self, title: str) -> None:
+    def validate_arguments(self, title: str, process: str) -> None:
+        _preflight_input(self.backend, "switch_window")
         try:
-            validate_window_query(title)
+            validate_exact_window_title(title)
+            validate_process_name(process)
         except ComputerControlError as exc:
             raise ToolArgumentError(str(exc)) from exc
 
-    def execute(self, title: str) -> ToolResult:
+    def execute(self, title: str, process: str) -> ToolResult:
         from app.observation.base import scrub
 
         try:
-            query = validate_window_query(title)
-            window = self.backend.switch_window(query)
+            exact_title, exact_process = validate_exact_window_title(title), validate_process_name(process)
+            window = self.backend.switch_window(exact_title, exact_process)
         except ComputerControlError as exc:
             return ToolResult.error(str(exc))
         shown = {"title": scrub(window.title, 120), "process_name": scrub(window.process_name, 60)}
@@ -626,6 +634,7 @@ class ScrollTool(Tool):
         ]
 
     def validate_arguments(self, amount: int) -> None:
+        _preflight_input(self.backend, "scroll")  # scrolling is input (mouse wheel): turned away early, never enforced here
         try:
             validate_scroll_amount(amount)
         except ComputerControlError as exc:

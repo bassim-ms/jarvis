@@ -279,6 +279,9 @@ jarvis/
     test_scheduled_operations_boundaries.py - (Slices 4-5) the layer cannot plan/run/launch/settle, imports no Handle This, adds no scheduler or store
     test_focus_recognition.py / test_focus_ranking.py / test_focus_service.py / test_focus_door.py / test_focus_interaction_precedence.py / test_focus_presentation.py - (Focus, Slice 1) the grammar boundary, the pure ranking, Tests A-D + untrusted text + bounds, door gating / precedence + package boundaries, a waiting question or confirmation always wins
     test_computer_gate.py / test_host_guard.py - (Computer Input Gate) the switch (off by default) and the ONE shared 10-per-rolling-minute limit with its exact boundaries, enforcement at execution time through direct, registry and chained calls (concurrency-safe), the production wiring, audit logs that never carry a value; and the loopback-only Host check (IPv4 / localhost / IPv6, ports, every production route)
+    test_computer_authority.py / test_computer_authorization.py - (authorization grants) the canonical, keyed form of an action; default deny for all seven input methods with the switch off or on but no grant; chat, chained, registry, tool and Job paths cannot bypass it; wrong action / argument / order, expiry, exhaustion, forged and replayed grants; concurrency (no entry spent twice, no way around the limit); rejected actions consume no entry and no slot; no authority is inherited by threads, pools or other backends; revocation and the switch; logs that carry no value, digest, key or length; static guards on who may mint grants and where input-capable calls may live
+    test_computer_gate_no_bypass.py / test_computer_typing_revocation.py / test_no_real_input_library.py / test_mutation_runner_isolation.py - (grant hardening) there is no budget-only or test-detecting way past the gate (no constructor option, a final gate class, stand-in gates refused, every production backend still refusing with the switch on); `type_text` is typed in chunks with a non-consuming recheck before each, so revocation, expiry, a mismatch or switch-off send no further chunk, and a failure part-way leaves the admission spent and closed; the suite-wide fake input library and tripwires (`tests/conftest.py`, `tests/fake_input_library.py`; helpers in `tests/grant_support.py`) and the isolated mutation runner, which shows that a deliberately broken gate reaches only the fake
+    test_computer_focus_authorization.py - (open_url and switch_window behind the gate) a real backend with no grant refuses both with the switch on and touches nothing; the grant binds the exact URL and the exact window title AND process (every near miss is a mismatch that ends the grant); the gate is asked before the browser is opened or any window is listed, the windows are listed once, zero or several exact matches fail with no focus operation and a spent entry that is never retried; revoked, expired, exhausted and switched-off grants; chat, chains, Jobs and every production backend refused while the tools stay registered; the shared exact matcher; the existing encodings byte for byte; isolated mutants that skip admission or restore substring matching
     test_action_proposal_recognition.py / _service.py / _door.py / _handoff.py / _execution.py / _result.py / _notes.py / _tasks.py / _complete.py - (Action Proposal, Slices 2-7) the grammars, building / follow-ups / approval / revalidation, precedence in the real core, the store handoff and package boundary, the exact approved plan run by the real JobEngine (allow-list, refusals, failure, restart, pause/resume, no re-planning), the verified one-time result report (truth, conversation binding, exactly-once, bounds, hook safety), and the optional note step (grammar, shown in full, exact handoff, mixed outcomes, interruption)
     test_workspace_policy.py / _tools.py / _jobs.py / _handle_this.py - (Automation Slice A1) the Workspace rules (every unsafe name / path / link / control character, create-only, bounds, kill switch, read-back check), the tools and where they are and are not reachable, real JobEngine runs (research -> analyze -> write, read -> analyze -> write, hostile file text), and Handle This's treatment of file requests
     test_scheduled_jobs_final.py   - (Slice 5) Run Now, result presentation, renewal, the full lifecycle, and the final security review
@@ -634,6 +637,9 @@ understood by a small, deterministic, schema-aware layer - never by
       -> ToolSequence            # immutable; the source of truth
       -> execute step 1, 2, ...  # via ToolRegistry.execute, in order
 
+(The example is about how a command is read. `open_url` and `scroll` are both behind the Computer Input Gate, so with no grant covering them this exact command is turned
+away whole - see *Computer Input Gate* below.)
+
 If **any** step is unknown, malformed, unbindable, invalid or unauthorized,
 the whole command is rejected and **nothing executes**. Execution only starts
 once the entire sequence has validated; if a step then fails at execution,
@@ -747,32 +753,89 @@ source of truth; a notification is never sent twice for one Job.
 
 ### Computer Input Gate
 
-Six computer tools send **input** to the desktop: `type_text`, `press_key`, `move_mouse`, `click_mouse`, `double_click` and `open_application`. They are
-SAFE_ACTION, so the registry asked for no confirmation - and one anonymous chat message could press Win+R, type a command and press Enter (`use tool
-press_key win+r, then use tool type_text ..., then use tool press_key enter`). The **Computer Input Gate** (`app/computer/gate.py`) closes that path
-without adding any capability:
+Nine computer tools **act on the desktop**. Seven send **input**: `type_text`, `press_key`, `move_mouse`, `click_mouse`, `double_click`, `scroll` (the mouse wheel) and
+`open_application`; two change which window is in front: `open_url` and `switch_window`. They are SAFE_ACTION, so the registry asks for no confirmation - and one anonymous chat
+message could press Win+R, type a command and press Enter (`use tool press_key win+r, then use tool type_text ..., then use tool press_key enter`). The **Computer Input Gate**
+(`app/computer/gate.py`) closes that path without adding any capability. Two locks must both open: the global switch **and** an authorization grant.
 
-- **Off by default.** `JARVIS_COMPUTER_INPUT_ENABLED` (default `false`) is read on **every** call. Off, none of the six reaches the desktop.
-- **One shared limit.** `JARVIS_COMPUTER_INPUT_ACTIONS_PER_MINUTE` (default `10`) is a single budget for all six tools together - not ten each. It is a
-  *rolling* 60-second window: an admitted action stops counting at **exactly** 60 seconds after it happened (at 59.999 s it still counts; at 60 s its
-  slot is free). A refused attempt - switched off or over the limit - uses up **no** slot; an attempt that passed the gate counts even if the OS then
-  failed, so a failing loop cannot spin. The limit is read live too; a value that is not a plain non-negative whole number allows nothing.
-- **Enforced by the real backend itself, when the action runs.** `WindowsComputerBackend` calls the gate immediately before each OS call that sends input,
-  so it does not matter how an instance was obtained: any `WindowsComputerBackend()` - built by the factory or by any other code - is switched off by default
-  and shares **one process-wide gate**, hence one budget, with every other instance (a caller can deliberately hand it a gate of its own, as a test does). A
-  direct tool `execute`, a `ToolRegistry.execute` call, a chained command, or a caller that never validated anything all meet the same gate; a request that
-  fails validation is turned away before the gate and uses no slot. Counting and recording an action is one step under a lock, so concurrent calls admit at
-  most the limit. (`GatedComputerBackend` does the same job for any *other* backend that does not gate itself, such as a test double; it refuses to wrap
-  one that does, so an action can never be counted twice.) The tools' `validate_arguments` also *pre-checks* (consuming nothing), which turns a
-  whole command away before its first step runs when input is off or the budget is already spent ("nothing was executed"); that is a convenience, never
-  the enforcement. A chain longer than the remaining budget therefore runs the steps that fit, stops at the first refused one and says which steps were
-  not run.
-- **Audit log, never a value.** Every admitted and every refused attempt is logged (logger `jarvis.computer.input`) with the tool name, the outcome, the
-  reason and the count - plus, at most, a coarse shape (`chars=12`, `parts=3`). **Never** typed text, key names, coordinates, application names or any other
-  argument value, and never an error message from the desktop. A refused three-step command leaves one line per refused step.
-- **The input tools are also `automatable = False`** (they used to be kept from automations only by living in a separate registry).
-- **Unchanged:** the read-only tools, the Job allowlist (`open_url`, `scroll`, `switch_window`, `get_active_window`, observation) and every permission level.
-  The input tools are still SAFE_ACTION: the control is the gate, not a confirmation prompt.
+- **Off by default.** `JARVIS_COMPUTER_INPUT_ENABLED` (default `false`) is read on **every** call. Off, none of the nine acts on the desktop. The switch is necessary
+  but **no longer sufficient**: turning it on does not let chat, a Job, a scheduler or an automation do any of the nine.
+- **An authorization grant is required** (`app/computer/authority.py`, minted only by `app/computer/issuer.py`). A grant is a short-lived, single-use, **ordered** list
+  of exact actions with exact arguments. It authorizes those and nothing else: different text, a different key, a different order or a different action is refused
+  **and revokes the whole grant**. Entries are matched by an HMAC (a random per-grant key) of a canonical form of the action and its arguments, so nothing derived from an
+  argument is stored or logged. A grant lives at most 300 seconds on a monotonic clock (the supervised Notepad demo asks for 120), is spent entry by entry, and can be
+  revoked (`revoke`, `revoke_all`) - **observed at the next authorization check, not instantly** (see *Stopping input mid-run* below). The gate also ends every grant at the next
+  admission or recheck that sees the switch off; nothing watches the switch in the background. A grant is an unguessable object (128-bit id, 256-bit key) that
+  cannot be copied or pickled.
+- **Authority is a reference, not ambient context.** A grant is handed to one backend instance (`create_authorized_computer_backend(grant)`). The default backend, and the
+  shared one in `app/main.py`, carry no grant and admit **no input at all**, switch or no switch. There is no context variable and no thread-local, so a thread, a request,
+  a Job or a scheduler gains nothing unless somebody passes it that exact backend. Today only the supervised Notepad demo's explicit `--run` mints a grant, for exactly
+  its own seven actions (including bringing Notepad forward by its exact title and process), and revokes it in a `finally`, so it never outlives the run whether the run finishes or raises (grants live in memory only: a restart forgets them all).
+- **One shared limit.** `JARVIS_COMPUTER_INPUT_ACTIONS_PER_MINUTE` (default `10`) is a single budget for all nine tools together. It is a *rolling* 60-second window: an
+  admitted action stops counting at **exactly** 60 seconds after it happened. A refused attempt - for **any** reason - uses up **no** rate-limit slot and **no** grant entry
+  (a wrong action or argument additionally ends the grant); an attempt that passed the gate counts even if the OS then failed, so a failing loop cannot spin. The limit is
+  read live; a value that is not a plain non-negative whole number allows nothing.
+- **Enforced by the real backend itself, when the action runs.** `WindowsComputerBackend` asks the gate immediately before each OS call that sends input, after the
+  arguments were validated. For these nine methods, a direct tool `execute`, a `ToolRegistry.execute` call, a chained command, a Job step, or a caller that never validated anything all meet the same
+  gate. Validating the grant, spending its entry and recording the rate-limit slot are one step under one lock, so concurrent calls admit at most what the grant and the limit
+  allow. (`GatedComputerBackend` does the same job for any *other* backend, such as a test double.) The explicit chat-command planner also *pre-checks* each step (consuming
+  nothing, order-agnostic), turning a whole command away before its first step runs; that is a convenience, never the enforcement.
+- **Audit log, never a value.** Every admitted and refused attempt, and every grant issued, spent or revoked, is logged (logger `jarvis.computer.input`) with the action
+  *name*, the outcome, a reason code and counts, plus a short prefix of the grant's random id. **Never** typed text, key names, coordinates, application names, argument
+  digests or any metadata derived from an argument (no lengths).
+- **`open_url` and `switch_window` are behind the gate too.** They used to need neither the switch nor a grant. Now both need an authorization grant that binds their exact
+  arguments, and the gate is asked **before** anything is opened, listed or brought forward. They are SAFE_ACTION (no confirmation prompt), and they stay registered in the Job
+  allowlist and in interactive chat - but **registration grants nothing**: the shared backend carries no grant, so a chat command, a chain or a Job is refused at execution (and a
+  chain is turned away whole by the non-consuming pre-check). Both change the **foreground window** when they succeed:
+  - `open_url` binds the **exact URL string** handed to the default browser (`webbrowser.open`; only `http`/`https` URLs with a host; no normalization of scheme, host case, trailing
+    slash or fragment - a different string is a mismatch and ends the grant). The Job variant still refuses non-public hosts and opens a `#fragment` only if that exact anchor was
+    observed, and does so before the gate is asked. Once the grant admits it, the browser is opened and **forced to the front**: the topmost visible window of the program Windows
+    associates with the URL's scheme is brought forward (to get past Windows' foreground lock this process's input thread is temporarily attached to the current foreground window's
+    thread, and a minimized window is restored). If that cannot be verified it fails with an error - but the browser has already been opened, and the entry stays spent. Redirects,
+    the choice of default browser and DNS resolution happen inside the browser and are not bound by the grant.
+  - `switch_window(title, process)` binds the **exact window title** (the window's full title, case-sensitive; no fragment, substring or wildcard) **and the exact process file
+    name** (case-folded, because Windows file names are; a plain `*.exe` name, never a path). Once the grant admits it - which spends the entry **before** any window is listed - the
+    visible windows are listed **once** and only an exact title-plus-process match is brought to the front (a minimized one is restored, as above). **No match, or more than one, is an
+    error with no focus operation:** there is no topmost-window fallback, no partial match, no arbitrary choice and no second look; the entry stays spent and cannot be used again.
+    The built-in **denylist** (password managers, credential and lock-screen programs, shells and terminals, the registry editor, Task Manager, `mmc`, `services`, and titles
+    containing words such as password, vault, sign in, 2FA or user account control) is never a match; it is best-effort, not an allowlist.
+  - **A grant binds a title and a process, not a window instance.** Two windows with the same title and process are an *error*, not a choice, and no claim is made about a window
+    created between authorization and use: the only protection is that exactly one window must match when the lookup happens. The grant also does not look at what a later keystroke
+    will do in that window.
+  - **The Notepad demo** brings Notepad forward with this very action, as its second authorized step: a bounded read-only wait inside the step, then the one gated `switch_window`
+    (see the demo's module docstring). Its grant has **seven** entries, in plan order: open Notepad, switch to the window, Ctrl+N, the note, Ctrl+S, the file name, Enter. The window
+    is requested by its exact title - `Untitled - Notepad` unless `--notepad-title` says what your Notepad shows - so an unexpected title fails closed, before anything is typed.
+  - **Existing features that used these tools now refuse** until something deliberately hands them a grant: Job and chat `open_url` / `switch_window` steps (including the navigation
+    and window-switching parts of Handle This workflows, which can still be planned) fail at execution with "needs an approved authorization", spending nothing.
+  Scrolling is gated as well: it used to pass straight through, even with the switch off.
+- **Unchanged:** the read-only tools, the Job allowlist (`open_url`, `scroll`, `switch_window`, `get_active_window`, observation - though a Job's `scroll`, `open_url` and `switch_window` now fail closed,
+  because Jobs hold no grant), every permission level (the input tools are still SAFE_ACTION and `automatable = False`: the grant is an additional enforcement layer, not a
+  confirmation prompt), the shared rate limit, pyautogui's own fail-safe (described below; it is narrower than "a corner") and the independent result verification.
+- **Stopping input mid-run: what revocation does and does not do.** Only `type_text` takes time in the middle of an action, so it is the only action that can be stopped
+  part-way. The real backend sends it in chunks of at most 50 characters (`TYPING_CHUNK_CHARACTERS`; about 1.5 seconds of typing at the 0.03 s pacing; the 1000-character
+  limit is unchanged, so at most 20 chunks) as **one** action - one grant entry and one rate-limit slot, matched against the grant by the exact whole text. Before **every**
+  chunk it asks the admission to confirm it may continue. That recheck consumes nothing, and it refuses once the grant was revoked or ended by a mismatch, its lifetime has
+  passed, or the switch is off (which also ends every grant). Once a recheck refuses, **no further chunk is sent**. The limits, honestly:
+  - It is observed at the **next** recheck, not at the instant of revocation. The chunk in progress completes (up to about 1.5 seconds of typing plus pyautogui's own
+    pause), and a change that lands after a recheck passed but before that chunk is written does not stop that chunk.
+  - **Characters already sent to the operating system cannot be recalled.** Nothing undoes them; they stay wherever the keystrokes landed. A stopped typing says so
+    ("Typing was stopped part-way ...").
+  - A failure part-way (an OS error) also ends the typing; the entry and the slot stay spent, so a failed typing is not a free retry.
+  - Using up a grant's last entry on this very action does not stop it, and neither does lowering the rate limit mid-typing (one action is one slot).
+  - The other eight acting methods (a key press, mouse move, click, double-click, scroll, an application launch, `open_url`, `switch_window`) are a single OS call (or one lookup) each: there is no moment in between to
+    interrupt, so revoking a grant only prevents the NEXT action. `GatedComputerBackend` (used for test doubles) admits once and cannot interrupt a double that types by itself.
+- **The pyautogui fail-safe is narrower than "a corner", and it is not part of the gate.** Jarvis leaves `pyautogui.FAILSAFE` on, and the pinned library (`pyautogui==0.9.54`)
+  raises `FailSafeException` only when the cursor is at **exactly the top-left pixel of the screen, (0, 0)** (`FAILSAFE_POINTS = [(0, 0)]`) - not at the other three corners and
+  not at an edge. It checks at the start of each pyautogui call (keys, mouse, scroll, `write`) and after each character `write` types, and only then: a cursor that passes
+  through (0, 0) between checks is not seen, nothing watches the mouse in the background, and `open_application`, `open_url`, `switch_window` and `get_active_window` do not go
+  through pyautogui at all, so they are not covered. It stops the call that finds the cursor there by raising; it does **not** revoke anything (the demo's own `finally` revokes
+  its grant) and does not recall characters already typed. It is the library's behaviour, read from its pinned source: this repository sets it, but its tests run on a fake
+  input library and never trigger it, and it relies on a person getting the cursor onto that one pixel and leaving it there until the next check.
+- **Not a security boundary against code inside the process.** The grant system and the import/call-site guards in the tests defend against accidental and prompted misuse
+  by a cooperating program. Anything running in this Python process can set the switch, read a grant's key or call the gate's internals, so it is **not** protection against
+  hostile in-process code; that would need a separate broker process. The switch is read from the settings object, which loads once at startup: editing `.env` while Jarvis runs
+  changes nothing. Stopping input mid-run is described in the two bullets above: `revoke` / `revoke_all` act at the next authorization check, Ctrl+C ends the demo's terminal
+  process (its `finally` then revokes the grant), and the pyautogui fail-safe acts only on the top-left pixel; none of them recalls characters already sent.
 
 **Loopback-only Host check** (`app/host_guard.py`, added to `app/main.py`): every route answers 403 unless the `Host` header is `localhost`, a `127.x.x.x`
 address or `[::1]`, each with an optional port (`localhost:8000`, `[::1]:8000`). `localhost` is matched exactly (not `localhost.` and not a name that
@@ -784,7 +847,7 @@ nothing and would NOT be loopback if it ever were), and anything that needs to b
 the `Host` header, never the client's address: a client on another machine that simply sends `Host: localhost` is not stopped by it, so it is no substitute
 for loopback binding - a loopback Host proves nothing about who is calling.
 
-What this does **not** do: it does not authenticate `/chat`; the interactive `open_url` still accepts any http/https address including `localhost`
+What this does **not** do: it does not authenticate `/chat`; the interactive `open_url`, once a grant names the address, still accepts any http/https address including `localhost`
 (the Job variant does not); and the counter is per process and in memory (a restart forgets it - the switch is off by default anyway). Tests pin that
 production builds the real backend in exactly one place, that nothing else in the application calls the OS input functions, and that every OS input call
 in the real backend sits behind a gate admission in the same method.

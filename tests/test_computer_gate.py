@@ -1,7 +1,9 @@
 """
-Computer Input Gate (app/computer/gate.py): the six INPUT methods - type_text, press_key, move_mouse, click_mouse, double_click, open_application - may
-reach the desktop only when `computer_input_enabled` is on (default OFF) and the one shared limit (default 10 admitted actions in any rolling 60 seconds)
-has room. The gate is enforced at EXECUTION time, inside the backend every tool ends in, so it cannot be skipped by a direct `execute`, a registry call, or
+Computer Input Gate (app/computer/gate.py), the SWITCH and LIMIT half: the seven INPUT methods - type_text, press_key, move_mouse, click_mouse, double_click,
+scroll, open_application - may reach the desktop only when `computer_input_enabled` is on (default OFF) and the one shared limit (default 10 admitted actions in any
+rolling 60 seconds) has room. (What a grant covers is tested in test_computer_authorization.py and test_computer_gate_no_bypass.py. There is no budget-only gate any more: the
+tests HERE keep asserting exactly the two rules they were written for, but every input call goes through the real gate with a real one-entry grant that tests/grant_support.py
+mints for exactly that call.) The gate is enforced at EXECUTION time, inside the backend every tool ends in, so it cannot be skipped by a direct `execute`, a registry call, or
 a chained "use tool ..., then ..." command; the tools' `validate_arguments` only PRE-checks (consuming nothing) to turn a whole command away early.
 
 Real: the gate, the wrapper, the tools, ToolRegistry, JarvisCore with its explicit-command planner, and (for the wiring tests) the production objects in
@@ -48,8 +50,11 @@ from app.providers.base import AIProvider
 from app.tools.base import PermissionLevel, ToolArgumentError, ToolResultStatus
 from app.tools.decision import ToolCallBuilder, ToolCallError, ToolCallProvider
 from app.tools.registry import ToolRegistry
+from grant_support import PerCallGrants, authorize, budget_trail, check_now, admit_now, without_grant_ids
 
-INPUT_TOOLS = ("type_text", "press_key", "move_mouse", "click_mouse", "double_click", "open_application")
+INPUT_TOOLS = ("type_text", "press_key", "move_mouse", "click_mouse", "double_click", "open_application", "scroll")
+#: Every method that ACTS on the desktop: the input tools plus the two that change which window is in front (each needs a grant that binds its exact arguments).
+ACTING_METHODS = (*INPUT_TOOLS, "open_url", "switch_window")
 
 #: (tool name, the parameters of a valid call, the single effect it must have on the desktop)
 INPUT_CALLS = [
@@ -59,6 +64,7 @@ INPUT_CALLS = [
     ("click_mouse", {"x": 10, "y": 20}, ("click_mouse", 10, 20, MouseButton.LEFT)),
     ("double_click", {"x": 10, "y": 20}, ("double_click", 10, 20, MouseButton.LEFT)),
     ("open_application", {"app": "notepad"}, ("open_application", AllowedApplication.NOTEPAD)),
+    ("scroll", {"amount": 5}, ("scroll", 5)),
 ]
 IDS = [c[0] for c in INPUT_CALLS]
 
@@ -105,9 +111,9 @@ class RecordingBackend(ComputerBackend):
     def open_url(self, url):
         self._act("open_url", url)
 
-    def switch_window(self, title):
-        self._act("switch_window", title)
-        return WindowInfo(title=title, process_name="x.exe", is_maximized=False)
+    def switch_window(self, title, process):
+        self._act("switch_window", title, process)
+        return WindowInfo(title=title, process_name=process, is_maximized=False)
 
     def type_text(self, text):
         self._act("type_text", text)
@@ -147,12 +153,15 @@ class SlowCountDeque(deque):
 
 
 def make_gated(limit=10, enabled=True, clock=None, inner=None):
-    """(gated backend, the recording backend behind it, a dict that changes the settings live, the clock)."""
+    """(gated backend, the recording backend behind it, a dict that changes the settings live, the clock).
+
+    These tests are about the switch and the limit. Every input call still goes through the REAL gate with a REAL grant: `PerCallGrants` mints a one-entry grant for exactly
+    the call being made (tests/grant_support.py) and hands it to the production `GatedComputerBackend`."""
     clock = clock or Clock()
     state = {"enabled": enabled, "limit": limit}
     gate = InputGate(lambda: state["enabled"], lambda: state["limit"], clock=clock)
     inner = inner or RecordingBackend()
-    return GatedComputerBackend(inner, gate), inner, state, clock
+    return PerCallGrants(lambda grant: GatedComputerBackend(inner, gate, grant), gate), inner, state, clock
 
 
 BACKEND_CALLS = {
@@ -162,6 +171,17 @@ BACKEND_CALLS = {
     "click_mouse": lambda b: b.click_mouse(10, 20, MouseButton.LEFT),
     "double_click": lambda b: b.double_click(10, 20, MouseButton.LEFT),
     "open_application": lambda b: b.open_application(AllowedApplication.NOTEPAD),
+    "scroll": lambda b: b.scroll(5),
+}
+#: The exact (normalized) arguments each BACKEND_CALLS call passes to the gate, for a test that mints its grants ahead of time.
+CALL_ARGS = {
+    "type_text": ("hello",),
+    "press_key": (("enter",),),
+    "move_mouse": (10, 20),
+    "click_mouse": (10, 20, MouseButton.LEFT),
+    "double_click": (10, 20, MouseButton.LEFT),
+    "open_application": (AllowedApplication.NOTEPAD,),
+    "scroll": (5,),
 }
 
 
@@ -176,24 +196,33 @@ def test_the_declared_defaults_are_off_and_ten_per_rolling_minute():
     assert DEFAULT_ACTIONS_PER_WINDOW == 10 and WINDOW_SECONDS == 60.0
 
 
+def test_the_default_gate_requires_authority_and_is_built_from_the_settings(monkeypatch):
+    monkeypatch.setattr(settings, "computer_input_enabled", True)  # the switch alone is not enough, on a gate built from the settings
+    monkeypatch.setattr(settings, "computer_input_actions_per_minute", 10**6)
+    for gate in (create_default_input_gate(), default_input_gate()):
+        assert not hasattr(gate, "_require_authority")  # fail closed always: there is no mode in which a grant is optional
+        with pytest.raises(ComputerControlError, match="approved authorization"):
+            gate.admit("type_text", authority=None, canonical=None)
+
+
 def test_the_default_gate_reads_both_settings_on_every_call(monkeypatch):
-    gate = create_default_input_gate()
+    gate = create_default_input_gate()  # (each admission below carries a real one-entry grant; this test is about the two SETTINGS)
     monkeypatch.setattr(settings, "computer_input_enabled", False)
     monkeypatch.setattr(settings, "computer_input_actions_per_minute", 2)
     with pytest.raises(ComputerControlError, match="switched off"):
-        gate.admit("type_text")
+        admit_now(gate, "type_text")
 
     monkeypatch.setattr(settings, "computer_input_enabled", True)  # the SAME gate object, no rebuild
-    gate.admit("type_text")
-    gate.admit("type_text")
+    admit_now(gate, "type_text")
+    admit_now(gate, "type_text")
     with pytest.raises(ComputerControlError, match="limited to 2 actions per minute"):
-        gate.admit("type_text")
+        admit_now(gate, "type_text")
 
     monkeypatch.setattr(settings, "computer_input_actions_per_minute", 3)  # raised live: the third now fits
-    gate.admit("type_text")
+    admit_now(gate, "type_text")
     monkeypatch.setattr(settings, "computer_input_enabled", False)  # switched off live: nothing more, even with room
     with pytest.raises(ComputerControlError, match="switched off"):
-        gate.admit("type_text")
+        admit_now(gate, "type_text")
 
 
 # ===================================================== the gate: switch, limit, boundary =====================================================
@@ -206,7 +235,7 @@ def test_a_switched_off_gate_refuses_everything_and_uses_up_nothing():
         with pytest.raises(ComputerControlError, match="switched off"):
             backend.type_text("x")
         with pytest.raises(ComputerControlError, match="switched off"):
-            backend.gate.check("type_text")
+            check_now(backend.gate, "type_text")
     state["enabled"] = True
     for _ in range(10):
         backend.type_text("x")  # all ten slots are still free: not one refusal was counted
@@ -284,13 +313,13 @@ def test_one_budget_is_shared_by_all_six_tools_not_one_each():
         assert len(inner.effects) == 3, spent_on
 
 
-def test_a_mixed_run_of_all_six_uses_one_count():
-    backend, inner, _, _ = make_gated(limit=6)
+def test_a_mixed_run_of_all_seven_uses_one_count():
+    backend, inner, _, _ = make_gated(limit=7)
     for call in BACKEND_CALLS.values():
         call(backend)
 
     with pytest.raises(ComputerControlError):
-        backend.type_text("seventh")
+        backend.type_text("eighth")
 
     assert [e[0] for e in inner.effects] == list(BACKEND_CALLS)
 
@@ -322,15 +351,15 @@ def test_the_retry_hint_counts_down_to_the_free_slot():
 def test_check_consumes_nothing_but_refuses_when_off_or_full():
     backend, inner, state, _ = make_gated(limit=2)
     for _ in range(500):
-        backend.gate.check("type_text")  # a pre-check can never be what limits anyone
+        check_now(backend.gate, "type_text")  # a pre-check can never be what limits anyone
 
     backend.type_text("x")
     backend.type_text("x")
     with pytest.raises(ComputerControlError, match="limited to 2"):
-        backend.gate.check("type_text")
+        check_now(backend.gate, "type_text")
     state["enabled"] = False
     with pytest.raises(ComputerControlError, match="switched off"):
-        backend.gate.check("type_text")
+        check_now(backend.gate, "type_text")
 
     assert len(inner.effects) == 2
 
@@ -391,15 +420,18 @@ def test_a_setting_that_cannot_be_read_fails_closed():
 @pytest.mark.parametrize("round_number", range(10))
 def test_concurrent_calls_admit_exactly_the_limit_and_no_more(round_number):
     threads_count, limit = 64, 10
-    backend, inner, _, _ = make_gated(limit=limit)  # a clock that never moves: nothing expires mid-test
-    backend.gate._events = SlowCountDeque()  # see the class: makes a missing lock show up every time instead of once in a blue moon
+    gate = InputGate(lambda: True, lambda: limit, clock=Clock(), max_grants=threads_count + 8)  # a clock that never moves: nothing expires mid-test
+    gate._events = SlowCountDeque()  # see the class: makes a missing lock show up every time instead of once in a blue moon
+    inner = RecordingBackend()
+    # One real grant per thread, minted BEFORE the race (the race is on the gate's lock, not on the issuer): every thread holds exactly the entry for its own call.
+    backends = [GatedComputerBackend(inner, gate, authorize(gate, (tool, *CALL_ARGS[tool]))) for tool in (INPUT_TOOLS[n % len(INPUT_TOOLS)] for n in range(threads_count))]
     barrier = threading.Barrier(threads_count)
     results = []
 
     def attempt(n):
         barrier.wait()
         try:
-            BACKEND_CALLS[INPUT_TOOLS[n % len(INPUT_TOOLS)]](backend)  # all six tools at once, sharing one budget
+            BACKEND_CALLS[INPUT_TOOLS[n % len(INPUT_TOOLS)]](backends[n])  # all seven tools at once, sharing one budget
             results.append(True)
         except ComputerControlError:
             results.append(False)
@@ -422,8 +454,8 @@ def test_every_method_of_the_backend_interface_is_classified_exactly_once():
 
     assert GATED_METHODS | UNGATED_METHODS == interface  # a method added later cannot reach the desktop unclassified
     assert GATED_METHODS & UNGATED_METHODS == set()
-    assert GATED_METHODS == set(INPUT_TOOLS)
-    assert UNGATED_METHODS == {"get_active_window", "get_screen_info", "open_url", "switch_window", "scroll"}
+    assert GATED_METHODS == set(ACTING_METHODS)
+    assert UNGATED_METHODS == {"get_active_window", "get_screen_info"}  # open_url and switch_window moved to GATED_METHODS: each changes which window is in front
 
 
 @pytest.mark.parametrize("tool, params, effect", INPUT_CALLS, ids=IDS)
@@ -431,7 +463,7 @@ def test_each_gated_method_is_admitted_first_and_then_passed_on_unchanged(tool, 
     order = []
     backend, inner, _, _ = make_gated()
     real_admit = backend.gate.admit
-    backend.gate.admit = lambda action, shape="": (order.append(("admit", action)), real_admit(action, shape))[1]
+    backend.gate.admit = lambda action, **kwargs: (order.append(("admit", action)), real_admit(action, **kwargs))[1]
 
     BACKEND_CALLS[tool](backend)
 
@@ -448,28 +480,39 @@ def test_each_gated_method_reaches_nothing_when_refused(tool, params, effect):
     assert inner.effects == []
 
 
-def test_the_other_methods_pass_straight_through_even_when_input_is_off():
+def test_only_the_reads_pass_straight_through_even_when_input_is_off():
     backend, inner, _, _ = make_gated(enabled=False, limit=0)
 
     assert backend.get_active_window().title == "Notepad" and backend.get_screen_info().width == 1920
-    backend.open_url("https://example.com")
-    backend.switch_window("Notes")
-    backend.scroll(-300)
+    with pytest.raises(ComputerControlError, match="switched off"):
+        backend.open_url("https://example.com")  # open_url and switch_window change which window is in front: gated like the rest
+    with pytest.raises(ComputerControlError, match="switched off"):
+        backend.switch_window("Notes", "notes.exe")
 
-    assert inner.effects == [("open_url", "https://example.com"), ("switch_window", "Notes"), ("scroll", -300)]
-    assert inner.reads == ["get_active_window", "get_screen_info"]
+    assert inner.effects == [] and inner.reads == ["get_active_window", "get_screen_info"]
 
 
-def test_the_other_methods_use_none_of_the_input_budget():
+def test_the_reads_use_none_of_the_input_budget():
     backend, inner, _, _ = make_gated(limit=1)
     for _ in range(25):
-        backend.scroll(-100)
-        backend.open_url("https://example.com")
         backend.get_active_window()
+        backend.get_screen_info()
 
-    backend.type_text("the one slot is still free")  # 75 pass-through calls later
+    backend.type_text("the one slot is still free")  # 50 pass-through reads later
     with pytest.raises(ComputerControlError, match="limited to 1"):
         backend.type_text("and now it is used")
+
+
+def test_open_url_and_switch_window_share_the_one_budget_with_the_other_seven():
+    backend, inner, _, _ = make_gated(limit=2)
+
+    backend.open_url("https://example.com")
+    backend.switch_window("Notes", "notes.exe")
+    for refused in (lambda: backend.type_text("x"), lambda: backend.open_url("https://example.com"), lambda: backend.switch_window("Notes", "notes.exe")):
+        with pytest.raises(ComputerControlError, match="limited to 2"):
+            refused()
+
+    assert inner.effects == [("open_url", "https://example.com"), ("switch_window", "Notes", "notes.exe")]
 
 
 # ===================================================== the tools: direct calls cannot bypass the gate ============================================
@@ -533,7 +576,7 @@ def test_the_limit_holds_at_execution_even_if_validation_is_skipped_or_stale(mon
     registry = tools_over(backend)
     for name in INPUT_TOOLS:  # a caller that never validates, or a pre-check that is out of date
         monkeypatch.setattr(type(registry.get(name)), "validate_arguments", lambda self, **kw: None)
-    monkeypatch.setattr(backend.gate, "check", lambda action: None)
+    monkeypatch.setattr(backend.gate, "check", lambda action, **kwargs: None)
 
     results = [registry.execute(n, params=p) for n, p, _ in INPUT_CALLS[:5]]
 
@@ -639,14 +682,14 @@ def test_a_chain_that_mixes_in_an_allowed_tool_is_still_turned_away_before_its_f
     assert inner.effects == []  # not even the scroll ran: the pre-check rejects the whole command
 
 
-def test_the_job_tools_and_reads_still_work_while_input_is_off():
+def test_the_reads_still_work_while_input_is_off_but_scrolling_and_opening_a_url_do_not():
     say, inner, _, _ = chat_over(enabled=False)
 
-    assert say("use tool scroll -600") == "Scrolled by -600."
+    assert "switched off" in say("use tool scroll -600")  # scrolling is mouse-wheel input: gated
+    assert "switched off" in say("use tool open_url https://example.com")  # and so is opening the browser: it changes which window is in front
     say("use tool get_active_window")
-    say("use tool open_url https://example.com")
 
-    assert inner.effects == [("scroll", -600), ("open_url", "https://example.com")]
+    assert inner.effects == []  # nothing acted; only the read ran (open_url and switch_window are no longer outside the gate)
 
 
 def test_a_chain_longer_than_the_remaining_budget_runs_only_what_fits_and_says_so():
@@ -776,9 +819,16 @@ def process_gate(monkeypatch):
     """The process-wide gate with its history cleared for this test (and restored afterwards), and both settings under the test's control."""
     gate = default_input_gate()
     monkeypatch.setattr(gate, "_events", deque())
+    monkeypatch.setattr(gate, "_grants", {})  # and no grant minted by an earlier test, or by this one, outlives it
     monkeypatch.setattr(settings, "computer_input_enabled", False)
     monkeypatch.setattr(settings, "computer_input_actions_per_minute", 10)
     return gate
+
+
+def authorized_real_backend(gate=None):
+    """The REAL `WindowsComputerBackend` over the process-wide gate (or `gate`), given a real one-entry grant for each call it is asked to make."""
+    gate = gate if gate is not None else default_input_gate()
+    return PerCallGrants(lambda grant: WindowsComputerBackend(gate=gate, authority=grant), gate)
 
 
 @pytest.mark.parametrize("tool", INPUT_TOOLS)
@@ -793,13 +843,16 @@ def test_a_bare_windows_backend_is_switched_off_and_nothing_reaches_the_os(tool,
 
 def test_the_real_backends_click_at_the_current_position_is_gated_too(recording_os, process_gate, monkeypatch):
     """`click_mouse(None, None, ...)` is a separate branch (it clicks wherever the cursor is): it has its own gate call, and its own test."""
-    bare = WindowsComputerBackend()
+    bare = authorized_real_backend()
 
     with pytest.raises(ComputerControlError, match="switched off"):
         bare.click_mouse(None, None, MouseButton.LEFT)
     assert recording_os.calls == []
 
     monkeypatch.setattr(settings, "computer_input_enabled", True)
+    with pytest.raises(ComputerControlError, match="approved authorization"):
+        WindowsComputerBackend().click_mouse(None, None, MouseButton.LEFT)  # on, but this instance carries no grant
+    assert recording_os.calls == []
     bare.click_mouse(None, None, MouseButton.LEFT)
     assert recording_os.calls == [("click", {"button": "left"})]
 
@@ -811,8 +864,11 @@ def test_each_tools_pre_check_works_on_the_real_backend_too_and_consumes_nothing
     with pytest.raises(ToolArgumentError, match="switched off"):
         instance.validate_arguments(**params)
     monkeypatch.setattr(settings, "computer_input_enabled", True)
+    with pytest.raises(ToolArgumentError, match="approved authorization"):
+        instance.validate_arguments(**params)  # on, but the production default carries no grant, so even the pre-check says no
+    authorized = create_computer_tools_registry(backend=authorized_real_backend()).get(tool)  # the same real backend and gate, handed a grant per call
     for _ in range(25):
-        instance.validate_arguments(**params)  # valid, repeatedly, and it never uses a slot
+        authorized.validate_arguments(**params)  # valid, repeatedly, and it never uses a slot
 
     assert recording_os.calls == [] and len(process_gate._events) == 0
 
@@ -820,7 +876,7 @@ def test_each_tools_pre_check_works_on_the_real_backend_too_and_consumes_nothing
 def test_a_bare_windows_backend_obeys_the_settings_and_every_instance_shares_one_budget(recording_os, process_gate, monkeypatch):
     monkeypatch.setattr(settings, "computer_input_enabled", True)
     monkeypatch.setattr(settings, "computer_input_actions_per_minute", 3)
-    first, second = WindowsComputerBackend(), WindowsComputerBackend()
+    first, second = authorized_real_backend(), authorized_real_backend()
 
     first.type_text("hello")
     second.press_key("enter")
@@ -834,7 +890,7 @@ def test_a_bare_windows_backend_obeys_the_settings_and_every_instance_shares_one
 
 
 def test_a_bare_windows_backend_rereads_the_switch_on_every_single_call(recording_os, process_gate, monkeypatch):
-    bare = WindowsComputerBackend()
+    bare = authorized_real_backend()
 
     for state in (False, True, False, True, True, False):
         monkeypatch.setattr(settings, "computer_input_enabled", state)
@@ -849,7 +905,7 @@ def test_a_bare_windows_backend_rereads_the_switch_on_every_single_call(recordin
 
 def test_a_gate_handed_to_the_backend_is_the_only_one_it_uses(recording_os, process_gate):
     own = InputGate(enabled=lambda: True, limit=lambda: 1)
-    bare = WindowsComputerBackend(gate=own)  # the process-wide gate is OFF here, and is never consulted
+    bare = authorized_real_backend(own)  # the process-wide gate is OFF here, and is never consulted
 
     bare.type_text("hello")
     with pytest.raises(ComputerControlError, match="limited to 1"):
@@ -865,14 +921,20 @@ def test_concurrent_calls_on_the_real_backend_admit_exactly_the_limit_across_ins
     monkeypatch.setattr(settings, "computer_input_enabled", True)
     monkeypatch.setattr(settings, "computer_input_actions_per_minute", 10)
     monkeypatch.setattr(process_gate, "_events", SlowCountDeque())
-    instances = [WindowsComputerBackend() for _ in range(4)]
+    monkeypatch.setattr(process_gate, "_max_grants", 80)  # capacity for the 64 grants minted below, which are all live at once (the cap is not what is under test)
+    # 64 real backends (a bare `WindowsComputerBackend(authority=...)` each, none handed a gate), every one holding a real grant minted ahead of the race for its own call.
+    instances = [
+        WindowsComputerBackend(authority=authorize(process_gate, (tool, *CALL_ARGS[tool])))
+        for tool in (INPUT_TOOLS[n % len(INPUT_TOOLS)] for n in range(64))
+    ]
+    assert all(instance.gate is process_gate for instance in instances)
     barrier = threading.Barrier(64)
     outcomes = []
 
     def attempt(n):
         barrier.wait()
         try:
-            BACKEND_CALLS[INPUT_TOOLS[n % len(INPUT_TOOLS)]](instances[n % len(instances)])
+            BACKEND_CALLS[INPUT_TOOLS[n % len(INPUT_TOOLS)]](instances[n])
             outcomes.append(True)
         except ComputerControlError:
             outcomes.append(False)
@@ -889,7 +951,7 @@ def test_concurrent_calls_on_the_real_backend_admit_exactly_the_limit_across_ins
 
 def test_the_real_backends_boundary_is_exact_at_59_999_and_60_seconds(recording_os):
     clock = Clock()
-    bare = WindowsComputerBackend(gate=InputGate(enabled=lambda: True, limit=lambda: 2, clock=clock))
+    bare = authorized_real_backend(InputGate(enabled=lambda: True, limit=lambda: 2, clock=clock))
     bare.type_text("hello")  # t = 0
     clock.now += 10.0
     bare.type_text("hello")  # t = 10
@@ -911,7 +973,7 @@ def test_the_real_backends_boundary_is_exact_at_59_999_and_60_seconds(recording_
 
 
 def test_requests_that_fail_validation_use_no_slot_at_the_real_backend(recording_os):
-    bare = WindowsComputerBackend(gate=InputGate(enabled=lambda: True, limit=lambda: 1))
+    bare = authorized_real_backend(InputGate(enabled=lambda: True, limit=lambda: 1))
     invalid = [
         lambda: bare.type_text(""), lambda: bare.type_text("x" * 1001), lambda: bare.press_key("a"), lambda: bare.press_key("ctrl+alt"),
         lambda: bare.move_mouse(99999, 1), lambda: bare.click_mouse(99999, 1, MouseButton.LEFT), lambda: bare.click_mouse(10, 20, "left"),
@@ -929,10 +991,10 @@ def test_requests_that_fail_validation_use_no_slot_at_the_real_backend(recording
 
 
 def test_an_action_counts_exactly_once_through_the_default_backend_and_the_tools(recording_os, process_gate, monkeypatch):
-    """No double counting: the default backend is the real one (not wrapped), so four allowed actions use four slots, not eight."""
+    """No double counting: the backend is the real one (not wrapped in the gate wrapper), so four allowed actions use four slots, not eight."""
     monkeypatch.setattr(settings, "computer_input_enabled", True)
     monkeypatch.setattr(settings, "computer_input_actions_per_minute", 4)
-    registry = create_computer_tools_registry()  # no backend given: the production default
+    registry = create_computer_tools_registry(backend=authorized_real_backend())  # the real backend and the process-wide gate, given a grant per call
 
     results = [registry.execute(name, params=params).status for name, params, _ in INPUT_CALLS[:5]]
 
@@ -963,7 +1025,7 @@ OS_INPUT_FUNCTIONS = frozenset({
     "write", "typewrite", "press", "hotkey", "keyDown", "keyUp", "moveTo", "moveRel", "move", "click", "doubleClick", "tripleClick", "rightClick",
     "middleClick", "mouseDown", "mouseUp", "dragTo", "dragRel", "drag", "scroll", "hscroll", "vscroll",
 })
-GATED_BACKEND_METHODS = ("open_application", "type_text", "press_key", "move_mouse", "click_mouse", "double_click")
+GATED_BACKEND_METHODS = ("open_application", "type_text", "press_key", "move_mouse", "click_mouse", "double_click", "scroll", "open_url", "switch_window")
 
 
 def app_trees():
@@ -977,7 +1039,7 @@ def test_production_code_builds_the_real_backend_in_exactly_one_place():
         if isinstance(node, ast.Call) and getattr(node.func, "id", getattr(node.func, "attr", None)) == "WindowsComputerBackend"
     ]
 
-    assert sites == ["computer/factory.py"]  # and the factory returns it as it is: the gate is inside it
+    assert sites == ["computer/factory.py", "computer/factory.py"]  # exactly the default (no grant) and the explicitly authorized constructor, both in the factory
 
 
 def test_production_code_never_references_the_wrapper_because_the_real_backend_gates_itself():
@@ -1007,17 +1069,18 @@ def test_every_os_input_call_in_the_real_backend_sits_behind_a_gate_admission_in
     def os_calls(method):
         found = []
         for node in ast.walk(method):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_bring_to_foreground":  # the focus-changing call `switch_window` ends in
+                found.append(node.lineno)
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
                 owner, name = node.func.value.id, node.func.attr
-                if (owner == "pyautogui" and name in OS_INPUT_FUNCTIONS - {"scroll"}) or (owner == "subprocess" and name == "Popen"):
+                if (owner == "pyautogui" and name in OS_INPUT_FUNCTIONS) or (owner == "subprocess" and name == "Popen") or (owner == "webbrowser" and name == "open"):
                     found.append(node.lineno)
         return found
 
     def admissions(method):
         return [
             n.lineno for n in ast.walk(method)
-            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "admit"
-            and isinstance(n.func.value, ast.Attribute) and n.func.value.attr == "gate"
+            if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "admit_input"  # gate.admit_input(gate, authority, action, *validated args)
         ]
 
     for name in GATED_BACKEND_METHODS:
@@ -1025,7 +1088,8 @@ def test_every_os_input_call_in_the_real_backend_sits_behind_a_gate_admission_in
         assert calls and len(admitted) >= 1, name
         assert all(any(a < c for a in admitted) for c in calls), f"{name}: an OS call comes before any gate admission"
     ungated = {name for name, method in methods.items() if name not in GATED_BACKEND_METHODS and os_calls(method)}
-    assert ungated == set(), ungated  # no other method of the real backend sends input to the OS (scroll is the deliberate, Job-allowlisted exception)
+    # `_activate_url_handler_window` brings the browser forward and is called ONLY by `open_url`, after its admission (test_computer_focus_authorization.py pins that order).
+    assert ungated - {"_activate_url_handler_window"} == set(), ungated  # no other method of the real backend acts on the OS (scroll, open_url and switch_window are gated now)
 
 
 # ===================================================== the production wiring ======================================================================
@@ -1047,9 +1111,10 @@ def test_every_production_path_to_the_desktop_goes_through_the_one_self_gating_b
 
     for name in INPUT_TOOLS:
         assert live_app.core.computer_tools.get(name).backend is backend
-        assert live_app.core.tools.has(name) is False  # and no input tool is in the Job/automation registry: the allowlist did not widen
+        if name != "scroll":
+            assert live_app.core.tools.has(name) is False  # and no keyboard/mouse/launch tool is in the Job/automation registry: the allowlist did not widen
     for name in JOB_COMPUTER_TOOL_NAMES:
-        assert live_app.core.tools.get(name).backend is backend  # the Job tools share it (they are not gated, only passed through)
+        assert live_app.core.tools.get(name).backend is backend  # the Job tools share it (scroll is gated, and this shared backend carries no grant)
     assert set(JOB_COMPUTER_TOOL_NAMES) == {"open_url", "scroll", "get_active_window", "switch_window"}
 
 
@@ -1062,12 +1127,24 @@ def test_with_the_default_off_the_production_registry_refuses_input_and_nothing_
     assert recorder.calls == []
 
 
-def test_switched_on_the_production_registry_obeys_the_settings_limit(live, monkeypatch):
+def test_switched_on_the_production_registry_still_admits_nothing_because_it_carries_no_grant(live, monkeypatch):
     live_app, _, recorder = live
     monkeypatch.setattr(settings, "computer_input_enabled", True)
     monkeypatch.setattr(settings, "computer_input_actions_per_minute", 2)
 
     results = [live_app.core.computer_tools.execute(name, params=params) for name, params, _ in INPUT_CALLS[:4]]
+
+    assert all(r.status is ToolResultStatus.ERROR and "approved authorization" in r.message for r in results)  # the switch is necessary, not sufficient
+    assert recorder.calls == []
+
+
+def test_a_registry_over_an_authorized_real_backend_obeys_the_settings_limit(live, monkeypatch):
+    _, _, recorder = live
+    monkeypatch.setattr(settings, "computer_input_enabled", True)
+    monkeypatch.setattr(settings, "computer_input_actions_per_minute", 2)
+    registry = create_computer_tools_registry(backend=authorized_real_backend())  # the real backend code and the real process-wide gate, handed a grant per call
+
+    results = [registry.execute(name, params=params) for name, params, _ in INPUT_CALLS[:4]]
 
     assert [r.status for r in results] == [ToolResultStatus.SUCCESS, ToolResultStatus.SUCCESS, ToolResultStatus.ERROR, ToolResultStatus.ERROR]
     assert recorder.calls == [OS_EFFECT["type_text"], OS_EFFECT["press_key"]]
@@ -1082,7 +1159,16 @@ def test_a_chained_chat_command_through_the_production_core_is_gated_too(live, m
 
     monkeypatch.setattr(settings, "computer_input_enabled", True)
     monkeypatch.setattr(settings, "computer_input_actions_per_minute", 2)
-    on = live_app.core.handle_chat(CHAIN)[0]  # three input steps, a budget of two
+    on = live_app.core.handle_chat(CHAIN)[0]  # the production core carries no grant: switched on, the whole chain is still turned away before its first step
+
+    assert recorder.calls == [] and "approved authorization" in on and "nothing was executed" in on.lower()
+
+
+def test_a_chained_command_over_an_authorized_real_backend_stops_at_the_limit(live, monkeypatch):
+    _, _, recorder = live
+    say = real_chat(monkeypatch, enabled=True, limit=2)
+
+    on = say(CHAIN)  # three input steps, a budget of two
 
     assert recorder.calls == [("hotkey", ("win", "r")), ("write", "notepad")]  # 'enter' never reached the OS
     assert "limited to 2 actions per minute" in on
@@ -1094,8 +1180,9 @@ SECRET = "TOP-SECRET-PASSWORD-9d2f"
 
 
 def flattened(caplog) -> str:
-    """Everything a log handler could ever emit for these records."""
-    return "\n".join(f"{r.getMessage()} | {r.msg} | {r.args!r} | {r.exc_text or ''}" for r in caplog.records)
+    """Everything a log handler could ever emit for these records. (An 'allowed' line now carries the grant's random 8-hex-digit id prefix; it is masked so that a check such as
+    'the text 777 is nowhere in the log' cannot be tripped by a random id that happens to contain it. The id is not an argument value.)"""
+    return without_grant_ids("\n".join(f"{r.getMessage()} | {r.msg} | {r.args!r} | {r.exc_text or ''}" for r in caplog.records))
 
 
 def test_the_audit_log_names_the_action_and_outcome_but_never_a_value(caplog):
@@ -1111,8 +1198,9 @@ def test_the_audit_log_names_the_action_and_outcome_but_never_a_value(caplog):
     registry.execute("move_mouse", params={"x": 777, "y": 513})  # switched off
     text = flattened(caplog)
 
-    assert "action=type_text" in text and "allowed" in text and "chars=" in text
-    assert "action=press_key" in text and "parts=3" in text
+    assert "action=type_text" in text and "allowed" in text
+    assert "action=press_key" in text
+    assert "chars=" not in text and "parts=" not in text and "shape=" not in text  # no length or other metadata derived from an argument
     assert "reason=rate_limited" in text and "reason=disabled" in text and "stage=preflight" not in text  # registry calls skip the pre-check
     for value in (SECRET, "ctrl", "shift", "esc", "777", "513", "calculator"):
         assert value not in text, value
@@ -1166,16 +1254,17 @@ def test_log_records_carry_no_extra_fields_that_could_hold_a_value(caplog):
 def everything_logged_anywhere(caplog) -> str:
     """Every record of every logger, as a handler would render it - message, arguments and any traceback."""
     formatter = logging.Formatter("%(name)s %(levelname)s %(message)s")
-    return "\n".join(f"{formatter.format(r)} | {r.args!r} | {r.exc_info!r}" for r in caplog.records)
+    return without_grant_ids("\n".join(f"{formatter.format(r)} | {r.args!r} | {r.exc_info!r}" for r in caplog.records))  # (grant id prefixes masked: see `flattened`)
 
 
 def real_chat(monkeypatch, *, enabled, limit):
-    """A JarvisCore over the PRODUCTION default backend (the real WindowsComputerBackend code, the process-wide gate) with only the OS libraries recorded."""
+    """A JarvisCore over the REAL WindowsComputerBackend code and the process-wide gate - handed a real grant per call, since the production default carries none - with only the OS
+    libraries recorded."""
     monkeypatch.setattr(settings, "computer_input_enabled", enabled)
     monkeypatch.setattr(settings, "computer_input_actions_per_minute", limit)
     jarvis = JarvisCore(
         provider=_NoAI(), memory=SQLiteMemoryStore(":memory:"), tools=ToolRegistry(),
-        computer_tools=create_computer_tools_registry(), tool_call_builder=ToolCallBuilder(_NoToolAI()),
+        computer_tools=create_computer_tools_registry(backend=authorized_real_backend()), tool_call_builder=ToolCallBuilder(_NoToolAI()),
     )
     return lambda message: jarvis.handle_chat(message)[0]
 
@@ -1225,10 +1314,10 @@ def test_no_log_record_holds_a_key_a_coordinate_an_application_or_any_other_argu
 
 def test_the_exact_audit_trail_through_config_changes_and_a_crashing_backend(caplog, monkeypatch, recording_os, process_gate):
     """One mixed sequence on the real backend, asserting the log line for EVERY attempt: off by default, switched on, the OS library crashing AFTER the gate
-    admitted the action, the limit lowered live below what is used, raised live, and switched off again. Tool name, outcome, reason, count and a coarse
-    shape - never a value."""
+    admitted the action, the limit lowered live below what is used, raised live, and switched off again. Tool name, outcome, reason and count - never a value
+    and never anything derived from one (no lengths)."""
     caplog.set_level(logging.DEBUG, logger="jarvis.computer")
-    bare = WindowsComputerBackend()
+    bare = authorized_real_backend()  # real backend, real process-wide gate, a real one-entry grant per call
     outcomes = []
 
     def attempt(call):
@@ -1253,13 +1342,13 @@ def test_the_exact_audit_trail_through_config_changes_and_a_crashing_backend(cap
     attempt(lambda: bare.move_mouse(777, 513))
     monkeypatch.setattr(settings, "computer_input_enabled", False)  # 6. switched off again, with budget to spare
     attempt(lambda: bare.open_application(AllowedApplication.CALCULATOR))
-    lines = [r.getMessage() for r in caplog.records]
+    lines = budget_trail([r.getMessage() for r in caplog.records])  # (an 'allowed' line also names the grant and its entry; the trail below is the action/outcome/count part)
 
     assert outcomes == ["refused", "ok", "crashed", "refused", "ok", "refused"]
     assert lines == [
         "computer_input refused action=type_text reason=disabled",
-        f"computer_input allowed action=type_text used=1/3 shape=chars={len(SECRET)}",
-        "computer_input allowed action=press_key used=2/3 shape=parts=3",  # admitted (and counted) before the library failed
+        "computer_input allowed action=type_text used=1/3",
+        "computer_input allowed action=press_key used=2/3",  # admitted (and counted) before the library failed
         "computer_input refused action=move_mouse reason=rate_limited",
         "computer_input allowed action=move_mouse used=3/4",
         "computer_input refused action=open_application reason=disabled",

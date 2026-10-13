@@ -8,6 +8,7 @@ Nothing here ever touches the real desktop: the Windows backend's `pyautogui`, `
 """
 
 import ast
+import logging
 import os
 import re
 from pathlib import Path
@@ -15,9 +16,11 @@ from pathlib import Path
 import pytest
 
 from app.computer import windows_backend
+from app.computer.authority import MAX_GRANT_SECONDS, AuthorityError, InputStep
 from app.computer.base import AllowedApplication, ComputerBackend, ComputerControlError, ScreenInfo, WindowInfo
 from app.computer.defaults import JOB_COMPUTER_TOOL_NAMES
 from app.computer.gate import GatedComputerBackend, InputGate, default_input_gate
+from app.computer.issuer import GrantIssuer
 from app.computer.windows_backend import WindowsComputerBackend
 from app.config import settings
 from app.demos import file_check, notepad_note, notepad_reader
@@ -33,6 +36,7 @@ from app.demos.notepad_note import (
     run_demo,
 )
 from app.orchestration.base import JobStatus, RetryPolicy, StepStatus
+from grant_support import admit_now
 from app.orchestration.validator import PlanValidationError, validate_plan
 from app.tools.base import ToolResultStatus
 
@@ -97,6 +101,10 @@ class FakeDesktop(ComputerBackend):
         self.typed: list[str] = []
         self.misdirected: list[str] = []
         self.switches = 0
+        self.listings = 0  # how many times the read-only window list was read (the front step's wait)
+        self.window_title = "Untitled - Notepad"  # what a fresh Notepad's window shows
+        self.duplicates = False  # two windows with that exact title and process
+        self.switch_error = None  # an error the (admitted) switch raises: the window vanished, or doubled, after the wait looked
         self.opened = False
         self.document = initial_document
         self.dialog_open = False
@@ -134,11 +142,23 @@ class FakeDesktop(ComputerBackend):
         self.log.append(("open", app.value))
         self.opened = True
 
-    def switch_window(self, title):
+    def list_windows(self):
+        """The read-only window list the front step waits on. A Notepad that appears late shows up only from listing number `appear_after` + 1."""
+        self.listings += 1
+        if not self.opened or self.listings <= self.appear_after:
+            return []
+        windows = [(11, self.window_title, "Notepad.exe")]
+        if self.duplicates:
+            windows.append((12, self.window_title, "notepad.exe"))
+        return windows
+
+    def switch_window(self, title, process):
         self.switches += 1
-        if not self.opened or self.switches <= self.appear_after:
-            raise ComputerControlError(f"No visible window title contains {title!r}.")
-        self.window = WindowInfo("Untitled - Notepad", self.process, False)
+        if self.switch_error is not None:
+            raise self.switch_error
+        if not self.opened or title != self.window_title or process.lower() != "notepad.exe":
+            raise ComputerControlError("No visible window has exactly that title and process.")
+        self.window = WindowInfo(self.window_title, self.process, False)  # (`process` is what comes forward: a test can make it something that is not notepad.exe)
         return self.window
 
     def type_text(self, text):
@@ -195,7 +215,18 @@ class Clock:
 
 
 def gate(limit=10, enabled=True):
-    return InputGate(enabled=lambda: enabled, limit=lambda: limit, clock=Clock())
+    return InputGate(enabled=lambda: enabled, limit=lambda: limit, clock=Clock())  # the demo's own flow is tested with this; its grant comes from `grant_for` below
+
+
+def grant_for(the_gate, setup):
+    """The REAL grant the command line would mint for this run: the demo's own `plan_input_steps`, from the real issuer, for the demo's lifetime. None while input is switched
+    off (then no grant can exist, and the gate itself must refuse the first action)."""
+    try:
+        return GrantIssuer(the_gate).issue(
+            notepad_note.plan_input_steps(build_raw_plan(setup)), ttl_seconds=notepad_note.DEMO_GRANT_SECONDS, purpose="notepad_demo", actor="cli",
+        )
+    except ComputerControlError:
+        return None
 
 
 def setup_for(tmp_path, *, gate_=None, name="jarvis_demo_run"):
@@ -206,7 +237,8 @@ def run(tmp_path, desktop=None, *, limit=10, enabled=True, name="jarvis_demo_run
     desktop = desktop or FakeDesktop()
     the_gate = gate(limit, enabled)
     setup = check_ready(tmp_path / name, NOTE, gate=gate(), list_windows=lambda: [], token="abc123")  # preflight against a healthy gate ...
-    report = run_demo(setup, GatedComputerBackend(desktop, the_gate), sleep=lambda seconds: None, read_document=read_document or desktop.read_document)  # ... the run against the gate under test
+    grant = grant_for(the_gate, setup)  # ... the run's own grant, minted against the gate under test ...
+    report = run_demo(setup, GatedComputerBackend(desktop, the_gate, authority=grant), sleep=lambda seconds: None, read_document=read_document or desktop.read_document, list_windows=desktop.list_windows)  # ... and the run against it
     return setup, desktop, report, the_gate
 
 
@@ -232,7 +264,7 @@ def test_the_whole_task_runs_and_the_file_is_verified_from_the_disk(tmp_path):
     assert desktop.misdirected == []
     assert setup.path.read_text(encoding="utf-8") == NOTE  # the disk, not the keystrokes
     assert sorted(p.name for p in setup.directory.iterdir()) == [setup.path.name]
-    assert the_gate.remaining() == 10 - INPUT_ACTIONS_NEEDED  # six gated actions, no more
+    assert the_gate.budget_remaining() == 10 - INPUT_ACTIONS_NEEDED  # seven gated actions, no more
     assert all(s.status is StepStatus.SUCCEEDED for s in report.job.plan.steps)
     assert "SUCCEEDED" in report.text and "Checked from the disk" in report.text
 
@@ -245,13 +277,13 @@ def test_every_input_step_has_exactly_one_attempt_and_only_reads_are_retried(tmp
             assert step.retry_policy.max_attempts == 1 and step.attempts == 1, step.id
 
 
-def test_a_notepad_that_appears_late_is_waited_for_by_the_read_step_without_repeating_any_input(tmp_path):
+def test_a_notepad_that_appears_late_is_waited_for_by_the_read_only_wait_inside_the_step_without_repeating_any_input(tmp_path):
     desktop = FakeDesktop(appear_after=2)
 
     _, _, report, _ = run(tmp_path, desktop)
 
     steps = steps_of(report)
-    assert report.succeeded and steps["front_notepad"].attempts == 3
+    assert report.succeeded and steps["front_notepad"].attempts == 1 and desktop.listings == 3 and desktop.switches == 1  # three looks, ONE switch, one attempt
     assert desktop.log.count(("open", "notepad")) == 1 and [k for k in desktop.log if k[0] == "key"] == [("key", "ctrl+n"), ("key", "ctrl+s"), ("key", "enter")]
 
 
@@ -330,12 +362,12 @@ def test_the_real_windows_backend_with_input_off_is_refused_by_its_own_gate_and_
 
 
 def test_when_the_budget_runs_out_mid_task_the_refused_action_is_not_repeated_and_nothing_later_runs(tmp_path):
-    setup, desktop, report, _ = run(tmp_path, limit=4)  # open, ctrl+n, the note and ctrl+s fit; the file name does not
+    setup, desktop, report, _ = run(tmp_path, limit=5)  # open, the window switch, ctrl+n, the note and ctrl+s fit; the file name does not
 
     steps = steps_of(report)
     assert not report.succeeded
     assert steps["type_file_name"].status is StepStatus.FAILED and steps["type_file_name"].attempts == 1
-    assert "limited to 4 actions per minute" in steps["type_file_name"].error
+    assert "limited to 5 actions per minute" in steps["type_file_name"].error
     assert steps["confirm_save"].status is StepStatus.SKIPPED and steps["verify_file"].status is StepStatus.SKIPPED
     assert desktop.log[-1] == ("key", "ctrl+s") and not setup.path.exists()
     assert desktop.misdirected == []  # the path was never typed anywhere, least of all into the note
@@ -360,7 +392,7 @@ def test_preflight_counts_recent_actions_against_the_rolling_minute(tmp_path):
     clock = Clock()
     busy = InputGate(enabled=lambda: True, limit=lambda: 10, clock=clock)
     for _ in range(5):
-        busy.admit("press_key")  # five slots already used in the last minute
+        admit_now(busy, "press_key")  # five slots already used in the last minute (each through the real gate, with a real one-entry grant)
     with pytest.raises(DemoRefused, match="only 5 remain"):
         check_ready(tmp_path / "jarvis_demo_x", NOTE, gate=busy, list_windows=lambda: [])
 
@@ -370,7 +402,7 @@ def test_preflight_counts_recent_actions_against_the_rolling_minute(tmp_path):
 
 def test_preflight_refuses_when_the_limit_is_already_reached(tmp_path):
     full = gate(limit=1)
-    full.admit("press_key")
+    admit_now(full, "press_key")
     with pytest.raises(DemoRefused, match="limited to 1 actions per minute"):
         check_ready(tmp_path / "jarvis_demo_x", NOTE, gate=full, list_windows=lambda: [])
 
@@ -647,7 +679,7 @@ def test_when_notepad_never_comes_forward_the_wait_is_bounded_and_nothing_is_typ
     setup, desktop, report, _ = run(tmp_path, FakeDesktop(appear_after=99))
 
     steps = steps_of(report)
-    assert steps["front_notepad"].status is StepStatus.FAILED and steps["front_notepad"].attempts == 5
+    assert steps["front_notepad"].status is StepStatus.FAILED and steps["front_notepad"].attempts == 1 and desktop.listings == 5 and desktop.switches == 0
     assert desktop.log == [("open", "notepad")] and desktop.typed == []
 
 
@@ -787,7 +819,8 @@ def test_the_command_reports_a_refusal_with_exit_code_2_and_touches_nothing(tmp_
 def test_with_run_the_command_does_the_task_through_the_gated_backend(tmp_path, capsys, process_gate, monkeypatch):
     desktop = FakeDesktop()
     monkeypatch.setattr(notepad_note, "read_visible_editor_text", desktop.read_document)
-    monkeypatch.setattr("app.computer.factory.create_default_computer_backend", lambda: GatedComputerBackend(desktop, process_gate_for(desktop)))
+    monkeypatch.setattr(notepad_note, "real_window_list", desktop.list_windows)  # the front step reads the fake desktop's windows
+    monkeypatch.setattr("app.computer.factory.create_authorized_computer_backend", lambda grant: GatedComputerBackend(desktop, process_gate, authority=grant))  # the REAL process gate enforces the REAL grant
     folder = tmp_path / "jarvis_demo_cli"
 
     code = notepad_note.main(["--dir", str(folder), "--run", "--note", "Hello from the test."])
@@ -805,7 +838,8 @@ def process_gate_for(_desktop):
 def test_the_command_exits_1_when_the_task_fails_and_says_what_was_left_behind(tmp_path, capsys, process_gate, monkeypatch):
     desktop = FakeDesktop(dialog=False)
     monkeypatch.setattr(notepad_note, "read_visible_editor_text", desktop.read_document)
-    monkeypatch.setattr("app.computer.factory.create_default_computer_backend", lambda: GatedComputerBackend(desktop, gate()))
+    monkeypatch.setattr(notepad_note, "real_window_list", desktop.list_windows)  # the front step reads the fake desktop's windows
+    monkeypatch.setattr("app.computer.factory.create_authorized_computer_backend", lambda grant: GatedComputerBackend(desktop, process_gate, authority=grant))
 
     code = notepad_note.main(["--dir", str(tmp_path / "jarvis_demo_cli"), "--run"])
 
@@ -883,6 +917,7 @@ def never_runs(monkeypatch, tmp_path):
 
     monkeypatch.setattr(notepad_note, "run_demo", boom)
     monkeypatch.setattr("app.computer.factory.create_default_computer_backend", boom)
+    monkeypatch.setattr("app.computer.factory.create_authorized_computer_backend", boom)
     folder = tmp_path / "jarvis_demo_x"
     monkeypatch.setattr(notepad_note, "check_ready", lambda *a, **k: DemoSetup(folder, folder / "jarvis_demo_20260101T000000Z_abc123.txt", NOTE))
     return folder
@@ -1025,12 +1060,12 @@ def test_no_input_step_follows_the_one_enter_and_it_is_the_only_enter(tmp_path):
     assert len([step for step in plan if step["tool"] == "press_key" and step["arguments"]["key"] == "enter"]) == 1
 
 
-def test_success_needs_both_the_disk_check_and_the_title_check_and_is_still_six_gated_actions(tmp_path):
+def test_success_needs_both_the_disk_check_and_the_title_check_and_is_still_seven_gated_actions(tmp_path):
     setup, desktop, report, the_gate = run(tmp_path)
 
     steps = steps_of(report)
     assert report.succeeded and steps["verify_saved_title"].status is StepStatus.SUCCEEDED and steps["verify_file"].status is StepStatus.SUCCEEDED
-    assert the_gate.remaining() == 10 - INPUT_ACTIONS_NEEDED  # the extra checks are reads
+    assert the_gate.budget_remaining() == 10 - INPUT_ACTIONS_NEEDED  # the extra checks are reads
 
 
 def test_the_residual_race_and_the_refusal_to_answer_a_prompt_are_documented_in_the_module():
@@ -1147,7 +1182,7 @@ def run_recording_sleeps(tmp_path, desktop=None, *, limit=10):
         desktop.log.append(("sleep", seconds))
 
     setup = check_ready(tmp_path / "jarvis_demo_run", NOTE, gate=gate(), list_windows=lambda: [], token="abc123")
-    report = run_demo(setup, GatedComputerBackend(desktop, the_gate), sleep=sleep, read_document=desktop.read_document)
+    report = run_demo(setup, GatedComputerBackend(desktop, the_gate, authority=grant_for(the_gate, setup)), sleep=sleep, read_document=desktop.read_document, list_windows=desktop.list_windows)
     return setup, desktop, report, the_gate, sleeps
 
 
@@ -1197,7 +1232,7 @@ def test_the_pauses_are_single_attempt_argument_free_reads_and_the_plan_still_fi
         if step.tool_name in notepad_note.INPUT_TOOLS:
             assert step.retry_policy.max_attempts == 1, step.id  # still ONE attempt per input action
     assert len(raw) <= notepad_note.MAX_STEPS
-    assert sum(1 for s in steps if s.tool_name in notepad_note.INPUT_TOOLS) == INPUT_ACTIONS_NEEDED == 6  # the pauses added no input action
+    assert sum(1 for s in steps if s.tool_name in notepad_note.INPUT_TOOLS) == INPUT_ACTIONS_NEEDED == 7  # the pauses added no input action
     assert "demo_settle" not in notepad_note.INPUT_TOOLS
 
 
@@ -1218,13 +1253,13 @@ def test_during_a_run_each_pause_happens_between_the_right_two_actions_and_nothi
         ("key", "enter"),
     ]
     assert sleeps == [1.5, 1.5, 1.5, 1.5]  # injected: the happy path has no retry delay, so these are the only waits
-    assert the_gate.remaining() == 10 - INPUT_ACTIONS_NEEDED
+    assert the_gate.budget_remaining() == 10 - INPUT_ACTIONS_NEEDED
 
 
-def test_the_pauses_use_no_gate_slot_so_a_limit_of_exactly_six_still_finishes(tmp_path):
+def test_the_pauses_use_no_gate_slot_so_a_limit_of_exactly_seven_still_finishes(tmp_path):
     _, _, report, the_gate, _ = run_recording_sleeps(tmp_path, limit=INPUT_ACTIONS_NEEDED)
 
-    assert report.succeeded and the_gate.remaining() == 0
+    assert report.succeeded and the_gate.budget_remaining() == 0
 
 
 def test_a_failure_after_the_pauses_never_repeats_an_input_action(tmp_path):
@@ -1613,7 +1648,7 @@ def test_a_wrong_document_stops_the_run_before_ctrl_s_with_nothing_saved_repaire
     assert ("key", "ctrl+s") not in desktop.log and ("key", "enter") not in desktop.log and desktop.log[-1] == ("type", NOTE)
     assert not desktop.dialog_open and list(setup.directory.iterdir()) == []
     assert all(steps[i].status is StepStatus.SKIPPED for i in ("open_save_as", "type_file_name", "confirm_save", "verify_file"))
-    assert the_gate.remaining() == 10 - 3  # open, Ctrl+N and the note: the check used no slot and nothing after it ran
+    assert the_gate.budget_remaining() == 10 - 4  # open, the window switch, Ctrl+N and the note: the check used no slot and nothing after it ran
     assert "NOT confirmed in the Notepad document" in report.text and "Save As was never opened" in report.text
     assert "the Save As dialog may still be open" not in report.text and "Enter was pressed" not in report.text
 
@@ -1710,3 +1745,529 @@ def test_the_real_windows_api_class_is_built_with_exactly_the_signature_of_the_p
 def test_the_windows_message_constants_and_flags_are_the_documented_values():
     assert notepad_reader.WM_GETTEXT == 0x000D and notepad_reader.WM_GETTEXTLENGTH == 0x000E and notepad_reader.SMTO_ABORTIFHUNG == 0x0002
     assert notepad_reader.READ_TIMEOUT_MS == 500 and notepad_reader.EDITOR_CLASS == "RichEditD2DPT" and notepad_reader.NOTEPAD_PROCESS == "notepad.exe"
+
+
+# ====================== the demo carries its OWN narrowly scoped grant: the switch alone is not enough, and any deviation ends the run ====================
+
+
+def grant_gate(limit=10):
+    """A gate for the tests that exercise the real grant enforcement (the same kind of gate as `gate()` above: every gate requires a grant)."""
+    return InputGate(enabled=lambda: True, limit=lambda: limit, clock=Clock())
+
+
+def run_under_grant(tmp_path, desktop=None, *, steps=None, the_gate=None, name="jarvis_demo_run"):
+    desktop = desktop or FakeDesktop()
+    the_gate = the_gate or grant_gate()
+    setup = check_ready(tmp_path / name, NOTE, gate=gate(), list_windows=lambda: [], token="abc123")  # the preflight, against a healthy budget
+    grant = GrantIssuer(the_gate).issue(
+        steps if steps is not None else notepad_note.plan_input_steps(build_raw_plan(setup)),
+        ttl_seconds=notepad_note.DEMO_GRANT_SECONDS, purpose="notepad_demo", actor="cli",
+    )
+    report = run_demo(setup, GatedComputerBackend(desktop, the_gate, authority=grant), sleep=lambda seconds: None, read_document=desktop.read_document, list_windows=desktop.list_windows)
+    return setup, desktop, report, the_gate, grant
+
+
+def test_the_grant_is_derived_from_the_same_plan_the_job_runs_exactly_seven_ordered_actions(tmp_path):
+    setup = setup_for(tmp_path)
+
+    steps = notepad_note.plan_input_steps(build_raw_plan(setup))
+
+    assert steps == [
+        InputStep("open_application", (AllowedApplication.NOTEPAD,)),
+        InputStep("switch_window", (notepad_note.DEFAULT_NOTEPAD_TITLE, "notepad.exe")),  # bringing Notepad forward: the exact title and the exact process
+        InputStep("press_key", (("ctrl", "n"),)),
+        InputStep("type_text", (NOTE,)),
+        InputStep("press_key", (("ctrl", "s"),)),
+        InputStep("type_text", (str(setup.path),)),
+        InputStep("press_key", (("enter",),)),
+    ]
+    assert len(steps) == INPUT_ACTIONS_NEEDED == 7
+
+
+def test_the_demo_succeeds_under_its_own_grant_and_the_grant_is_spent_entry_by_entry(tmp_path):
+    setup, desktop, report, the_gate, grant = run_under_grant(tmp_path)
+
+    assert report.succeeded and setup.path.read_text(encoding="utf-8") == NOTE
+    state = the_gate._grants[grant.id]
+    assert state.actions == ("open_application", "switch_window", "press_key", "type_text", "press_key", "type_text", "press_key") and state.index == 7
+    assert state.closed == "exhausted" and the_gate.unspent(grant) == 0  # seven entries, seven spent: nothing is left to reuse
+    assert len(the_gate._events) == 7  # and exactly seven rate-limit slots
+
+
+def test_the_demo_cannot_run_on_the_switch_alone_the_first_input_is_refused_without_a_grant(tmp_path):
+    the_gate = grant_gate()
+    desktop = FakeDesktop()
+    setup = check_ready(tmp_path / "jarvis_demo_run", NOTE, gate=gate(), list_windows=lambda: [], token="abc123")
+
+    report = run_demo(setup, GatedComputerBackend(desktop, the_gate), sleep=lambda seconds: None, read_document=desktop.read_document, list_windows=desktop.list_windows)
+
+    steps = steps_of(report)
+    assert not report.succeeded and steps["open_notepad"].status is StepStatus.FAILED and "needs an approved authorization" in steps["open_notepad"].error
+    assert desktop.log == [] and len(the_gate._events) == 0 and not setup.path.exists()
+
+
+def test_a_different_note_than_the_one_approved_stops_the_run_at_that_keystroke_and_ends_the_grant(tmp_path):
+    setup = setup_for(tmp_path)
+    approved = notepad_note.plan_input_steps(build_raw_plan(setup))
+    approved[3] = InputStep("type_text", ("A different note than the run will type.",))
+
+    setup, desktop, report, the_gate, grant = run_under_grant(tmp_path, steps=approved)
+
+    steps = steps_of(report)
+    assert not report.succeeded and steps["type_note"].status is StepStatus.FAILED and "needs an approved authorization" in steps["type_note"].error
+    assert desktop.log == [("open", "notepad"), ("key", "ctrl+n")] and desktop.document == ""  # nothing was typed
+    assert the_gate._grants[grant.id].closed == "mismatch" and the_gate.unspent(grant) == 0
+    assert steps["open_save_as"].status is StepStatus.SKIPPED and not setup.path.exists() and len(the_gate._events) == 3  # open, the window switch, ctrl+n
+
+
+def test_the_right_actions_in_a_different_order_are_refused_from_the_very_first_input(tmp_path):
+    setup = setup_for(tmp_path)
+    approved = notepad_note.plan_input_steps(build_raw_plan(setup))
+    approved[0], approved[1] = approved[1], approved[0]  # the window switch approved before the launch
+
+    _, desktop, report, the_gate, grant = run_under_grant(tmp_path, steps=approved)
+
+    assert not report.succeeded and desktop.log == [] and the_gate._grants[grant.id].closed == "mismatch" and len(the_gate._events) == 0
+
+
+def test_a_grant_for_a_different_file_name_lets_nothing_be_saved_and_the_enter_is_never_sent(tmp_path):
+    setup = setup_for(tmp_path)
+    approved = notepad_note.plan_input_steps(build_raw_plan(setup))
+    approved[5] = InputStep("type_text", (str(setup.directory / "jarvis_demo_20260101T000000Z_ffffff.txt"),))
+
+    setup, desktop, report, the_gate, grant = run_under_grant(tmp_path, steps=approved)
+
+    steps = steps_of(report)
+    assert steps["type_file_name"].status is StepStatus.FAILED and steps["confirm_save"].status is StepStatus.SKIPPED
+    assert ("key", "enter") not in desktop.log and not setup.path.exists() and the_gate._grants[grant.id].closed == "mismatch"
+    assert "may still be open with the note unsaved" in report.text  # and the report tells the owner the dialog was left open
+
+
+def test_a_grant_with_one_entry_too_few_cannot_press_the_enter_that_saves(tmp_path):
+    setup = setup_for(tmp_path)
+    approved = notepad_note.plan_input_steps(build_raw_plan(setup))[:6]  # everything except the final Enter
+
+    setup, desktop, report, the_gate, grant = run_under_grant(tmp_path, steps=approved)
+
+    assert ("key", "enter") not in desktop.log and not setup.path.exists() and steps_of(report)["confirm_save"].status is StepStatus.FAILED
+    assert the_gate._grants[grant.id].closed == "exhausted"
+
+
+def test_a_finished_grant_cannot_be_replayed_to_run_the_demo_again(tmp_path):
+    setup, desktop, report, the_gate, grant = run_under_grant(tmp_path)
+    assert report.succeeded
+    second = FakeDesktop()
+    again = check_ready(tmp_path / "jarvis_demo_again", NOTE, gate=gate(), list_windows=lambda: [], token="def456")
+
+    replay = run_demo(again, GatedComputerBackend(second, the_gate, authority=grant), sleep=lambda seconds: None, read_document=second.read_document, list_windows=second.list_windows)
+
+    assert not replay.succeeded and second.log == [] and not again.path.exists()
+
+
+def test_the_plan_cannot_describe_an_input_action_it_does_not_know_so_it_cannot_be_authorized(tmp_path):
+    plan = build_raw_plan(setup_for(tmp_path)) + [{"id": "extra", "tool": "click_mouse", "arguments": {"x": 1, "y": 2}, "depends_on": []}]
+
+    with pytest.raises(AuthorityError):
+        notepad_note.plan_input_steps(plan)
+
+
+def test_the_demos_grant_lifetime_is_the_approved_120_seconds_within_the_library_cap():
+    assert notepad_note.DEMO_GRANT_SECONDS == 120.0 and notepad_note.DEMO_GRANT_SECONDS <= MAX_GRANT_SECONDS == 300.0
+
+
+@pytest.fixture
+def cli_gate(process_gate, monkeypatch):
+    """The REAL process-wide gate (which requires authority) with its grants cleared; the backend the CLI builds is the fake desktop wrapped to enforce that gate."""
+    monkeypatch.setattr(process_gate, "_grants", {})
+    return process_gate
+
+
+def patch_cli_backend(monkeypatch, desktop, gate_, minted):
+    def build(grant):
+        minted.append(grant)
+        return GatedComputerBackend(desktop, gate_, authority=grant)
+
+    monkeypatch.setattr("app.computer.factory.create_authorized_computer_backend", build)
+    monkeypatch.setattr(notepad_note, "read_visible_editor_text", desktop.read_document)
+    monkeypatch.setattr(notepad_note, "real_window_list", desktop.list_windows)  # the front step reads the fake desktop's windows
+
+
+def test_the_command_line_mints_one_grant_for_the_run_and_it_is_spent_and_never_logs_a_value(tmp_path, cli_gate, monkeypatch, caplog, capsys):
+    caplog.set_level(logging.DEBUG)
+    desktop, minted = FakeDesktop(), []
+    patch_cli_backend(monkeypatch, desktop, cli_gate, minted)
+    folder = tmp_path / "jarvis_demo_cli"
+
+    code = notepad_note.main(["--dir", str(folder), "--run"])
+
+    assert code == 0 and "SUCCEEDED" in capsys.readouterr().out and len(minted) == 1
+    lines = [r.getMessage() for r in caplog.records if r.name == "jarvis.computer.input"]
+    short = minted[0].short_id
+    assert lines[0] == f"computer_input grant issued id={short} entries=7 ttl=120 purpose=notepad_demo actor=cli"
+    assert [line for line in lines if "allowed" in line] == [
+        f"computer_input allowed action={a} grant={short} entry={n}/7 used={n}/10"
+        for n, a in enumerate(["open_application", "switch_window", "press_key", "type_text", "press_key", "type_text", "press_key"], start=1)
+    ]
+    assert f"computer_input grant spent id={short}" in lines
+    text = "\n".join(lines)
+    (written,) = list(folder.iterdir())
+    for value in (NOTE, str(folder), written.name, "ctrl", "enter", minted[0].id):
+        assert value not in text, value
+    assert cli_gate.unspent(minted[0]) == 0
+
+
+def test_the_command_line_with_input_switched_off_mints_nothing_and_starts_nothing(tmp_path, cli_gate, monkeypatch, capsys):
+    monkeypatch.setattr(settings, "computer_input_enabled", False)
+    folder = tmp_path / "jarvis_demo_cli"
+
+    code = notepad_note.main(["--dir", str(folder), "--run"])
+
+    assert code == 2 and "Not started" in capsys.readouterr().out and cli_gate._grants == {} and not folder.exists()
+
+
+def test_a_dry_run_mints_no_grant(tmp_path, cli_gate, capsys):
+    code = notepad_note.main(["--dir", str(tmp_path / "jarvis_demo_cli")])
+
+    assert code == 0 and cli_gate._grants == {} and "Dry run only" in capsys.readouterr().out
+
+
+def test_the_grant_is_revoked_when_the_run_is_refused_and_when_it_crashes(tmp_path, cli_gate, monkeypatch, capsys):
+    minted = []
+    patch_cli_backend(monkeypatch, FakeDesktop(), cli_gate, minted)
+
+    def refuse(*args, **kwargs):
+        raise DemoRefused("refused at the last moment")
+
+    monkeypatch.setattr(notepad_note, "run_demo", refuse)
+    assert notepad_note.main(["--dir", str(tmp_path / "jarvis_demo_a"), "--run"]) == 2 and cli_gate.unspent(minted[0]) == 0
+
+    def crash(*args, **kwargs):
+        raise RuntimeError("the run crashed")
+
+    monkeypatch.setattr(notepad_note, "run_demo", crash)
+    with pytest.raises(RuntimeError):
+        notepad_note.main(["--dir", str(tmp_path / "jarvis_demo_b"), "--run"])
+    assert len(minted) == 2 and cli_gate.unspent(minted[1]) == 0  # even a crash leaves no usable grant behind
+    with pytest.raises(KeyboardInterrupt):  # and so does the owner pressing Ctrl+C
+        monkeypatch.setattr(notepad_note, "run_demo", lambda *a, **k: (_ for _ in ()).throw(KeyboardInterrupt()))
+        notepad_note.main(["--dir", str(tmp_path / "jarvis_demo_c"), "--run"])
+    assert cli_gate.unspent(minted[2]) == 0
+
+
+def test_the_command_line_asks_for_exactly_the_demos_lifetime_and_the_plans_own_steps(tmp_path, cli_gate, monkeypatch):
+    from app.computer import issuer as issuer_module
+
+    seen = []
+    real_issue = issuer_module.GrantIssuer.issue
+
+    def spy(self, steps, **kwargs):
+        seen.append((list(steps), kwargs))
+        return real_issue(self, steps, **kwargs)
+
+    monkeypatch.setattr(issuer_module.GrantIssuer, "issue", spy)
+    patch_cli_backend(monkeypatch, FakeDesktop(), cli_gate, [])
+    folder = tmp_path / "jarvis_demo_cli"
+
+    notepad_note.main(["--dir", str(folder), "--run"])
+
+    (steps, kwargs), = seen
+    assert kwargs == {"ttl_seconds": 120.0, "purpose": "notepad_demo", "actor": "cli"}
+    assert [s.action for s in steps] == ["open_application", "switch_window", "press_key", "type_text", "press_key", "type_text", "press_key"]
+    assert steps[1] == InputStep("switch_window", (notepad_note.DEFAULT_NOTEPAD_TITLE, "notepad.exe"))
+    assert steps[3] == InputStep("type_text", (notepad_note.DEFAULT_NOTE,))
+
+
+# ====================================== front_notepad: a READ-only wait, then ONE authorized switch (item 6) ===========================================
+# The step waits for the window by LOOKING (a read-only listing: no focus, no input, no gated call) and only then makes the single gated `switch_window`. A wait that finds
+# no window, or several, never calls the backend, so the grant's entry is not spent. Once the backend IS called, its entry is spent whatever it finds, and it is never retried.
+
+TITLE = notepad_note.DEFAULT_NOTEPAD_TITLE
+
+
+class RecordingFront(ComputerBackend):
+    """Only `switch_window` is real here: every other method would be a bug in the tool under test."""
+
+    def __init__(self, error=None):
+        self.error, self.calls = error, []
+
+    def get_active_window(self): raise AssertionError("the front tool reads nothing from the backend")  # noqa: E704
+    def get_screen_info(self): raise AssertionError("not used")  # noqa: E704
+    def open_application(self, app): raise AssertionError("not used")  # noqa: E704
+    def open_url(self, url): raise AssertionError("not used")  # noqa: E704
+    def type_text(self, text): raise AssertionError("not used")  # noqa: E704
+    def press_key(self, key): raise AssertionError("not used")  # noqa: E704
+    def move_mouse(self, x, y): raise AssertionError("not used")  # noqa: E704
+    def click_mouse(self, x, y, button): raise AssertionError("not used")  # noqa: E704
+    def double_click(self, x, y, button): raise AssertionError("not used")  # noqa: E704
+    def scroll(self, amount): raise AssertionError("not used")  # noqa: E704
+
+    def switch_window(self, title, process):
+        self.calls.append((title, process))
+        if self.error is not None:
+            raise self.error
+        return WindowInfo(title, process, False)
+
+
+def front_tool(backend, listings, *, title=TITLE):
+    """(tool, the list of sleeps, the list of listings made). `listings` is a list of window lists, one per look; the last one repeats."""
+    sleeps, looked = [], []
+
+    def list_windows():
+        looked.append(1)
+        return listings[min(len(looked), len(listings)) - 1]
+
+    return notepad_note.DemoFrontNotepadTool(backend, title, "notepad.exe", list_windows, sleep=sleeps.append), sleeps, looked
+
+
+NP_WINDOW = (11, TITLE, "Notepad.exe")
+
+
+def test_the_wait_is_five_looks_two_seconds_apart_and_calls_the_backend_exactly_once_for_one_match():
+    backend = RecordingFront()
+    tool, sleeps, looked = front_tool(backend, [[], [], [NP_WINDOW]])
+
+    result = tool.execute(title=TITLE, process="notepad.exe")
+
+    assert result.status is ToolResultStatus.SUCCESS and len(looked) == 3 and sleeps == [2.0, 2.0]  # the third look found it
+    assert backend.calls == [(TITLE, "notepad.exe")]
+    assert notepad_note.FRONT_CHECKS == 5 and notepad_note.FRONT_CHECK_DELAY_SECONDS == 2.0  # at most four sleeps: eight seconds
+
+
+def test_no_window_after_five_looks_fails_without_calling_the_backend_and_names_what_is_visible():
+    backend = RecordingFront()
+    other = [(21, "Untitled - Notepad (2)", "Notepad.exe"), (22, "Secret plans - Browser", "chrome.exe")]
+    tool, sleeps, looked = front_tool(backend, [other])
+
+    result = tool.execute(title=TITLE, process="notepad.exe")
+
+    assert result.status is ToolResultStatus.ERROR and backend.calls == [] and len(looked) == 5 and sleeps == [2.0] * 4
+    assert "no entry of the grant was used" in result.message and repr(TITLE) in result.message and "notepad.exe" in result.message
+    assert "Untitled - Notepad (2)" in result.message  # the observed notepad.exe window titles ...
+    assert "Secret plans" not in result.message  # ... and ONLY those: another program's window title is not the report's business
+    assert "--notepad-title" in result.message
+
+
+def test_several_matching_windows_fail_at_once_without_waiting_and_without_calling_the_backend():
+    backend = RecordingFront()
+    tool, sleeps, looked = front_tool(backend, [[NP_WINDOW, (12, TITLE, "notepad.exe")]])
+
+    result = tool.execute(title=TITLE, process="notepad.exe")
+
+    assert result.status is ToolResultStatus.ERROR and backend.calls == [] and len(looked) == 1 and sleeps == []
+    assert "2 windows have exactly that title and process" in result.message and "none was chosen" in result.message
+
+
+def test_the_candidates_are_bounded_and_scrubbed():
+    backend = RecordingFront()
+    crowd = [(30 + i, f"Document {i}\x07 - Notepad", "Notepad.exe") for i in range(9)]
+    tool, _, _ = front_tool(backend, [crowd])
+
+    message = tool.execute(title=TITLE, process="notepad.exe").message
+
+    assert message.count("Document ") == notepad_note.MAX_CANDIDATES == 5 and "\x07" not in message
+
+
+def test_a_listing_that_fails_means_cannot_tell_and_nothing_is_switched():
+    backend = RecordingFront()
+    tool = notepad_note.DemoFrontNotepadTool(backend, TITLE, "notepad.exe", lambda: (_ for _ in ()).throw(RuntimeError("boom")), sleep=lambda s: None)
+
+    result = tool.execute(title=TITLE, process="notepad.exe")
+
+    assert result.status is ToolResultStatus.ERROR and backend.calls == [] and "could not be listed" in result.message and "boom" not in result.message
+
+
+def test_the_backend_is_called_at_most_once_so_a_second_execute_never_reaches_it():
+    backend = RecordingFront()
+    tool, _, looked = front_tool(backend, [[NP_WINDOW]])
+    assert tool.execute(title=TITLE, process="notepad.exe").status is ToolResultStatus.SUCCESS
+
+    again = tool.execute(title=TITLE, process="notepad.exe")
+
+    assert again.status is ToolResultStatus.ERROR and backend.calls == [(TITLE, "notepad.exe")] and len(looked) == 1
+
+
+def test_an_admitted_switch_that_then_fails_is_not_retried_by_the_tool():
+    backend = RecordingFront(error=ComputerControlError("No visible window has exactly that title and process."))
+    tool, _, _ = front_tool(backend, [[NP_WINDOW]])
+
+    result = tool.execute(title=TITLE, process="notepad.exe")
+    again = tool.execute(title=TITLE, process="notepad.exe")
+
+    assert result.status is ToolResultStatus.ERROR and "The authorized switch failed" in result.message
+    assert again.status is ToolResultStatus.ERROR and backend.calls == [(TITLE, "notepad.exe")]
+
+
+@pytest.mark.parametrize("title, process", [("Untitled - Notepad (2)", "notepad.exe"), (TITLE, "code.exe"), ("Notepad", "notepad.exe"), (TITLE, "notepad"), (" " + TITLE, "notepad.exe")])
+def test_the_tool_only_acts_for_its_own_bound_title_and_process_and_refuses_before_looking_or_calling_anything(title, process):
+    backend = RecordingFront()
+    tool, sleeps, looked = front_tool(backend, [[NP_WINDOW]])
+
+    result = tool.execute(title=title, process=process)
+
+    assert result.status is ToolResultStatus.ERROR and backend.calls == [] and looked == [] and sleeps == []
+
+
+def test_the_tool_cannot_be_built_for_a_title_or_process_that_could_not_be_authorized():
+    for title, process in ((" padded", "notepad.exe"), ("", "notepad.exe"), (TITLE, "notepad"), (TITLE, "..\\notepad.exe")):
+        with pytest.raises(ComputerControlError):
+            notepad_note.DemoFrontNotepadTool(RecordingFront(), title, process, lambda: [], sleep=lambda s: None)
+
+
+# ---- through the real plan, the real Job engine and a real gate with the run's own grant ----
+
+
+def test_a_notepad_that_never_appears_fails_the_step_with_the_switch_entry_unspent_and_nothing_typed(tmp_path):
+    desktop = FakeDesktop(appear_after=99)
+
+    setup, desktop, report, the_gate, grant = run_under_grant(tmp_path, desktop)
+
+    steps = steps_of(report)
+    assert not report.succeeded and steps["front_notepad"].status is StepStatus.FAILED and steps["front_notepad"].attempts == 1
+    assert desktop.listings == 5 and desktop.switches == 0  # five read-only looks, and the gated action was never invoked
+    assert the_gate._grants[grant.id].index == 1 and the_gate.unspent(grant) == 6 and len(the_gate._events) == 1  # only open_application was spent
+    assert desktop.log == [("open", "notepad")] and desktop.typed == [] and not setup.path.exists()
+    assert all(s.status is StepStatus.SKIPPED for sid, s in steps.items() if sid not in ("open_notepad", "front_notepad"))
+    assert repr(TITLE) in steps["front_notepad"].error and "Visible notepad.exe windows: none" in steps["front_notepad"].error
+
+
+def test_two_notepad_windows_with_the_exact_title_fail_the_step_before_the_backend_and_spend_nothing_more(tmp_path):
+    desktop = FakeDesktop()
+    desktop.duplicates = True
+
+    setup, desktop, report, the_gate, grant = run_under_grant(tmp_path, desktop)
+
+    steps = steps_of(report)
+    assert steps["front_notepad"].status is StepStatus.FAILED and desktop.switches == 0 and desktop.listings == 1
+    assert the_gate._grants[grant.id].index == 1 and desktop.typed == []
+
+
+@pytest.mark.parametrize("message", ["No visible window has exactly that title and process.", "More than one visible window has exactly that title and process; none was chosen."])
+def test_once_the_backend_is_called_its_entry_is_spent_whatever_the_lookup_finds_and_nothing_retries_it(tmp_path, message):
+    desktop = FakeDesktop()
+    desktop.switch_error = ComputerControlError(message)  # the window vanished (or doubled) between the wait and the backend's own lookup
+
+    setup, desktop, report, the_gate, grant = run_under_grant(tmp_path, desktop)
+
+    steps = steps_of(report)
+    assert steps["front_notepad"].status is StepStatus.FAILED and steps["front_notepad"].attempts == 1 and "The authorized switch failed" in steps["front_notepad"].error
+    assert desktop.switches == 1  # one call, never repeated
+    # the FakeDesktop sits BEHIND the gate: admission already happened, so the switch entry (and its slot) are spent even though the lookup failed
+    assert the_gate._grants[grant.id].index == 2 and the_gate.unspent(grant) == 5 and len(the_gate._events) == 2
+    assert desktop.typed == [] and all(s.status is StepStatus.SKIPPED for sid, s in steps.items() if sid not in ("open_notepad", "front_notepad"))
+    with pytest.raises(ComputerControlError):
+        GatedComputerBackend(desktop, the_gate, authority=grant).switch_window(TITLE, "notepad.exe")  # the same entry cannot be used again: the next one is ctrl+n
+    assert desktop.switches == 1
+
+
+def test_the_late_notepad_is_waited_for_inside_the_one_step_and_the_plan_keeps_its_twenty_steps(tmp_path):
+    desktop = FakeDesktop(appear_after=3)
+
+    setup, desktop, report, the_gate, grant = run_under_grant(tmp_path, desktop)
+
+    assert report.succeeded and len(report.job.plan.steps) == notepad_note.MAX_STEPS == 20
+    assert desktop.listings == 4 and desktop.switches == 1 and steps_of(report)["front_notepad"].attempts == 1
+    assert the_gate.unspent(grant) == 0
+
+
+def test_a_notepad_that_shows_another_title_fails_closed_and_the_option_binds_exactly_the_title_it_is_given(tmp_path):
+    shown = FakeDesktop()
+    shown.window_title = "notes.txt - Notepad"
+
+    _, _, report, _, _ = run_under_grant(tmp_path, shown)  # the default title is bound, but this Notepad shows another one
+
+    failure = steps_of(report)["front_notepad"].error
+    assert not report.succeeded and repr(TITLE) in failure and "'notes.txt - Notepad'" in failure and shown.switches == 0 and shown.typed == []
+
+    setup = check_ready(tmp_path / "jarvis_demo_title", NOTE, gate=gate(), list_windows=lambda: [], token="abc123", notepad_title="notes.txt - Notepad")
+    desktop = FakeDesktop()
+    desktop.window_title = "notes.txt - Notepad"
+    the_gate = grant_gate()
+    grant = GrantIssuer(the_gate).issue(notepad_note.plan_input_steps(build_raw_plan(setup)), ttl_seconds=notepad_note.DEMO_GRANT_SECONDS, purpose="notepad_demo", actor="cli")
+    report = run_demo(setup, GatedComputerBackend(desktop, the_gate, authority=grant), sleep=lambda seconds: None, read_document=desktop.read_document, list_windows=desktop.list_windows)
+    assert report.succeeded and the_gate.unspent(grant) == 0
+
+
+@pytest.mark.parametrize("bad", ["", "   ", " Untitled - Notepad", "Untitled - Notepad ", "Untitled  - Notepad", "x" * 101, "bell\x07 - Notepad"])
+def test_a_notepad_title_that_could_not_be_requested_exactly_is_refused_before_anything_starts(tmp_path, bad):
+    with pytest.raises(DemoRefused, match="Notepad window title"):
+        check_ready(tmp_path / "jarvis_demo_x", NOTE, gate=gate(), list_windows=lambda: [], notepad_title=bad)
+    assert not (tmp_path / "jarvis_demo_x").exists()
+
+
+def test_the_command_line_shows_binds_and_validates_the_notepad_title_and_a_dry_run_touches_nothing(tmp_path, capsys, process_gate):
+    folder = tmp_path / "jarvis_demo_title"
+
+    assert notepad_note.main(["--dir", str(folder), "--notepad-title", "notes.txt - Notepad"]) == 0
+    shown = capsys.readouterr().out
+    assert "exactly 'notes.txt - Notepad' of notepad.exe" in shown and "Dry run only" in shown and not folder.exists()
+    assert notepad_note.main(["--dir", str(folder)]) == 0 and repr(TITLE) in capsys.readouterr().out  # the default
+    assert notepad_note.main(["--dir", str(folder), "--notepad-title", " padded"]) == 2 and "Not started" in capsys.readouterr().out
+
+
+def test_the_plan_is_twenty_steps_and_exactly_seven_of_them_are_gated_in_the_order_of_the_grant(tmp_path):
+    setup = setup_for(tmp_path)
+    raw = build_raw_plan(setup)
+
+    assert len(raw) == notepad_note.MAX_STEPS == 20
+    gated = [(i + 1, step["id"], step["tool"]) for i, step in enumerate(raw) if step["tool"] in notepad_note.INPUT_TOOLS]
+    assert gated == [
+        (1, "open_notepad", "open_application"), (2, "front_notepad", "demo_front_notepad"), (4, "new_document", "press_key"), (7, "type_note", "type_text"),
+        (9, "open_save_as", "press_key"), (13, "type_file_name", "type_text"), (18, "confirm_save", "press_key"),
+    ]
+    assert next(step for step in raw if step["id"] == "front_notepad")["arguments"] == {"title": TITLE, "process": "notepad.exe"}
+    assert notepad_note.plan_input_steps(raw) == [
+        InputStep("open_application", (AllowedApplication.NOTEPAD,)),
+        InputStep("switch_window", (TITLE, "notepad.exe")),
+        InputStep("press_key", (("ctrl", "n"),)),
+        InputStep("type_text", (NOTE,)),
+        InputStep("press_key", (("ctrl", "s"),)),
+        InputStep("type_text", (str(setup.path),)),
+        InputStep("press_key", (("enter",),)),
+    ]
+    for step in raw:  # every gated step runs once; every other step is a read, a pause or a disk check and reaches no gated method
+        if step["tool"] in notepad_note.INPUT_TOOLS:
+            assert step["max_attempts"] == 1, step["id"]
+
+
+def test_the_grant_covers_the_switch_for_exactly_the_bound_title_and_process_and_a_different_pair_ends_it(tmp_path):
+    setup, desktop, _, the_gate, grant = run_under_grant(tmp_path)  # a complete run: every entry spent in order, E2 included
+    assert the_gate._grants[grant.id].actions[1] == "switch_window"
+
+    for title, process in ((TITLE + " - extra", "notepad.exe"), ("untitled - notepad", "notepad.exe"), (TITLE, "notepad++.exe")):
+        other_gate = grant_gate()
+        fresh = GrantIssuer(other_gate).issue(notepad_note.plan_input_steps(build_raw_plan(setup)), ttl_seconds=60, purpose="notepad_demo", actor="cli")
+        backend = GatedComputerBackend(FakeDesktop(), other_gate, authority=fresh)
+        backend.open_application(AllowedApplication.NOTEPAD)  # E1
+        with pytest.raises(ComputerControlError):
+            backend.switch_window(title, process)  # E2 is bound to the exact pair: anything else is refused ...
+        assert other_gate.unspent(fresh) == 0  # ... and ends the grant
+
+
+def test_the_front_tool_is_private_to_the_demo_and_the_shared_switch_window_tool_is_not_used_here(tmp_path):
+    registry = build_registry(FakeDesktop(), setup_for(tmp_path))
+
+    assert registry.has("demo_front_notepad") and not registry.has("switch_window") and not registry.has("open_url")
+    tool = registry.get("demo_front_notepad")
+    assert tool.automatable is False and {p.name: p.required for p in tool.parameters} == {"title": True, "process": True}
+    users = sorted(p.relative_to(APP_DIR).as_posix() for p in APP_DIR.rglob("*.py") if "demo_front_notepad" in p.read_text(encoding="utf-8") or "DemoFrontNotepadTool" in p.read_text(encoding="utf-8"))
+    assert users == ["demos/notepad_note.py"]  # no shared registry, no Job allowlist, no main.py
+
+
+def test_the_front_tool_has_no_matching_or_focus_logic_of_its_own_and_one_gated_call_site():
+    source = (APP_DIR / "demos" / "notepad_note.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    cls = next(n for n in ast.walk(tree) if isinstance(n, ast.ClassDef) and n.name == "DemoFrontNotepadTool")
+    text = ast.get_source_segment(source, cls)
+
+    assert "exact_window_matches(" in text  # the backend's own matcher, from app/computer/base.py
+    for forbidden in ("_bring_to_foreground", "webbrowser", "win32gui", "_user32", "SetForegroundWindow", "pyautogui", "subprocess", ".lower() ==", "in w[1]", "in window["):
+        assert forbidden not in text, forbidden
+    switches = [n for n in ast.walk(cls) if isinstance(n, ast.Call) and ast.unparse(n.func) == "self._backend.switch_window"]
+    assert len(switches) == 1  # the one and only gated call
+    assert "SwitchWindowTool" not in source.split("class DemoFrontNotepadTool")[0].split("from app.computer.tools import")[1].split("\n")[0]
+
+
+def test_the_waits_worst_case_fits_far_inside_the_grants_lifetime():
+    wait = (notepad_note.FRONT_CHECKS - 1) * notepad_note.FRONT_CHECK_DELAY_SECONDS
+
+    assert wait == 8.0 and wait + 4 * notepad_note.SETTLE_SECONDS + 5 * notepad_note.FILE_CHECK_DELAY_SECONDS + 60 < notepad_note.DEMO_GRANT_SECONDS  # generous: a real run takes ~30 s

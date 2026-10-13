@@ -302,7 +302,7 @@ def test_plan_validation_is_the_gate_the_input_tools_and_screen_capture_are_not_
             validate_plan([{"id": "s1", "tool": tool, "arguments": {}}], world.registry, max_steps=20, default_retry=retry)
     for tool, arguments in (("observe_page", {"url": START}), ("open_url", {"url": START}), ("scroll", {"amount": -300}),
                             ("get_active_window", {}), ("verify_observation", {"check": "window_process_is", "value": "x.exe"}),
-                            ("switch_window", {"title": "Example"}), ("observe_screen", {})):
+                            ("switch_window", {"title": "Example", "process": "example.exe"}), ("observe_screen", {})):
         assert validate_plan([{"id": "s1", "tool": tool, "arguments": arguments}], world.registry, max_steps=20, default_retry=retry)
 
 
