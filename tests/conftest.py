@@ -12,9 +12,11 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
+import db_isolation  # noqa: E402
 import fake_input_library  # noqa: E402
 
 fake_input_library.install()
+db_isolation.install()  # before any test module imports the application's main module, whose module-level core opens every default database (see tests/db_isolation.py)
 
 import pytest  # noqa: E402
 
@@ -24,6 +26,18 @@ def pytest_configure(config):
     report = fake_input_library.isolation_report()
     if not report["all_ok"]:
         raise pytest.UsageError(f"the OS-input isolation is NOT in place, so no test will run: {report}")
+    db_report = db_isolation.isolation_report()
+    if not db_report["all_ok"]:
+        raise pytest.UsageError(f"the database isolation is NOT in place, so no test will run (the real jarvis_*.db files would be opened): {db_report}")
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """A real database file that changed during the run means something got past the redirect: say so loudly and fail the session. Then remove the session's temporary databases."""
+    changed = db_isolation.session_changes()
+    if changed:
+        print(f"\nDATABASE ISOLATION FAILURE: real database file(s) changed during the test run: {changed}", file=sys.stderr)
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
+    db_isolation.cleanup()
 
 
 @pytest.fixture(autouse=True)

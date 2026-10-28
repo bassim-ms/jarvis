@@ -56,6 +56,9 @@ def test_disabling_identity_context_removes_it_from_the_prompt(monkeypatch):
     already hold real stored facts from prior use - this test must not
     assume the rest of the prompt is empty, only that the identity
     block specifically is gone."""
+    # The final assertion needs SOMETHING ahead of the user's message (otherwise the prompt is just the bare message). That used to come from whatever facts the developer's REAL
+    # jarvis_memory.db happened to hold; the suite now runs against an empty temporary database (tests/db_isolation.py), so the test supplies its own fact instead.
+    monkeypatch.setattr(main.core.memory, "get_facts", lambda: {"isolation_test_fact": "present"})
     provider_with = _RecordingProvider()
     monkeypatch.setattr(main.core, "provider", provider_with)
     client.post("/chat", json={"message": "hello there"})
