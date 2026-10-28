@@ -64,11 +64,16 @@ def test_handle_chat_delegates_to_provider():
     assert sources == []
 
 
-def test_default_provider_is_the_ai_provider_manager():
+def test_default_provider_is_the_ai_provider_manager(monkeypatch):
     """Since the AI Provider Manager integration, Core's own default
     (when no provider is injected) is the ordered Gemini->Groq->
     OpenRouter->Cloudflare fallback manager (app/providers/manager.py),
-    built from JARVIS_AI_PROVIDER_ORDER - not a bare GeminiProvider."""
+    built from JARVIS_AI_PROVIDER_ORDER - not a bare GeminiProvider.
+    FreeLLMAPI is cleared so a key in the developer's .env does not
+    append it to the list."""
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "freellmapi_api_key", "")
     provider = JarvisCore().provider
     assert isinstance(provider, AIProviderManager)
     assert [health.name for health in provider.get_health()] == [

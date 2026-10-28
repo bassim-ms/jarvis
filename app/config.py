@@ -280,7 +280,7 @@ class Settings(BaseSettings):
     # hardcoded, but every path operation still re-validates against it at
     # runtime regardless of what this setting says.
     self_dev_project_root: str = (
-        r"C:\Users\bassim.ms\Documents\claude-access\jarvis-foundation\jarvis"
+        r"C:\Users\bassi\dev\jarvis"
     )
     # A small, fixed ceiling on bounded self-repair iterations after a
     # failed test/check - never unlimited (V1's own explicit requirement).

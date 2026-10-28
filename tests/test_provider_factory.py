@@ -274,6 +274,7 @@ def test_create_default_ai_provider_manager_omits_freellmapi_without_a_key(monke
 
 def test_build_ai_provider_entries_follows_configured_order(monkeypatch):
     monkeypatch.setattr(factory.settings, "ai_provider_order", "cloudflare,gemini")
+    monkeypatch.setattr(factory.settings, "freellmapi_api_key", "")
 
     entries = factory.build_ai_provider_entries()
 
@@ -291,6 +292,7 @@ def test_build_ai_provider_entries_raises_on_unknown_name(monkeypatch):
 
 def test_create_default_ai_provider_manager_returns_a_manager(monkeypatch):
     monkeypatch.setattr(factory.settings, "ai_provider_order", "gemini,groq")
+    monkeypatch.setattr(factory.settings, "freellmapi_api_key", "")
 
     manager = factory.create_default_ai_provider_manager()
 
