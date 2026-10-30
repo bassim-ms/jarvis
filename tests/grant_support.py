@@ -83,6 +83,21 @@ def without_grant_ids(text: str) -> str:
     return _SHORT_ID.sub("<id>", text)
 
 
+# The per-request chat trace (app/core.py: _RequestTrace) carries a random 32-hex-digit conversation id and a duration in milliseconds -
+# both in its message and in its arguments. Neither is an argument value of any tool, but either can happen to contain '777'.
+_CONVERSATION_ID = re.compile(r"\b[0-9a-f]{32}\b")
+_TRACE_DURATION = re.compile(r"duration_ms=\d+")
+_TRACE_ARGS_DURATION = re.compile(r"(\('<conversation>', '[^']*', '[^']*', '[^']*', '[^']*', )\d+\)")
+
+
+def without_chat_trace_noise(text: str) -> str:
+    """A log text with the chat trace's random conversation ids and durations replaced, so a 'no value appears in the log' check cannot
+    trip over them. Only those two fields are masked: everything else in the trace line is still checked."""
+    text = _CONVERSATION_ID.sub("<conversation>", text)
+    text = _TRACE_DURATION.sub("duration_ms=<ms>", text)
+    return _TRACE_ARGS_DURATION.sub(r"\1<ms>)", text)
+
+
 def _steps(calls) -> list[InputStep]:
     steps = []
     for call in calls:

@@ -8,7 +8,23 @@ variables Jarvis understands.
 
 import os
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+#: Every setting that names a file of the application's own local state (databases, the device credential). When `data_dir` is set, each
+#: of these that is a plain relative path is placed inside that folder instead of the current directory - see Settings._place_data_files.
+DATA_FILE_SETTINGS: tuple[str, ...] = (
+    "memory_db_path",
+    "search_cache_db_path",
+    "reminders_db_path",
+    "automations_db_path",
+    "calendar_token_db_path",
+    "tasks_db_path",
+    "notes_db_path",
+    "orchestration_db_path",
+    "voice_device_credential_file",
+    "log_file",
+)
 
 
 class Settings(BaseSettings):
@@ -282,6 +298,10 @@ class Settings(BaseSettings):
     self_dev_project_root: str = (
         r"C:\Users\bassi\dev\jarvis"
     )
+    # Whether the running app wires the Self-Development Engine at all. OFF by default: its approvals arrive over the anonymous /chat
+    # route, so any local program could answer them. Off, a self-development request is answered as ordinary chat (see
+    # JarvisCore._handle_self_development's existing fallback when no engine is configured).
+    self_dev_enabled: bool = False
     # A small, fixed ceiling on bounded self-repair iterations after a
     # failed test/check - never unlimited (V1's own explicit requirement).
     self_dev_max_repair_iterations: int = 2
@@ -301,7 +321,63 @@ class Settings(BaseSettings):
     computer_input_enabled: bool = False
     computer_input_actions_per_minute: int = 10
 
+    # Where the application's local state lives. Empty (the default) keeps every file exactly where it always was: a relative path,
+    # resolved against the directory the server is started from. Set it (e.g. JARVIS_DATA_DIR=sandbox) and every relative path named
+    # in DATA_FILE_SETTINGS is placed inside that folder instead, which is created if missing - a separate, disposable set of databases
+    # for a trial run. Absolute paths are never moved.
+    data_dir: str = ""
+
+    # Whether the server's start-up starts the background workers - the reminder scheduler, the automation engine and the Job
+    # engine (whose tick also drives Scheduled Jobs). ON keeps the usual behaviour. OFF, nothing runs on its own: due reminders,
+    # automations, Jobs and scheduled runs all wait, untouched, until a later start with this ON.
+    background_schedulers_enabled: bool = True
+
+    # Logging (app/logging_setup.py), configured when the server starts. Only Jarvis's own loggers ("jarvis.*" and "app.*") are
+    # written - never the HTTP client's, whose request lines can contain a provider key. Empty `log_file` = no file, console only.
+    log_file: str = "jarvis.log"
+    log_level: str = "INFO"
+
     model_config = SettingsConfigDict(env_file=".env", env_prefix="JARVIS_")
+
+    @model_validator(mode="after")
+    def _place_data_files(self) -> "Settings":
+        """With `data_dir` set, move each relative data-file path inside it (creating the folder). Without it, change nothing."""
+        if not self.data_dir:
+            return self
+        os.makedirs(self.data_dir, exist_ok=True)
+        for name in DATA_FILE_SETTINGS:
+            setattr(self, name, self.in_data_dir(getattr(self, name)))
+        return self
+
+    def data_files_outside_data_dir(self, extra: dict[str, str] | None = None) -> list[str]:
+        """The names of the data-file settings (and of any `extra` name -> path) that do NOT end up inside `data_dir`: an absolute path
+        elsewhere, or a relative one that climbs out of it ("..\\jarvis_memory.db"). Paths are compared fully resolved, so a junction or
+        symlink inside the folder that points out of it counts as outside. An empty path (e.g. no log file) uses no file and is never
+        listed. Without a `data_dir` nothing is isolated, so EVERY non-empty path is listed - a caller that needs isolation fails closed."""
+        paths = {name: getattr(self, name) for name in DATA_FILE_SETTINGS}
+        paths.update(extra or {})
+        if not self.data_dir:
+            return [name for name, path in paths.items() if path]
+        root = os.path.realpath(self.data_dir)
+        outside = []
+        for name, path in paths.items():
+            if not path:
+                continue
+            resolved = os.path.realpath(path)
+            try:
+                inside = os.path.commonpath([root, resolved]) == root and resolved != root
+            except ValueError:  # different drives on Windows
+                inside = False
+            if not inside:
+                outside.append(name)
+        return outside
+
+    def in_data_dir(self, path: str) -> str:
+        """`path` placed inside `data_dir` when that is set and `path` is relative; otherwise `path` unchanged. For data files whose
+        path is not a setting (the World Model's, which app/main.py passes explicitly - see app/world_model/sqlite_store.py)."""
+        if not self.data_dir or not path or os.path.isabs(path):
+            return path
+        return os.path.join(self.data_dir, path)
 
 
 settings = Settings()

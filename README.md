@@ -1,25 +1,41 @@
 # Jarvis
 
-Personal AI assistant project. This is **Milestone 11: Multi-Provider AI
-Foundation** — `app/providers/` now has three more `AIProvider`
-implementations alongside Gemini (Groq, OpenRouter, Cloudflare Workers
-AI - deliberately exactly these four cloud providers for now) and a
-small registry (`app/providers/factory.py`) to construct one by stable
-name. This milestone is **foundation only**: `JarvisCore` still builds
-its own default provider directly (`GeminiProvider()`, unchanged) and
-has no notion of provider selection, fallback, retries, quota tracking,
-or health-based rotation - that's the next milestone. See
-[Multi-Provider AI Foundation](#multi-provider-ai-foundation-m11) for
-the full provider table (base URL/required env/model config per
-provider) and what's still deliberately missing. `SearchRouter`,
-`CapabilityRouter`, `ToolCallBuilder`, Core's DIRECT/SEARCH/TOOL
-dispatch, Hands-Free Voice + Wake Word (M10), Google Calendar + Local
-Jarvis Tasks (M9), Persistent Automation Engine (M8), Persistent Tasks,
-Reminders & Background Scheduling (M7), natural-language tool selection
-(M6.16), capability routing (M6.13-M6.15), and the search pipeline
-(M6.5-6.12) are all unchanged. No provider fallback/rotation, no quota
-tracking, no agents/sub-agents, no new capabilities, and no API key is
-required for any of the three new providers yet.
+Personal AI assistant (also called Miles) - a local FastAPI service with multi-provider AI fallback, memory and a personal World Model,
+search, tools behind permission levels, persistent Jobs, reminders, automations, Scheduled Jobs, the Productivity Action Loop (Focus ->
+Action Proposal -> approval -> Job -> verified result), device trust, voice, and a computer-control layer that is OFF and gated.
+
+> **Status (2026-10-30).** The sections below were written milestone by milestone and the oldest ones describe their own milestone
+> ("this is Milestone 11", "Core still uses GeminiProvider") - read them as history; the code is the source of truth.
+> The full suite is about 10,000 tests and takes 15-25 minutes (see [Run the tests](#run-the-tests) for the latest result). There is no
+> user interface yet besides `curl` and the voice client.
+
+## Safe first run (Milestone 0)
+
+Starting the server normally opens the real databases in the current folder and starts the background workers (reminders,
+automations, Jobs, Scheduled Jobs), which may act on whatever is stored there. To try Jarvis without touching any of that:
+
+```
+python scripts/smoke_check.py              # offline: sandbox databases, no worker, no network, no AI call
+python scripts/smoke_check.py --live       # also one real /chat round-trip through your provider chain
+python scripts/smoke_check.py --providers  # also one tiny real call to each configured provider
+```
+
+It runs the real app against a `sandbox/` folder with the workers off, checks `/health` and `/chat`, and fails if any real data file
+(`jarvis_*.db`, `.env`, `jarvis_pc_device.json`) changed. To run the server the same way:
+
+```
+set JARVIS_DATA_DIR=sandbox
+set JARVIS_BACKGROUND_SCHEDULERS_ENABLED=false
+uvicorn app.main:app --host 127.0.0.1
+```
+
+| Setting | Default | Effect |
+|---|---|---|
+| `JARVIS_DATA_DIR` | empty | Puts every database, the device credential and the log in that folder (created if missing). |
+| `JARVIS_BACKGROUND_SCHEDULERS_ENABLED` | `true` | `false` starts no background worker: nothing runs on its own. |
+| `JARVIS_LOG_FILE` / `JARVIS_LOG_LEVEL` | `jarvis.log` / `INFO` | Log of Jarvis's own loggers only (never httpx, whose lines can hold a key). Each chat request writes one line: capability, which step answered, job id, failed steps and duration - never the message text. |
+| `JARVIS_SELF_DEV_ENABLED` | `false` | Wires the Self-Development Engine. Leave off: its approvals arrive over the anonymous `/chat`. |
+| `JARVIS_COMPUTER_INPUT_ENABLED` | `false` | Unchanged: the computer-input switch (and every action still needs a grant). |
 
 ## Stack
 
@@ -110,10 +126,14 @@ Expected output (actual text will vary):
 pytest
 ```
 
-Expected output ends with something like:
+The whole suite takes 15-25 minutes. Latest full run (2026-10-30, Milestone 0 branch, Windows 11, Python 3.13.15):
 ```
-707 passed in 0.XXs
+1 failed, 10069 passed, 5 skipped
 ```
+The one failure was `tests/test_job_report_and_notification.py::test_without_a_notifier_nothing_is_dispatched_and_no_thread_is_started`,
+which compares the process's total thread count before and after a Job tick (it found one thread FEWER). Rerun on its own it passed
+20 times out of 20, and its whole file passed 42/42, which suggests a possible timing-related flake (a thread left by an earlier test
+ending mid-test) - not confirmed. The 5 skips need symbolic-link rights or a newer pywin32.
 
 Tests never call the real Gemini or SearXNG APIs — `httpx.post` / `httpx.get`
 are monkeypatched, so they run without a network connection or real

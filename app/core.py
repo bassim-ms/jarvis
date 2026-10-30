@@ -166,7 +166,10 @@ the message/decision itself.
 """
 
 import json
+import logging
 import re
+import time
+from dataclasses import dataclass, field
 from datetime import datetime
 
 from app.capability import (
@@ -213,6 +216,39 @@ from app.tools.decision import (
 from app.tools.registry import ToolRegistry
 from app.tools.web_search import WebSearchTool
 from app.world_model.base import ContextSnapshot
+
+
+#: One INFO line per chat request (see _RequestTrace) and one WARNING per swallowed fault. Configured by app/logging_setup.py.
+logger = logging.getLogger("jarvis.chat")
+
+
+@dataclass
+class _RequestTrace:
+    """What happened to ONE chat request, for the log: the capability the router chose, which door or branch answered, how long it
+    took and which best-effort steps failed. Deliberately holds no message text, reply text or fact - only names, ids and timings."""
+
+    started: float = field(default_factory=time.monotonic)
+    capability: str = ""
+    door: str = ""
+    faults: list[str] = field(default_factory=list)
+
+    def attempt(self, door: str) -> None:
+        """A door is about to be asked. Doors are asked only while nothing has answered, so the last one asked is the one that answered."""
+        self.door = door
+
+    def fault(self, step: str, exc: BaseException) -> None:
+        """A best-effort step raised and was treated as "not mine" / "nothing to add". Record it and say so: the exception's TYPE only
+        at WARNING (its text may quote the user's message), the full traceback at DEBUG."""
+        self.faults.append(f"{step}:{type(exc).__name__}")
+        logger.warning("chat step failed and was skipped: step=%s error=%s", step, type(exc).__name__)
+        logger.debug("chat step %s traceback", step, exc_info=exc)
+
+    def finish(self, conversation_id: str, answered_by: str, job_id: str | None) -> None:
+        logger.info(
+            "chat conversation=%s capability=%s answered_by=%s job=%s faults=%s duration_ms=%d",
+            conversation_id, self.capability, answered_by, job_id or "-", ",".join(self.faults) or "-",
+            int((time.monotonic() - self.started) * 1000),
+        )
 
 
 class ConversationNotFoundError(RuntimeError):
@@ -611,6 +647,7 @@ class JarvisCore:
         capability dispatch and conversation persistence happen exactly
         once, here, so the public methods can never drift out of sync
         with each other."""
+        trace = _RequestTrace()
         if conversation_id is None:
             conversation_id = self.memory.create_conversation()
         elif not self.memory.conversation_exists(conversation_id):
@@ -623,8 +660,8 @@ class JarvisCore:
         if self.action_proposals is not None:
             try:
                 self.action_proposals.note_message(conversation_id)
-            except Exception:  # noqa: BLE001 - a fault here is "nothing to count"
-                pass
+            except Exception as exc:  # noqa: BLE001 - a fault here is "nothing to count"
+                trace.fault("action_proposals.note_message", exc)
 
         history = self.memory.get_messages(conversation_id)
         facts = with_derived_facts(self.memory.get_facts(), datetime.now().astimezone().date())
@@ -633,6 +670,7 @@ class JarvisCore:
             decision = self.capability_router.route(message)
         except CapabilityDecisionError as exc:
             raise ProviderError(f"Failed to decide a capability: {exc}") from exc
+        trace.capability = decision.capability.value
 
         # A reply to a waiting interaction (an explicit `answer <code>: ...`,
         # or a yes/no / free-text answer to something surfaced to THIS
@@ -657,7 +695,8 @@ class JarvisCore:
                 )
                 if outcome.handled:
                     interaction_reply = outcome.reply
-            except Exception:  # noqa: BLE001 - see above
+            except Exception as exc:  # noqa: BLE001 - see above
+                trace.fault("interaction_resolver", exc)
                 interaction_reply = None
 
         # An explicit memory command ("remember that I prefer X", "set my goal
@@ -677,8 +716,10 @@ class JarvisCore:
             )
         ):
             try:
+                trace.attempt("activity_context")
                 memory_reply = self.activity_context.command_reply(message, conversation_id)
-            except Exception:  # noqa: BLE001 - a fault here is "not an activity statement"
+            except Exception as exc:  # noqa: BLE001 - a fault here is "not an activity statement"
+                trace.fault("activity_context", exc)
                 memory_reply = None
         # The Morning Brief is read the same way: a whole-message request only, on the ordinary
         # conversation path (DIRECT, or SEARCH when only a freshness word like "today" put it
@@ -693,8 +734,10 @@ class JarvisCore:
             )
         ):
             try:
+                trace.attempt("morning_brief")
                 memory_reply = self.morning_brief.command_reply(message, conversation_id)
-            except Exception:  # noqa: BLE001 - a fault here is "not a brief request"
+            except Exception as exc:  # noqa: BLE001 - a fault here is "not a brief request"
+                trace.fault("morning_brief", exc)
                 memory_reply = None
         # Device operations are read the same way: a whole-message phrasing only, on the ordinary
         # conversation path. Reads answer from the registry; "revoke my phone" only ASKS (existing
@@ -709,12 +752,14 @@ class JarvisCore:
             )
         ):
             try:
+                trace.attempt("device_operations")
                 memory_reply = (
                     self.device_operations.command_reply(message, conversation_id, device_context=device_context)
                     if device_context is not None
                     else self.device_operations.command_reply(message, conversation_id)
                 )
-            except Exception:  # noqa: BLE001 - a fault here is "not a device request"
+            except Exception as exc:  # noqa: BLE001 - a fault here is "not a device request"
+                trace.fault("device_operations", exc)
                 memory_reply = None
         # Reminders are read the same way: a whole-message request only, on the ordinary conversation path (DIRECT, or
         # SEARCH when only a freshness word like "tomorrow" put it there - never an explicit search, tool, task, status
@@ -729,8 +774,10 @@ class JarvisCore:
             )
         ):
             try:
+                trace.attempt("reminder_operations")
                 memory_reply = self.reminder_operations.command_reply(message, conversation_id)
-            except Exception:  # noqa: BLE001 - a fault here is "not a reminder request"
+            except Exception as exc:  # noqa: BLE001 - a fault here is "not a reminder request"
+                trace.fault("reminder_operations", exc)
                 memory_reply = None
         # Scheduled Jobs are read the same way, with one difference: a request to do something EVERY day / at a TIME is claimed
         # here even when the router would otherwise have sent it to Handle This (TASK) or to search - otherwise "research X, compare
@@ -744,12 +791,14 @@ class JarvisCore:
             and decision.capability in (Capability.DIRECT, Capability.SEARCH, Capability.TASK)
         ):
             try:
+                trace.attempt("scheduled_job_operations")
                 memory_reply = (
                     self.scheduled_job_operations.command_reply(message, conversation_id, device_context=device_context)
                     if device_context is not None
                     else self.scheduled_job_operations.command_reply(message, conversation_id)
                 )
-            except Exception:  # noqa: BLE001 - a fault here is "not a scheduled job request"
+            except Exception as exc:  # noqa: BLE001 - a fault here is "not a scheduled job request"
+                trace.fault("scheduled_job_operations", exc)
                 memory_reply = None
         if (
             memory_reply is None
@@ -758,8 +807,10 @@ class JarvisCore:
             and decision.capability is Capability.DIRECT
         ):
             try:
+                trace.attempt("memory_writer.command_reply")
                 memory_reply = self.memory_writer.command_reply(message, conversation_id)
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
+                trace.fault("memory_writer.command_reply", exc)
                 memory_reply = None
         # The user's own questions about their memory ("what did I note down?", "what are my preferences?", "how old
         # am I?") and an explicit "forget that preference" are answered from the existing stores by the same service -
@@ -774,8 +825,10 @@ class JarvisCore:
             )
         ):
             try:
+                trace.attempt("memory_writer.recall_reply")
                 memory_reply = self.memory_writer.recall_reply(message, conversation_id)
-            except Exception:  # noqa: BLE001 - a fault here is "not a memory question"
+            except Exception as exc:  # noqa: BLE001 - a fault here is "not a memory question"
+                trace.fault("memory_writer.recall_reply", exc)
                 memory_reply = None
         # Focus is the last of the answering doors, read the same way: a whole-message request only, on the ordinary conversation path (DIRECT,
         # or SEARCH when only a freshness word like "today" put it there). Never an explicit search, tool, task, status,
@@ -794,8 +847,10 @@ class JarvisCore:
             and not self._interaction_awaiting_reply(conversation_id)  # last: a lookup, asked only of a message that could be Focus's
         ):
             try:
+                trace.attempt("focus")
                 memory_reply = self.focus.command_reply(message, conversation_id)
-            except Exception:  # noqa: BLE001 - a fault here is "not a focus request"
+            except Exception as exc:  # noqa: BLE001 - a fault here is "not a focus request"
+                trace.fault("focus", exc)
                 memory_reply = None
         # The Action Proposal door follows Focus, on the same terms: ordinary conversation only (DIRECT, or SEARCH when only a freshness word put
         # it there), never an explicit search, tool, task, status, confirmation or self-development request, never a message another door already
@@ -812,8 +867,10 @@ class JarvisCore:
             and not self._interaction_awaiting_reply(conversation_id)
         ):
             try:
+                trace.attempt("action_proposals")
                 memory_reply = self.action_proposals.command_reply(message, conversation_id)
-            except Exception:  # noqa: BLE001 - a fault here is "not a proposal message"
+            except Exception as exc:  # noqa: BLE001 - a fault here is "not a proposal message"
+                trace.fault("action_proposals", exc)
                 memory_reply = None
 
         # M16.2: purely additive - computed only when a context_engine was
@@ -990,7 +1047,8 @@ class JarvisCore:
         ):
             try:
                 note = self.memory_writer.observe(message, conversation_id)
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
+                trace.fault("memory_writer.observe", exc)
                 note = None
             if note:
                 reply = f"{reply}\n\n{note}"
@@ -1001,7 +1059,8 @@ class JarvisCore:
         if self.escalation_surface is not None:
             try:
                 urgent_items = self.escalation_surface.take_escalations()
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
+                trace.fault("escalation_surface", exc)
                 urgent_items = []
             if urgent_items:
                 lines = " ".join(item.event.text for item in urgent_items)
@@ -1012,7 +1071,8 @@ class JarvisCore:
         if self.result_reports is not None:
             try:
                 finished = self.result_reports.take(conversation_id)
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
+                trace.fault("result_reports", exc)
                 finished = None
             if finished and isinstance(finished, str):
                 reply = f"{reply}\n\n{finished}"
@@ -1023,7 +1083,8 @@ class JarvisCore:
         if self.interaction_resolver is not None:
             try:
                 notice = self.interaction_resolver.surface(conversation_id)
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
+                trace.fault("interaction_resolver.surface", exc)
                 notice = None
             if notice:
                 reply = f"{reply}\n\n{notice}"
@@ -1034,10 +1095,21 @@ class JarvisCore:
             # in the conversation history (see MemoryWriteService.redact).
             try:
                 stored_message = self.memory_writer.redact(message)
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
+                trace.fault("memory_writer.redact", exc)
                 stored_message = message
         self.memory.add_message(conversation_id, "user", stored_message)
         self.memory.add_message(conversation_id, "assistant", reply)
+
+        # Which door answered, or else the capability branch the message was sent to (a branch that fell back to ordinary conversation is
+        # still recorded under its capability; `faults` says what went wrong on the way).
+        if interaction_reply is not None:
+            answered_by = "interaction_resolver"
+        elif memory_reply is not None:
+            answered_by = trace.door
+        else:
+            answered_by = decision.capability.value
+        trace.finish(conversation_id, answered_by, job_id)
 
         return (
             reply,

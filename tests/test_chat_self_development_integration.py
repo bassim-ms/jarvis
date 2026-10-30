@@ -108,14 +108,24 @@ def test_ordinary_requests_never_invoke_the_self_development_engine(tmp_path, mo
     assert provider.calls == 0
 
 
-def test_main_core_has_a_real_self_development_engine_configured_by_default():
-    """app/main.py's own wiring activates this for the real app - the
-    module-level singleton (before any test monkeypatches it) already
-    has one, pointed at the real, configured project root."""
+def test_main_core_wires_the_self_development_engine_only_when_enabled():
+    """app/main.py wires the engine only when JARVIS_SELF_DEV_ENABLED is on
+    (default OFF since Milestone 0: its approvals arrive over the anonymous
+    /chat). Off, the module-level singleton (before any test monkeypatches
+    it) has none; on, it has one pointed at the configured project root."""
     from app.config import settings
 
-    assert main.core.self_development_engine is not None
-    assert main.core.self_development_engine.project_root == settings.self_dev_project_root
+    if settings.self_dev_enabled:
+        assert main.core.self_development_engine is not None
+        assert main.core.self_development_engine.project_root == settings.self_dev_project_root
+    else:
+        assert main.core.self_development_engine is None
+
+
+def test_self_development_is_off_unless_explicitly_enabled():
+    from app.config import Settings
+
+    assert Settings(_env_file=None).self_dev_enabled is False
 
 
 # -- prompt injection resistance, at the full-stack level --------------

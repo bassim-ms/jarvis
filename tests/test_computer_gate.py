@@ -50,7 +50,7 @@ from app.providers.base import AIProvider
 from app.tools.base import PermissionLevel, ToolArgumentError, ToolResultStatus
 from app.tools.decision import ToolCallBuilder, ToolCallError, ToolCallProvider
 from app.tools.registry import ToolRegistry
-from grant_support import PerCallGrants, authorize, budget_trail, check_now, admit_now, without_grant_ids
+from grant_support import PerCallGrants, authorize, budget_trail, check_now, admit_now, without_chat_trace_noise, without_grant_ids
 
 INPUT_TOOLS = ("type_text", "press_key", "move_mouse", "click_mouse", "double_click", "open_application", "scroll")
 #: Every method that ACTS on the desktop: the input tools plus the two that change which window is in front (each needs a grant that binds its exact arguments).
@@ -1182,7 +1182,7 @@ SECRET = "TOP-SECRET-PASSWORD-9d2f"
 def flattened(caplog) -> str:
     """Everything a log handler could ever emit for these records. (An 'allowed' line now carries the grant's random 8-hex-digit id prefix; it is masked so that a check such as
     'the text 777 is nowhere in the log' cannot be tripped by a random id that happens to contain it. The id is not an argument value.)"""
-    return without_grant_ids("\n".join(f"{r.getMessage()} | {r.msg} | {r.args!r} | {r.exc_text or ''}" for r in caplog.records))
+    return without_chat_trace_noise(without_grant_ids("\n".join(f"{r.getMessage()} | {r.msg} | {r.args!r} | {r.exc_text or ''}" for r in caplog.records)))
 
 
 def test_the_audit_log_names_the_action_and_outcome_but_never_a_value(caplog):
@@ -1254,7 +1254,8 @@ def test_log_records_carry_no_extra_fields_that_could_hold_a_value(caplog):
 def everything_logged_anywhere(caplog) -> str:
     """Every record of every logger, as a handler would render it - message, arguments and any traceback."""
     formatter = logging.Formatter("%(name)s %(levelname)s %(message)s")
-    return without_grant_ids("\n".join(f"{formatter.format(r)} | {r.args!r} | {r.exc_info!r}" for r in caplog.records))  # (grant id prefixes masked: see `flattened`)
+    # (grant id prefixes, and the chat trace's random conversation id and duration, are masked: see `flattened` and grant_support.without_chat_trace_noise)
+    return without_chat_trace_noise(without_grant_ids("\n".join(f"{formatter.format(r)} | {r.args!r} | {r.exc_info!r}" for r in caplog.records)))
 
 
 def real_chat(monkeypatch, *, enabled, limit):

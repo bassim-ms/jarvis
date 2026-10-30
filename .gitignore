@@ -14,6 +14,9 @@ venv/
 # Local data (future SQLite DB etc.)
 *.db
 *.sqlite3
+*.log
+*.log.[0-9]*
+sandbox/
 
 # OS / editor
 .DS_Store

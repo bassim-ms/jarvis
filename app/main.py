@@ -25,6 +25,7 @@ from M15 Job planning or AutomationEngine (see this file's own
 hardware control beyond that yet - those come in later milestones.
 """
 
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Header, HTTPException
@@ -45,6 +46,7 @@ from app.context_reasoning.factory import create_default_context_reasoner
 from app.action_proposal import ActionProposalService, ExecutionHandoff, ResultReports
 from app.focus import FocusService
 from app.host_guard import LoopbackHostMiddleware
+from app.logging_setup import configure_logging
 from app.handle_this.base import GoalFamily
 from app.handle_this.boundary import DEFAULT_BOUNDARY
 from app.handle_this.continuation import ObjectiveContinuer, plausible_input_answer
@@ -290,7 +292,9 @@ core.interaction_resolver = InteractionResolver(
 # living in this file too. `memory=core.memory` mirrors the same "share
 # the one real MemoryStore, never open a second connection to the same
 # file" convention every store above already follows.
-_world_model_store = create_default_world_model_store(DEFAULT_WORLD_MODEL_DB_PATH)
+# With JARVIS_DATA_DIR set, the same file name is placed in that folder (settings.in_data_dir) - still passed explicitly.
+_WORLD_MODEL_DB_PATH = settings.in_data_dir(DEFAULT_WORLD_MODEL_DB_PATH)
+_world_model_store = create_default_world_model_store(_WORLD_MODEL_DB_PATH)
 _world_model_service = create_default_world_model_service(_world_model_store)
 core.context_engine = create_default_context_engine(_world_model_service, memory=core.memory)
 
@@ -304,7 +308,7 @@ core.context_engine = create_default_context_engine(_world_model_service, memory
 core.memory_writer = create_default_memory_write_service(
     _world_model_service,
     core.memory,
-    DEFAULT_WORLD_MODEL_DB_PATH,
+    _WORLD_MODEL_DB_PATH,
     # A sensitive request is confirmed through the EXISTING Job / interaction /
     # ToolRegistry machinery (never a mechanism of its own): its confirmation is
     # put to the user in the conversation it came from.
@@ -552,13 +556,17 @@ core.identity_context = load_identity_context(
 # client. `self_dev_project_root` bounds every file/command this engine
 # will ever touch (app/self_development/safety.py) - configurable via
 # settings, but re-validated at runtime regardless of what's configured.
-core.self_development_engine = create_default_self_development_engine(
-    core.provider,
-    project_root=settings.self_dev_project_root,
-    max_repair_iterations=settings.self_dev_max_repair_iterations,
-    command_timeout_seconds=settings.self_dev_command_timeout_seconds,
-    test_command=settings.self_dev_test_command,
-)
+#
+# Only when JARVIS_SELF_DEV_ENABLED is on (default OFF): its approvals arrive over the anonymous /chat, so any local program could answer
+# them. Off, `core.self_development_engine` stays `None` and a development request is answered as ordinary chat.
+if settings.self_dev_enabled:
+    core.self_development_engine = create_default_self_development_engine(
+        core.provider,
+        project_root=settings.self_dev_project_root,
+        max_repair_iterations=settings.self_dev_max_repair_iterations,
+        command_timeout_seconds=settings.self_dev_command_timeout_seconds,
+        test_command=settings.self_dev_test_command,
+    )
 
 # Computer Control (M17.1-A/B/C, see app/computer/) - `core.computer_tools`
 # defaults to `None` (see JarvisCore.__init__), so this is what actually
@@ -581,15 +589,37 @@ core.self_development_engine = create_default_self_development_engine(
 core.computer_tools = create_computer_tools_registry(_computer_backend)
 
 
+_startup_log = logging.getLogger("jarvis.startup")
+
+
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    reminder_scheduler.start()
-    automation_engine.start()
-    job_engine.start()
+    # Logging first, so everything below is recorded (app/logging_setup.py). Configured here, at server start, never on import.
+    configure_logging(settings.log_file, settings.log_level)
+    _startup_log.info(
+        "Jarvis starting: data_dir=%s background_schedulers=%s self_development=%s computer_input=%s",
+        settings.data_dir or "(current directory)",
+        "on" if settings.background_schedulers_enabled else "OFF",
+        "on" if core.self_development_engine is not None else "off",
+        "ON" if settings.computer_input_enabled else "off",
+    )
+    if settings.data_dir:
+        # An absolute path (or one climbing out with "..") is honoured as configured - say plainly that it is NOT in the data folder.
+        outside = settings.data_files_outside_data_dir({"world_model_db_path": _WORLD_MODEL_DB_PATH})
+        if outside:
+            _startup_log.warning("data_dir is set, but these data files are OUTSIDE it: %s", ", ".join(outside))
+    # JARVIS_BACKGROUND_SCHEDULERS_ENABLED=false starts nothing that runs on its own: due reminders, automations, Jobs and scheduled
+    # runs wait, untouched, for a later start with it on. Chat still works; a Job created from chat is stored but not run.
+    schedulers = settings.background_schedulers_enabled
+    if schedulers:
+        reminder_scheduler.start()
+        automation_engine.start()
+        job_engine.start()
     yield
-    job_engine.stop()
-    automation_engine.stop()
-    reminder_scheduler.stop()
+    if schedulers:
+        job_engine.stop()
+        automation_engine.stop()
+        reminder_scheduler.stop()
 
 
 app = FastAPI(title=settings.app_name, lifespan=_lifespan)
@@ -721,6 +751,9 @@ def device_check_in(
     return {"device_id": device.device_id, "status": device.status.value, "last_seen": device.last_seen.isoformat()}
 
 
+_chat_log = logging.getLogger("jarvis.chat")
+
+
 def _chat(request: ChatRequest, device: DeviceContext | None) -> ChatResponse:
     # Only the Gateway makes an authenticated DeviceContext; refuse anything else rather than pass it on.
     if device is not None and not device.is_authenticated:
@@ -733,8 +766,11 @@ def _chat(request: ChatRequest, device: DeviceContext | None) -> ChatResponse:
             request.message, request.conversation_id, **extra
         )
     except ConversationNotFoundError as exc:
+        _chat_log.info("chat refused: unknown conversation (404)")
         raise HTTPException(status_code=404, detail=str(exc))
     except ProviderError as exc:
+        # The exception's type only: its text can describe the request. The detail still goes back to the caller, as before.
+        _chat_log.warning("chat failed: %s (502)", type(exc).__name__)
         raise HTTPException(status_code=502, detail=str(exc))
     return ChatResponse(
         reply=reply,
