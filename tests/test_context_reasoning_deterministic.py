@@ -316,3 +316,26 @@ def test_analyze_is_deterministic_for_the_same_inputs():
     first = analyze(snapshot, request_context)
     second = analyze(snapshot, request_context)
     assert first == second
+
+
+# --- regression: date-only / naive timestamps made analyze() raise, failing every chat request (found 2026-11-18) -------------
+
+
+def test_a_date_only_goal_target_date_is_compared_without_failing_and_counts_as_that_whole_day():
+    """World Model goals carry target dates like "2026-01-02" (no time, no zone); comparing them with the snapshot's aware time
+    raised "can't compare offset-naive and offset-aware datetimes"."""
+    goal = _goal(target_date="2026-01-02")
+
+    analysis = analyze(_snapshot(relevant_goals=[goal]), _rc())
+
+    assert any("approaching target date" in fact.text for fact in analysis.facts)
+
+
+def test_naive_commitment_and_event_times_are_read_as_utc_without_failing():
+    overdue = _commitment(id_="c-old", due_at="2025-12-31T00:00:00")
+    soon = _commitment(id_="c-soon", due_at="2026-01-01T12:00:00")
+
+    analysis = analyze(_snapshot(upcoming_commitments=[overdue, soon]), _rc())
+
+    texts = " ".join(fact.text for fact in analysis.facts)
+    assert "is overdue" in texts and "is due soon" in texts

@@ -174,3 +174,30 @@ def test_tie_break_falls_back_to_stable_id_ordering():
         entity_id="bbb",
     )
     assert a < b
+
+
+# --- regression: a goal with a date-only target date made every chat request fail (found 2026-11-18) ---------------------
+
+
+def test_a_date_only_target_is_compared_with_an_aware_now_without_failing():
+    """World Model goals carry target dates like "2026-11-30" (no time, no timezone) while the request time is aware - comparing
+    them raised "can't compare offset-naive and offset-aware datetimes", which turned every chat message into an HTTP 500."""
+    score, reason = time_relevance("2026-11-30", "2026-11-18T21:00:00+04:00")
+
+    assert score == DEFAULT_WEIGHTS.TIME_FAR_FUTURE
+
+
+def test_a_date_only_target_is_due_that_day_not_overdue_from_its_first_minute():
+    score, _ = time_relevance("2026-11-30", "2026-11-30T15:00:00+04:00")
+    assert score == DEFAULT_WEIGHTS.TIME_TODAY or score == DEFAULT_WEIGHTS.TIME_NOW
+
+    overdue, _ = time_relevance("2026-11-30", "2026-12-01T00:30:00+04:00")
+    assert overdue == DEFAULT_WEIGHTS.TIME_OVERDUE
+
+
+def test_a_naive_timestamp_and_an_aware_now_compare_in_the_same_zone():
+    tomorrow, _ = time_relevance("2026-11-19T10:00:00", "2026-11-18T21:00:00+04:00")
+    assert tomorrow == DEFAULT_WEIGHTS.TIME_TOMORROW
+
+    aware_ts_naive_now, _ = time_relevance("2026-11-19T10:00:00+04:00", "2026-11-18T21:00:00")
+    assert aware_ts_naive_now == DEFAULT_WEIGHTS.TIME_TOMORROW

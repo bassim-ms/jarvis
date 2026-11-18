@@ -56,12 +56,21 @@ _REASON_DEPENDENCY = "dependency"
 
 
 def _parse(timestamp: str | None) -> datetime | None:
+    """An AWARE datetime, so every comparison here is aware-with-aware: a value without a timezone is read as UTC (this
+    module's `now` is the snapshot's UTC time), and a plain date ("2026-11-30" - a goal's target date) means the end of that
+    day. Before this, a date-only target date compared with the aware `now` raised a TypeError and failed the chat request."""
     if not timestamp:
         return None
+    text = timestamp.strip()
     try:
-        return datetime.fromisoformat(timestamp)
+        value = datetime.fromisoformat(text)
     except ValueError:
         return None
+    if len(text) == 10 and "T" not in text:
+        value = value.replace(hour=23, minute=59, second=59)
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value
 
 
 @dataclass(frozen=True)

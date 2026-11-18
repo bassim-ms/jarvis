@@ -65,9 +65,11 @@ def test_an_unreadable_due_date_adds_nothing_but_is_flagged_not_dropped(value):
     assert urgency(value, NOW) == (0.0, REASON_DUE_UNREADABLE, None)
 
 
-def test_a_date_only_due_today_is_never_scored_overdue_unlike_the_context_engine_scorer():
-    """The reason this module has its own clock reading: the Context Engine's string comparison treats a date-only "today" as midnight."""
-    assert S.time_relevance("2026-09-29", "2026-09-29T08:00:00")[1] == S.REASON_TIME_OVERDUE  # documents the trap
+def test_a_date_only_due_today_is_never_scored_overdue_by_focus_nor_now_by_the_context_engine():
+    """Focus reads its own clock because the Context Engine scorer used to treat a date-only "today" as midnight (overdue from its
+    first minute). That trap was fixed on 2026-11-18 (a date-only value now means the end of that day - and a naive/aware mix no
+    longer raises), so both now agree: due today, not overdue."""
+    assert S.time_relevance("2026-09-29", "2026-09-29T08:00:00")[1] == S.REASON_TIME_TODAY
     assert urgency("2026-09-29", NOW)[1] == S.REASON_TIME_TODAY
 
 

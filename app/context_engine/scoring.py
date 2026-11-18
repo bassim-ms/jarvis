@@ -163,6 +163,15 @@ def time_relevance(
         now = datetime.fromisoformat(current_time)
     except ValueError:
         return None
+    # A plain date ("2026-11-30" - a goal's target date) means the END of that day: due that day, not overdue from its first
+    # minute. A value without a timezone is read in the same zone as the other one, so a naive and an aware timestamp compare
+    # (before this, a goal with a date-only target date made every chat request fail with a TypeError).
+    if "T" not in timestamp.strip() and len(timestamp.strip()) == 10:
+        ts = ts.replace(hour=23, minute=59, second=59)
+    if ts.tzinfo is None and now.tzinfo is not None:
+        ts = ts.replace(tzinfo=now.tzinfo)
+    elif now.tzinfo is None and ts.tzinfo is not None:
+        now = now.replace(tzinfo=ts.tzinfo)
 
     if ts < now:
         return weights.TIME_OVERDUE, REASON_TIME_OVERDUE
