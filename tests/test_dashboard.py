@@ -684,7 +684,7 @@ def test_without_a_world_model_the_view_says_so(world):
     _, http = world
 
     assert http.get("/api/world").json()["available"] is False
-    assert http.get("/api/memory").json() == {"facts": [], "preferences": [], "candidates": []}
+    assert http.get("/api/memory").json() == {"facts": [], "preferences": [], "candidates": [], "remembered": [], "history": []}
     assert http.get("/api/calendar").json()["connected"] is False
 
 

@@ -76,7 +76,7 @@ Privacy: the stored rows hold counts, durations, timestamps and failure kinds on
 error through the manager and checks none of it reaches the database. Concurrency: 8 threads x 50 requests and 6 threads
 recording directly lose no count. The provider order is unchanged.
 
-## Batch 5 - reliability: health report and verified backups (2026-11-18)
+## Batch 5 - reliability: health report and verified backups (2026-11-18, commit 39bf0c4)
 
 | Spec # | Feature | Status | Evidence |
 |---|---|---|---|
@@ -86,6 +86,15 @@ recording directly lose no count. The provider order is unchanged.
 | 456 | Backup verification | Done | verified backups (SQLite backup API, integrity + row counts, SHA-256 manifest) and later re-verification (changed / missing / damaged / unreadable manifest / path escape all caught) - tests; browser-checked (12 files backed up and verified) |
 | 460 | Reliability reporting | Partial | one report with an overall ok / warning / failing status and its reasons. Not yet a report over time |
 | 453 | Failure alerts | Planned | the report shows problems when looked at; nothing notifies yet |
+
+## Batch 6 - memory you control (2026-11-18)
+
+| Spec # | Feature | Status | Evidence |
+|---|---|---|---|
+| 104 | User-controlled memory editing | Partial | Forget ONE exact, user-picked item from the dashboard, in two steps enforced by the memory policy (single-use, 5-minute token; nothing deleted before confirming), through the same deletion and audit path as chat - `tests/test_memory_editing.py` (31); browser-checked (Cancel keeps, OK forgets exactly that item). Correcting a value in place is not built yet |
+| 93 | Memory provenance | Done (view) | each kept item shown with its wording, stored value, origin ("you asked me to remember it" / "you told me"), action and time from the audit journal; the journal itself as "Recent memory changes" - tests; browser-checked |
+| 469 | Memory browser | Done | (batch 3) now shows the policy's view - kept items with provenance, unconfirmed candidates, history |
+| - | Forgetting leaves no trace of the content | Done | a forgotten item's content-derived key is replaced by an opaque reference in the journal and its staged candidate is deleted (chat and dashboard) - tests check nothing on disk still names it. Items forgotten before this change keep their old key |
 
 ## Next batches
 

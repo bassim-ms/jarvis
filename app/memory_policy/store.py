@@ -102,6 +102,12 @@ class WriteStore(ABC):
         return how many were changed. Used when the user asks Jarvis to forget something: the audit trail keeps
         THAT a write happened, never WHAT was written."""
 
+    def forget_key(self, kind: str, key: str) -> str:
+        """Erase what the journal still says about one forgotten item and return the opaque reference that replaces its key.
+        The default only scrubs values (a store that cannot do more keeps the key); SQLiteWriteStore does it fully."""
+        self.scrub_key(kind, key)
+        return key
+
     @abstractmethod
     def stage_candidate(
         self, *, kind: str, key: str, value: str, category: str, origin: str, confidence: float, evidence: str
@@ -230,6 +236,21 @@ class SQLiteWriteStore(WriteStore):
             )
             self._conn.commit()
         return cursor.rowcount
+
+    def forget_key(self, kind: str, key: str) -> str:
+        """Everything the journal still holds that could reveal a forgotten item, gone in ONE transaction: its values, its KEY
+        (a note's key is made from its own words, e.g. "note:my_printer_nozzle_is_0_4") - replaced by an opaque
+        "forgotten:<random>" reference in every journal row - and any staged candidate for it (whose evidence is the user's
+        sentence). The rows themselves stay, so the history still shows that something was kept and later forgotten."""
+        ref = "forgotten:" + uuid.uuid4().hex[:12]
+        with self._lock:
+            self._conn.execute(
+                "UPDATE write_journal SET value = NULL, previous_value = NULL, key = ? WHERE kind = ? AND key = ?",
+                (ref, kind, key),
+            )
+            self._conn.execute("DELETE FROM write_candidates WHERE kind = ? AND key = ?", (kind, key))
+            self._conn.commit()
+        return ref
 
     # -- candidates ------------------------------------------------------------------------------
 

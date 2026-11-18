@@ -781,6 +781,7 @@ app.include_router(build_dashboard_router(DashboardSources(
     world_model=_world_model_service,
     memory_candidates=core.memory_writer.candidates_for_context,
     diagnostics=diagnostics,
+    memory_policy=core.memory_writer,
 )))
 
 

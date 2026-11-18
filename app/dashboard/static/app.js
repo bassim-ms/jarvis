@@ -367,20 +367,28 @@ function renderWorld(data) {
   }
 }
 
+const ORIGIN_WORDS = {
+  user_command: "you asked me to remember it",
+  user_statement: "you told me",
+  inference: "I concluded it",
+  external: "from an outside source",
+};
+
 function renderMemory(data) {
-  const facts = $("fact-list");
-  facts.replaceChildren();
-  $("fact-count").textContent = String(data.facts.length);
-  if (!data.facts.length) facts.append(emptyItem("Nothing remembered yet. Say \"remember that ...\" in chat."));
-  for (const fact of data.facts) {
-    facts.append(el("li", {}, [el("div", { className: "kv" }, [el("span", { className: "k", text: fact.key }), el("span", { text: fact.value })])]));
-  }
-  const preferences = $("preference-list");
-  preferences.replaceChildren();
-  if (!data.preferences.length) preferences.append(emptyItem("No preferences yet."));
-  for (const item of data.preferences) {
-    preferences.append(el("li", {}, [el("div", { className: "kv" }, [el("span", { className: "k", text: item.key }), el("span", { text: item.value })]),
-      el("div", { className: "sub", text: `${item.category} - ${item.source}` })]));
+  const kept = $("kept-list");
+  kept.replaceChildren();
+  $("kept-count").textContent = String(data.remembered.length);
+  if (!data.remembered.length) kept.append(emptyItem("Nothing kept yet. Say \"remember that ...\" in chat."));
+  for (const item of data.remembered) {
+    const p = item.provenance;
+    const from = p ? `${ORIGIN_WORDS[p.origin] || p.origin} - ${p.action} ${when(p.saved_at)}` : "no record of when it was saved";
+    const value = item.value && !item.text.includes(item.value) ? ` (stored as: ${item.value})` : "";
+    const forget = el("button", { className: "small danger", text: "Forget", attrs: { type: "button" } });
+    forget.addEventListener("click", () => forgetItem(item, forget));
+    kept.append(el("li", {}, [
+      el("div", { className: "row" }, [el("div", { className: "grow", text: item.text + value }), pill(item.kind), forget]),
+      el("div", { className: "sub", text: from }),
+    ]));
   }
   const candidates = $("candidate-list");
   candidates.replaceChildren();
@@ -390,6 +398,31 @@ function renderMemory(data) {
     candidates.append(el("li", {}, [el("div", { className: "kv" }, [el("span", { className: "k", text: item.key }), el("span", { text: item.value })]),
       el("div", { className: "sub", text: `${item.kind} - confidence ${Math.round((item.confidence || 0) * 100)}%` })]));
   }
+  const history = $("memory-history");
+  history.replaceChildren();
+  if (!data.history.length) history.append(emptyItem("No changes yet."));
+  for (const entry of data.history.slice(0, 15)) {
+    const what = entry.value === null || entry.value === undefined ? entry.key : `${entry.key}: ${entry.value}`;
+    history.append(el("li", {}, [el("div", { className: "row" }, [el("div", { className: "grow", text: what }), pill(entry.action)]),
+      el("div", { className: "sub", text: `${when(entry.at)} - ${entry.reason}` })]));
+  }
+}
+
+/* Forgetting is two steps on the SERVER: prepare names the exact item and issues a single-use token; only confirming with it
+   forgets. The browser's own "are you sure?" sits between them, showing the item exactly as kept. */
+async function forgetItem(item, button) {
+  button.disabled = true;
+  try {
+    const prepared = await api("/api/memory/forget/prepare", { method: "POST", body: { kind: item.kind, id: item.id } });
+    if (!window.confirm(`Forget this? It cannot be undone.
+
+"${prepared.text}"`)) { button.disabled = false; return; }
+    const done = await api("/api/memory/forget/confirm", { method: "POST", body: { token: prepared.token } });
+    toast(done.message);
+  } catch (error) {
+    toast(error.message, true);
+  }
+  loadTab("memory");
 }
 
 function renderAutomations(data) {

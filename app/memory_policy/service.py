@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import secrets
 import threading
 import time
 import uuid
@@ -87,6 +88,8 @@ MAX_LISTED = 15
 MAX_ITEM_DISPLAY_CHARS = 140
 #: The most "which one?" candidates a forget request that matched several is shown, and the conversations whose last write is remembered.
 MAX_FORGET_CHOICES = 5
+#: How long a dashboard "forget this?" confirmation stays valid (app/dashboard: Memory tab).
+FORGET_CONFIRM_SECONDS = 300
 MAX_TRACKED_CONVERSATIONS = 50
 
 _NOTHING_NOTED = "I don't have anything noted down for you yet."
@@ -147,6 +150,8 @@ class MemoryWriteService:
         # What each conversation last had written, so "forget that preference" means the one just saved. In memory,
         # bounded, never persisted.
         self._last_written: OrderedDict[str, tuple[Kind, str]] = OrderedDict()
+        # Dashboard forget confirmations (token -> (kind, item id, issued)): in memory only, single use, short-lived.
+        self._forget_tokens: dict[str, tuple[str, str, float]] = {}
 
     # -- the doors from the user's own words ------------------------------------------------------------------
 
@@ -270,14 +275,95 @@ class MemoryWriteService:
             self.memory.delete_fact(item.key)
             kind, destination = Kind.FACT.value, Destination.MEMORY.value
         try:
-            self.store.scrub_key(kind, item.key)
+            ref = self.store.forget_key(kind, item.key)  # values, the content-derived key and any candidate: all erased
             self.store.record(
-                action="forgotten", kind=kind, key=item.key, value=None, previous_value=None,
+                action="forgotten", kind=kind, key=ref, value=None, previous_value=None,
                 origin=Origin.USER_COMMAND.value, destination=destination, source="user", confidence=None,
                 reason="the user asked Jarvis to forget it",
             )
         except Exception:  # noqa: BLE001 - an audit fault must not undo the user's deletion
             logger.warning("memory_policy forget_audit_failed")
+
+    # -- the dashboard's door: see what is kept, and forget ONE exact item after an explicit confirmation ---------------------
+    #
+    # The same items, deletion, audit scrub and "forgotten" record as "forget ..." in chat (`_items`, `_forget_item`); only the
+    # way the user names the item differs - picked from a list instead of described in words. Two steps, both here (not in the
+    # page), so nothing can delete in one call: `prepare_forget` names the exact item and returns a single-use token;
+    # `confirm_forget(token)` deletes that item only if it still exists exactly as shown. No bulk path exists.
+
+    def remembered(self) -> list[dict]:
+        """What the user asked Jarvis to keep (preferences, notes, date of birth - never candidates), each with its exact
+        (kind, key), the wording Jarvis keeps it in, the stored value, and its provenance from the audit journal: when it was
+        saved, how (the user's command or statement), from where, and why."""
+        latest = {}
+        for entry in self.store.journal():  # newest first
+            if entry.action in ("persisted", "updated", "promoted") and (entry.kind, entry.key) not in latest:
+                latest[(entry.kind, entry.key)] = entry
+        facts = self.memory.get_facts()
+        preferences = {p.id: p for p in self.world_model.get_preferences()}
+        shown = []
+        for item in self._items():
+            kind = Kind.PREFERENCE.value if item.kind == "preference" else Kind.FACT.value
+            entry = latest.get((kind, item.key))
+            preference = preferences.get(item.ref) if item.ref else None
+            shown.append({
+                "kind": item.kind,
+                "id": item.ref or item.key,
+                "key": item.key,
+                "text": self._shown(item.text),
+                "value": preference.value if preference is not None else facts.get(item.key),
+                "category": preference.category if preference is not None else None,
+                "source": _value_of(preference.source) if preference is not None else None,
+                "provenance": None if entry is None else {
+                    "saved_at": entry.at, "action": entry.action, "origin": entry.origin, "source": entry.source,
+                    "reason": entry.reason, "destination": entry.destination,
+                },
+            })
+        return shown
+
+    def history(self, limit: int = 30) -> list[dict]:
+        """The memory audit journal, newest first: what was kept, updated, staged, refused or forgotten, and why. A forgotten
+        item's content was scrubbed when it was forgotten - only the record that it was forgotten remains."""
+        return [
+            {"at": e.at, "action": e.action, "kind": e.kind, "key": e.key, "value": e.value, "origin": e.origin,
+             "destination": e.destination, "reason": e.reason}
+            for e in self.store.journal()[: max(1, min(int(limit), 200))]
+        ]
+
+    def prepare_forget(self, kind: str, item_id: str) -> dict | None:
+        """Step 1: the exact item the user picked, and a single-use token to confirm forgetting it - or None when no item with
+        exactly that (kind, id) is kept - a preference's id, a note's key (a candidate, a typo, something already forgotten). Nothing is
+        deleted here."""
+        item = self._exact_item(kind, item_id)
+        if item is None:
+            return None
+        token = secrets.token_urlsafe(18)
+        with self._pending_lock:
+            now = time.monotonic()
+            for stale in [t for t, (_, _, made) in self._forget_tokens.items() if now - made > FORGET_CONFIRM_SECONDS]:
+                del self._forget_tokens[stale]
+            self._forget_tokens[token] = (item.kind, item.ref or item.key, now)
+        return {"token": token, "kind": item.kind, "id": item.ref or item.key, "key": item.key, "text": self._shown(item.text),
+                "expires_in_seconds": FORGET_CONFIRM_SECONDS}
+
+    def confirm_forget(self, token: str) -> dict:
+        """Step 2: forget the ONE item the token was issued for - if the token is current and the item still exists exactly.
+        Returns {"forgotten": bool, "message": ...}. A token works once."""
+        with self._pending_lock:
+            found = self._forget_tokens.pop(token, None) if isinstance(token, str) else None
+        if found is None or time.monotonic() - found[2] > FORGET_CONFIRM_SECONDS:
+            return {"forgotten": False, "message": "That confirmation has expired or was already used - nothing was forgotten."}
+        item = self._exact_item(found[0], found[1])
+        if item is None:
+            return {"forgotten": False, "message": "That item is no longer kept - nothing was forgotten."}
+        self._forget_item(item)
+        return {"forgotten": True, "message": f"Done - I've forgotten that. ({self._shown(item.text)})"}
+
+    def _exact_item(self, kind: object, item_id: object) -> _Item | None:
+        if not isinstance(kind, str) or not isinstance(item_id, str) or not item_id:
+            return None
+        matches = [i for i in self._items() if i.kind == kind and (i.ref or i.key) == item_id]
+        return matches[0] if len(matches) == 1 else None
 
     def command_reply(self, message: str, conversation_id: str | None = None) -> str | None:
         """If `message` is an explicit memory command ("remember that ...", "set
@@ -588,3 +674,7 @@ class MemoryWriteService:
             )
         except Exception:  # noqa: BLE001 - an audit fault must not undo or block the user's write
             logger.warning("memory_policy journal_failed")
+
+
+def _value_of(item: object) -> object:
+    return getattr(item, "value", item)

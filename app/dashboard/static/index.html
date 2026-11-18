@@ -107,18 +107,19 @@
       </div>
 
       <div class="tab-panel" data-panel="memory" hidden>
-        <section class="card" aria-label="Remembered facts">
-          <div class="card-head"><h2>What Jarvis remembers</h2><span class="badge" id="fact-count">0</span></div>
-          <ul class="list" id="fact-list"></ul>
-        </section>
-        <section class="card" aria-label="Preferences">
-          <div class="card-head"><h2>Preferences</h2></div>
-          <ul class="list" id="preference-list"></ul>
+        <section class="card" aria-label="What you told me to keep">
+          <div class="card-head"><h2>What you told me to keep</h2><span class="badge" id="kept-count">0</span></div>
+          <p class="hint">Exactly as I keep it, with where it came from. Forget removes that one item only, after you confirm.</p>
+          <ul class="list" id="kept-list"></ul>
         </section>
         <section class="card" aria-label="Not confirmed">
           <div class="card-head"><h2>Not confirmed yet</h2><span class="badge" id="candidate-count">0</span></div>
           <p class="hint">Things Jarvis noticed but is not sure about. Nothing here is used as a fact.</p>
           <ul class="list" id="candidate-list"></ul>
+        </section>
+        <section class="card" aria-label="Recent memory changes">
+          <div class="card-head"><h2>Recent memory changes</h2></div>
+          <ul class="list" id="memory-history"></ul>
         </section>
       </div>
 

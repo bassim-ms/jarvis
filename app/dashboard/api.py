@@ -103,6 +103,9 @@ class DashboardSources:
     world_model: Any = None  # WorldModelService (its .store lists every entity)
     memory_candidates: Callable[[], list] | None = None  # MemoryWriteService.candidates_for_context - staged, unconfirmed
     diagnostics: Any = None  # app.diagnostics.Diagnostics - health report, verified backups (spec 452, 456-458, 460)
+    # The memory write policy (MemoryWriteService): the ONLY way the dashboard changes memory - list what is kept with its
+    # provenance, and forget one exact item in two confirmed steps (spec 93, 104). The dashboard never deletes memory itself.
+    memory_policy: Any = None
 
 
 class NewTask(BaseModel):
@@ -113,6 +116,15 @@ class NewTask(BaseModel):
 
 class TaskAction(BaseModel):
     """The (empty) JSON body of a task action: a body keeps every change a JSON request."""
+
+
+class ForgetPick(BaseModel):
+    kind: str = Field(min_length=1, max_length=20)
+    id: str = Field(min_length=1, max_length=300)
+
+
+class ForgetConfirm(BaseModel):
+    token: str = Field(min_length=1, max_length=100)
 
 
 def _is_loopback_origin(value: str) -> bool:
@@ -446,7 +458,30 @@ def build_dashboard_router(sources: DashboardSources) -> APIRouter:
                  "created_at": c.created_at}
                 for c in candidates
             ],
+            # What the user asked Jarvis to keep, worded as Jarvis keeps it, with provenance (spec 93) - and the audit history.
+            "remembered": sources.memory_policy.remembered() if sources.memory_policy is not None else [],
+            "history": sources.memory_policy.history(30) if sources.memory_policy is not None else [],
         }
+
+    # Forgetting ONE exact item, in two steps owned by the memory policy (spec 104): prepare names the item and issues a
+    # single-use token; only confirm with that token forgets it - through the policy's own deletion, audit scrub and record.
+    @router.post("/api/memory/forget/prepare", dependencies=[Depends(require_dashboard_request)])
+    def memory_forget_prepare(body: ForgetPick) -> dict:
+        if sources.memory_policy is None:
+            raise HTTPException(status_code=404, detail="memory editing is not available")
+        prepared = sources.memory_policy.prepare_forget(body.kind, body.id)
+        if prepared is None:
+            raise HTTPException(status_code=404, detail="That item is not kept - nothing to forget.")
+        return prepared
+
+    @router.post("/api/memory/forget/confirm", dependencies=[Depends(require_dashboard_request)])
+    def memory_forget_confirm(body: ForgetConfirm) -> dict:
+        if sources.memory_policy is None:
+            raise HTTPException(status_code=404, detail="memory editing is not available")
+        result = sources.memory_policy.confirm_forget(body.token)
+        if not result["forgotten"]:
+            raise HTTPException(status_code=409, detail=result["message"])
+        return result
 
     @router.get("/api/world")
     def world() -> dict:

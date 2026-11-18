@@ -165,6 +165,30 @@ a stub AI provider: chat round-trip and reload, a reminder set by chat appearing
 Job pause and its plan staying open across refreshes, every tab with seeded data, automation disable / enable, phone width
 (no sideways scrolling).
 
+## Memory you control: what is kept, where it came from, and forgetting one item (spec 93, 104)
+
+The dashboard's **Memory** tab lists **what you told Jarvis to keep** - preferences, notes and your date of birth, worded the way
+Jarvis keeps them, with the stored value and **where each came from** (from the memory policy's audit journal: "you asked me to
+remember it" / "you told me", and when). Unconfirmed candidates are shown separately and are never treated as kept. **Recent
+memory changes** shows the audit journal: kept, updated, staged, refused, forgotten - and why.
+
+**Forget** removes ONE item you picked, in two steps the memory policy itself enforces (`MemoryWriteService.prepare_forget` /
+`confirm_forget`): the first names the exact item and issues a single-use token valid for 5 minutes (nothing is deleted); the
+browser then asks "Forget this? It cannot be undone." showing the item exactly as kept; only confirming with that token
+forgets it - through the same deletion and audit path as saying "forget ..." in chat. A preference is identified by its own id
+and a note by its exact key, so a similar item (e.g. "my dog is called Max" next to "my dog is called Max Junior") is never
+removed with it. There is no way to forget everything at once, and the dashboard never deletes memory itself.
+
+Forgetting now also erases the item's **key** from the audit journal (a note's key is made from its own words, e.g.
+`note:my_printer_nozzle_is_0_4`), replacing it with an opaque `forgotten:<random>` reference, and deletes any staged candidate
+for it (whose evidence is your sentence). This applies to "forget ..." in chat too. Items forgotten before this change keep
+their old key in the journal (their values were already scrubbed).
+
+Tests: `tests/test_memory_editing.py` (31: provenance, exact matching, near-duplicates, two preferences with one key, single-use
+and expiring tokens, missing / candidate / wrong-kind items, an item removed between the two steps, audit history, nothing on
+disk still naming the forgotten item, persistence across a restart, the dashboard's two steps and cross-site refusals, no bulk
+path). Checked in a real browser against the real app in a sandbox: Cancel keeps the item, OK forgets exactly that one.
+
 ## Reliability: health report and verified backups (spec 452, 456-458, 460)
 
 The dashboard's **System** tab (and `GET /api/system`) reports, read-only:
