@@ -15,11 +15,11 @@ M16.2.
 Uses the existing AIProvider/provider-routing architecture (app/
 providers/) exactly as app.capability.GeminiCapabilityDecisionProvider
 and app.tools.decision.GeminiToolCallProvider already do for their own
-strict-JSON needs - via `call_with_requirements` with
-RequestRequirements(structured_output=True), which ProviderRouter
-(app/providers/router.py) hard-gates to a provider that's actually been
-engineered and validated for that (today, Gemini - see
-app/providers/capabilities.py) - never a second AI client, never a
+strict-JSON needs - via `call_structured` (app/providers/manager.py)
+with RequestRequirements(structured_output=True): the providers are
+asked in the fixed configured order, and a reply that fails this
+module's own strict validation sends the request on to the next one
+(nothing is promoted for the task) - never a second AI client, never a
 hardcoded provider class here. `LLMContextReasoner` takes its
 AIProvider as a required constructor argument rather than defaulting to
 one internally, so it is always routed through whatever provider/
@@ -46,7 +46,7 @@ from app.context_reasoning.base import (
 from app.context_reasoning.deterministic import DeterministicAnalysis, analyze
 from app.context_reasoning.prompt import build_reasoning_prompt, collect_allowed_provenance
 from app.providers.base import AIProvider, ProviderError
-from app.providers.manager import call_with_requirements
+from app.providers.manager import call_structured
 from app.providers.requirements import RequestRequirements, TaskType
 from app.world_model.base import CANDIDATE_PROVENANCE_PREFIX, ContextSnapshot
 
@@ -325,10 +325,14 @@ class LLMContextReasoner(ContextReasoner):
             reasoning=True,
         )
         try:
-            raw = call_with_requirements(self.provider, prompt, requirements)
+            # A reply that fails `_parse_and_validate` sends the request to the next provider in the fixed order.
+            return call_structured(
+                self.provider,
+                prompt,
+                lambda raw: _parse_and_validate(raw, allowed_provenance),
+                requirements=requirements,
+            )
         except ProviderError as exc:
             raise ContextReasonerError(
                 f"Failed to get a reasoning result: {exc}"
             ) from exc
-
-        return _parse_and_validate(raw, allowed_provenance)

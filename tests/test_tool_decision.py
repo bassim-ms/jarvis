@@ -361,11 +361,10 @@ def test_all_providers_failing_raises_one_clear_tool_call_error():
     assert "groq" in message
 
 
-def test_malformed_reply_from_fallback_provider_is_not_retried_further():
-    """A fallback provider answering with garbage is a VALIDATION failure,
-    not a provider failure - AIProviderManager already returned
-    successfully once groq answered, so this must fail immediately and
-    never reach a third configured provider."""
+def test_malformed_reply_from_a_provider_moves_on_to_the_next_in_order():
+    """A provider answering with garbage is a VALIDATION failure: its reply is never used as a result, that provider is
+    not asked again, and the request goes on to the next provider in the configured order - whose valid reply is what
+    is returned."""
     from app.providers.manager import AIProviderEntry, AIProviderManager
 
     gemini = FakeAIProvider(error=ProviderError("Gemini returned 429: quota exceeded"))
@@ -380,10 +379,27 @@ def test_malformed_reply_from_fallback_provider_is_not_retried_further():
     )
     tool_call_provider = GeminiToolCallProvider(provider=manager)
 
-    with pytest.raises(ToolCallError, match="Invalid JSON"):
+    call = tool_call_provider.decide("use tool add 2 3", [AddTool()])
+
+    assert call.tool_name == "add" and call.parameters == {"a": 1, "b": 1}
+    assert third.last_message is not None  # reached, in order, after groq's garbage
+    assert manager.get_health()[1].healthy is True  # a bad reply is not a provider-health event
+
+
+def test_when_every_provider_answers_garbage_the_validation_error_still_surfaces():
+    """Nothing is repaired or guessed: with no acceptable reply anywhere in the chain, the caller gets the same
+    ToolCallError it always got for invalid JSON."""
+    from app.providers.manager import AIProviderEntry, AIProviderManager
+
+    first = FakeAIProvider(reply="not json at all")
+    second = FakeAIProvider(reply='{"tool_name": "no_such_tool", "parameters": {}}')
+    manager = AIProviderManager([AIProviderEntry("first", first), AIProviderEntry("second", second)])
+    tool_call_provider = GeminiToolCallProvider(provider=manager)
+
+    with pytest.raises(ToolCallError):
         tool_call_provider.decide("use tool add 2 3", [AddTool()])
 
-    assert third.last_message is None  # never reached - no retry past validation
+    assert first.last_message is not None and second.last_message is not None  # each asked exactly once
 
 
 # --- Dependency injection / defaults --------------------------------------------

@@ -64,6 +64,7 @@ from app.handle_this.signals import (
     extract_constraints,
 )
 from app.providers.base import AIProvider, ProviderError
+from app.providers.manager import call_structured
 
 
 class InterpretationError(RuntimeError):
@@ -218,10 +219,10 @@ class LLMGoalInterpreter(GoalInterpreter):
             "Reply with the JSON object now."
         )
         try:
-            raw = self.provider.generate_reply(prompt)
+            # A reply that fails `validate_interpretation` sends the request to the next provider in the fixed order.
+            return call_structured(self.provider, prompt, lambda raw: validate_interpretation(raw, message))
         except ProviderError as exc:
             raise InterpreterUnavailableError("the interpreter is unavailable") from exc
-        return validate_interpretation(raw, message)
 
 
 def _normalize(text: str) -> str:

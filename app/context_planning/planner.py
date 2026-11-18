@@ -18,10 +18,11 @@ it directly.
 Uses the existing AIProvider/provider-routing architecture (app/
 providers/) exactly as app.context_reasoning.reasoner.LLMContextReasoner
 already does for M16.3's own structured-output needs - via
-`call_with_requirements` with RequestRequirements(structured_output=True),
-which ProviderRouter (app/providers/router.py) hard-gates to a provider
-actually engineered/validated for that (today, Gemini - see
-app/providers/capabilities.py) - never a second AI client, never a
+`call_structured` (app/providers/manager.py) with
+RequestRequirements(structured_output=True): the providers are asked in
+the fixed configured order, and a reply that fails this module's own
+strict validation sends the request on to the next one (nothing is
+promoted for the task) - never a second AI client, never a
 hardcoded provider class here. `LLMContextPlanner` takes its AIProvider
 as a required constructor argument, so it is always routed through
 whatever provider/provider-manager the caller (normally JarvisCore)
@@ -48,7 +49,7 @@ from app.context_reasoning.base import ReasoningResult
 from app.context_reasoning.deterministic import DeterministicAnalysis, analyze
 from app.context_reasoning.prompt import collect_allowed_provenance
 from app.providers.base import AIProvider, ProviderError
-from app.providers.manager import call_with_requirements
+from app.providers.manager import call_structured
 from app.providers.requirements import RequestRequirements, TaskType
 from app.world_model.base import ContextSnapshot
 
@@ -307,10 +308,14 @@ class LLMContextPlanner(ContextPlanner):
             reasoning=True,
         )
         try:
-            raw = call_with_requirements(self.provider, prompt, requirements)
+            # A reply that fails `_parse_and_validate` sends the request to the next provider in the fixed order.
+            return call_structured(
+                self.provider,
+                prompt,
+                lambda raw: _parse_and_validate(raw, allowed_provenance),
+                requirements=requirements,
+            )
         except ProviderError as exc:
             raise ContextPlanningError(
                 f"Failed to get a planning directive: {exc}"
             ) from exc
-
-        return _parse_and_validate(raw, allowed_provenance)

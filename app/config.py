@@ -72,6 +72,10 @@ class Settings(BaseSettings):
     # own Gemini key), which Jarvis never sees. The base URL is genuinely
     # configurable, unlike the fixed vendor URLs above, since this is a
     # locally-hosted address the user controls.
+    # This DEFAULT is the Docker Compose address (3001), kept so an existing
+    # Docker setup keeps working. The Windows desktop app listens on
+    # 127.0.0.1:31415 instead - .env.example sets that - see README
+    # "FreeLLMAPI addresses: the code default vs. the desktop app".
     freellmapi_api_key: str = ""
     freellmapi_base_url: str = "http://localhost:3001/v1"
 
@@ -82,24 +86,38 @@ class Settings(BaseSettings):
     # Ordered, comma-separated list of provider names to try, with automatic
     # fallback to the next on failure; a name left out of this list is
     # effectively disabled. Same convention as JARVIS_SEARCH_PROVIDER_ORDER.
-    # Deliberately still the original four - FreeLLMAPI is NOT listed here.
+    # The four cloud providers only - FreeLLMAPI is NOT listed here.
     # factory.py:build_ai_provider_entries() derives the actual effective
     # order from this value, automatically appending "freellmapi" as the
     # final entry whenever JARVIS_FREELLMAPI_API_KEY is configured - so
     # this setting (and any pre-existing JARVIS_AI_PROVIDER_ORDER override
     # in .env) never needs to be touched to enable FreeLLMAPI.
-    ai_provider_order: str = "gemini,groq,openrouter,cloudflare"
-    # Extra attempts against the SAME provider for a transient (5xx) error
-    # before falling back to the next provider - 2 means up to 3 attempts
-    # total. Rate-limit/network/auth errors never retry the same provider.
-    ai_provider_retry_count: int = 2
+    #
+    # THE FIXED ORDER (the user's decision, 2026-10-31): Groq -> OpenRouter -> Gemini -> Cloudflare -> FreeLLMAPI. It applies
+    # to EVERY AI workflow: app/providers/router.py returns exactly this order for every kind of request and never promotes a
+    # provider for a task. Do not reorder, remove or promote a provider here without the user's explicit instruction.
+    ai_provider_order: str = "groq,openrouter,gemini,cloudflare"
+    # Extra attempts against the SAME provider for a transient (5xx) error before falling back to the next provider - 1 means
+    # up to 2 attempts total (was 2/3: with a slow provider that held every request back by three full attempts).
+    # Rate-limit/network/auth/timeout errors and a reply that fails the caller's validation never retry the same provider.
+    ai_provider_retry_count: int = 1
     ai_provider_retry_delay_seconds: float = 0.5
-    # How long a provider that returned a rate-limit (429) error is skipped
-    # for, in seconds, before the manager will try it again.
+    # How long a provider that returned a rate-limit (429) error is skipped for, in seconds, before the manager will try it
+    # again. When the provider itself says how long to wait (Gemini's daily-quota 429 says "retry in 10h58m"), THAT is used
+    # instead, capped at ai_provider_max_cooldown_seconds - so an exhausted daily quota is not re-asked every minute.
     ai_provider_cooldown_seconds: float = 60.0
+    ai_provider_max_cooldown_seconds: float = 86400.0
+    # How long ONE HTTP attempt to a provider may take (connect / send / wait for the reply), in seconds. Was a hard-coded
+    # 120 in every adapter, so a provider that accepted the request and never answered held the whole chain for two minutes.
+    ai_provider_timeout_seconds: float = 30.0
 
     # Memory (local SQLite persistence for conversations and user facts)
     memory_db_path: str = "jarvis_memory.db"
+    # How many of a conversation's most recent messages a chat reply's prompt carries. The whole conversation stays in the
+    # database, untouched - this only bounds what is SENT, so a long conversation no longer makes every reply slower,
+    # costlier and eventually too large for a provider. Long-term knowledge reaches the prompt through stored facts and the
+    # World Model context instead of through unbounded history. 0 = no limit (the old behaviour).
+    chat_history_max_messages: int = 40
 
     # Identity context (small, local, human-editable Markdown files - see
     # app/identity.py) - Jarvis's own personality and what it knows about

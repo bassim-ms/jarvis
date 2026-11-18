@@ -65,21 +65,20 @@ def test_handle_chat_delegates_to_provider():
 
 
 def test_default_provider_is_the_ai_provider_manager(monkeypatch):
-    """Since the AI Provider Manager integration, Core's own default
-    (when no provider is injected) is the ordered Gemini->Groq->
-    OpenRouter->Cloudflare fallback manager (app/providers/manager.py),
-    built from JARVIS_AI_PROVIDER_ORDER - not a bare GeminiProvider.
-    FreeLLMAPI is cleared so a key in the developer's .env does not
-    append it to the list."""
-    from app.config import settings
+    """Core's own default (when no provider is injected) is the ordered fallback manager (app/providers/manager.py),
+    built from JARVIS_AI_PROVIDER_ORDER - here the code default, the user's fixed Groq -> OpenRouter -> Gemini ->
+    Cloudflare - not a bare GeminiProvider. The order is pinned to the code default and FreeLLMAPI is cleared so the
+    developer's own .env decides neither."""
+    from app.config import Settings, settings
 
+    monkeypatch.setattr(settings, "ai_provider_order", Settings.model_fields["ai_provider_order"].default)
     monkeypatch.setattr(settings, "freellmapi_api_key", "")
     provider = JarvisCore().provider
     assert isinstance(provider, AIProviderManager)
     assert [health.name for health in provider.get_health()] == [
-        "gemini",
         "groq",
         "openrouter",
+        "gemini",
         "cloudflare",
     ]
 
@@ -1441,12 +1440,17 @@ def test_tool_path_all_providers_failing_raises_a_clear_error():
         jarvis.handle_chat("use tool add 2 and 3")
 
 
-def test_tool_path_malformed_fallback_reply_is_a_clean_error_not_a_retry_loop():
-    """A fallback provider that answers but with garbage must fail the
-    request cleanly (ToolCallError -> ProviderError) - AIProviderManager
-    already returned successfully, so this is a validation failure, not a
-    provider failure, and must NEVER be retried against a third
-    provider."""
+def test_tool_path_malformed_reply_moves_to_the_next_provider_and_the_tool_runs_exactly_once():
+    """A provider that answers but with garbage is passed over (its reply is never used as a result), the next provider
+    in the configured order constructs the call - and the tool itself runs exactly ONCE: asking a second provider for the
+    tool call must never execute anything twice."""
+    executions = []
+
+    class CountingAddTool(AddNumbersTool):
+        def execute(self, a: float = 0, b: float = 0) -> ToolResult:
+            executions.append((a, b))
+            return super().execute(a=a, b=b)
+
     gemini = FailableFakeProvider(errors=[ProviderError("Gemini returned 429: quota exceeded")])
     groq = FailableFakeProvider(reply="not json at all")
     third = FailableFakeProvider(reply='{"tool_name": "add", "parameters": {"a": 1, "b": 1}}')
@@ -1458,7 +1462,36 @@ def test_tool_path_malformed_fallback_reply_is_a_clean_error_not_a_retry_loop():
         ]
     )
     registry = ToolRegistry()
-    registry.register(AddNumbersTool())
+    registry.register(CountingAddTool())
+    jarvis = JarvisCore(
+        provider=manager,
+        memory=SQLiteMemoryStore(":memory:"),
+        tools=registry,
+        capability_router=FakeCapabilityRouter(Capability.TOOL, tool_name="add"),
+    )
+
+    reply = jarvis.handle_chat("use tool add 2 and 3")[0]
+
+    assert "2" in reply  # 1 + 1, from the third provider's valid call
+    assert (gemini.calls, groq.calls, third.calls) == (1, 1, 1)  # each asked once, in order
+    assert executions == [(1, 1)]  # the tool ran exactly once
+
+
+def test_tool_path_with_no_valid_reply_anywhere_is_a_clean_error_and_nothing_runs():
+    """Every provider answers garbage: a clean ProviderError (from ToolCallError), each provider asked exactly once - no
+    retry loop - and the tool never runs."""
+    executions = []
+
+    class CountingAddTool(AddNumbersTool):
+        def execute(self, a: float = 0, b: float = 0) -> ToolResult:
+            executions.append((a, b))
+            return super().execute(a=a, b=b)
+
+    first = FailableFakeProvider(reply="not json at all")
+    second = FailableFakeProvider(reply="still not json")
+    manager = AIProviderManager([AIProviderEntry("first", first), AIProviderEntry("second", second)])
+    registry = ToolRegistry()
+    registry.register(CountingAddTool())
     jarvis = JarvisCore(
         provider=manager,
         memory=SQLiteMemoryStore(":memory:"),
@@ -1469,9 +1502,8 @@ def test_tool_path_malformed_fallback_reply_is_a_clean_error_not_a_retry_loop():
     with pytest.raises(ProviderError, match="Invalid JSON"):
         jarvis.handle_chat("use tool add 2 and 3")
 
-    assert gemini.calls == 1
-    assert groq.calls == 1
-    assert third.calls == 0  # never reached - no retry past validation failure
+    assert (first.calls, second.calls) == (1, 1)
+    assert executions == []
 
 
 def test_tool_path_permission_enforcement_is_authoritative_after_fallback():

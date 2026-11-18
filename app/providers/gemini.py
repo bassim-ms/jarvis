@@ -34,7 +34,7 @@ class GeminiProvider(AIProvider):
                 url,
                 params={"key": settings.gemini_api_key},
                 json={"contents": [{"parts": [{"text": message}]}]},
-                timeout=120,
+                timeout=settings.ai_provider_timeout_seconds,
             )
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:

@@ -1,17 +1,17 @@
 """
-Tests for ProviderRouter (app/providers/router.py): the M13 deterministic
-hybrid routing layer - eligibility filtering, scoring, deterministic
-tie-breaking, and the safe-to-log RoutingDecision record. Uses plain fake
-AIProviderEntry objects only; ProviderRouter never calls generate_reply on
-anything (it only reorders), so no provider call - real or fake - should
-ever happen here, and no network call is made anywhere in this file.
+Tests for ProviderRouter (app/providers/router.py): the FIXED-ORDER rule. The router returns every entry in exactly the
+configured order for every kind of request - nothing is promoted for a capability, a long prompt or a latency preference -
+and records unavailable providers and capability matches as information only. Uses plain fake AIProviderEntry objects;
+ProviderRouter never calls generate_reply on anything, so no provider call - real or fake - happens here, and no network
+call is made anywhere in this file.
 """
 
 import pytest
 
+from app.capability import Capability
 from app.providers.base import AIProvider
 from app.providers.manager import AIProviderEntry
-from app.providers.requirements import LatencyPreference, RequestRequirements
+from app.providers.requirements import LatencyPreference, RequestRequirements, TaskType, classify_request
 from app.providers.router import ExcludedCandidate, ProviderRouter, RoutingDecision
 
 
@@ -28,7 +28,28 @@ def make_entries(names):
     return [AIProviderEntry(name=name, provider=_DummyProvider()) for name in names]
 
 
-ALL_FOUR = ["gemini", "groq", "openrouter", "cloudflare"]
+#: The user's fixed order.
+FIXED_ORDER = ["groq", "openrouter", "gemini", "cloudflare", "freellmapi"]
+#: The order this project shipped with before the fixed-order rule - still a valid configuration, and still honoured exactly.
+OLD_ORDER = ["gemini", "groq", "openrouter", "cloudflare"]
+
+#: Every kind of request a Jarvis workflow makes (see the call sites of `call_with_requirements` / `call_structured`).
+EVERY_KIND_OF_REQUEST = {
+    "plain": RequestRequirements(),
+    "chat with a long prompt (personality + profile)": classify_request("hello", capability=Capability.DIRECT, context_char_count=7284),
+    "chat, reasoning wording": classify_request("explain why", capability=Capability.DIRECT, context_char_count=7284),
+    "chat, coding wording": classify_request("fix this bug", capability=Capability.DIRECT, context_char_count=10),
+    "search answer": classify_request("news", capability=Capability.SEARCH, context_char_count=9000),
+    "tool call": classify_request("use tool x", capability=Capability.TOOL, context_char_count=10),
+    "strict JSON (reasoner / planner / Job plan)": RequestRequirements(
+        task_type=TaskType.STRUCTURED_OUTPUT, structured_output=True, reasoning=True
+    ),
+    "low latency": RequestRequirements(latency_preference=LatencyPreference.LOW),
+    "everything at once": RequestRequirements(
+        tool_use=True, structured_output=True, search_synthesis=True, long_context=True, reasoning=True,
+        latency_preference=LatencyPreference.LOW,
+    ),
+}
 
 
 @pytest.fixture
@@ -36,176 +57,112 @@ def router():
     return ProviderRouter()
 
 
-# --- 1. Basic provider selection --------------------------------------------
+# --- 1. The fixed order ------------------------------------------------------------------------------------------------
 
 
-def test_basic_selection_with_no_requirements_keeps_configured_order(router):
-    entries = make_entries(ALL_FOUR)
+@pytest.mark.parametrize("kind", sorted(EVERY_KIND_OF_REQUEST))
+@pytest.mark.parametrize("order", [FIXED_ORDER, OLD_ORDER, list(reversed(FIXED_ORDER))])
+def test_every_kind_of_request_gets_exactly_the_configured_order(router, kind, order):
+    decision = router.route(EVERY_KIND_OF_REQUEST[kind], make_entries(order), now=0.0)
 
-    decision = router.route(RequestRequirements(), entries, now=0.0)
-
-    assert decision.ordered_names == ALL_FOUR
-    assert decision.selected == "gemini"
-    assert decision.eligible == ALL_FOUR
+    assert decision.ordered_names == order
+    assert decision.selected == order[0]
+    assert decision.eligible == order
     assert decision.excluded == []
 
 
-# --- 2. Capability matching --------------------------------------------------
+def test_gemini_is_not_promoted_for_a_long_prompt_or_strict_json(router):
+    """The exact regression: with the fixed order, a chat carrying the personality/profile (over the long-context threshold)
+    and a strict-JSON request both used to put Gemini first."""
+    entries = make_entries(FIXED_ORDER)
+
+    for kind in ("chat with a long prompt (personality + profile)", "search answer", "tool call",
+                 "strict JSON (reasoner / planner / Job plan)"):
+        decision = router.route(EVERY_KIND_OF_REQUEST[kind], entries, now=0.0)
+        assert decision.ordered_names[0] == "groq", kind
+        assert decision.ordered_names.index("gemini") == 2, kind
 
 
-def test_capability_match_promotes_gemini_for_structured_output(router):
-    entries = make_entries(ALL_FOUR)
-    requirements = RequestRequirements(structured_output=True)
+def test_groq_is_not_promoted_for_a_latency_preference(router):
+    decision = router.route(RequestRequirements(latency_preference=LatencyPreference.LOW), make_entries(OLD_ORDER), now=0.0)
 
-    decision = router.route(requirements, entries, now=0.0)
-
-    assert decision.selected == "gemini"
-    assert decision.scores["gemini"] == 2
-    assert {c.name for c in decision.excluded} == {"groq", "openrouter", "cloudflare"}
-    for excluded in decision.excluded:
-        assert excluded.reason == "missing capability: structured_output"
-
-
-# --- 3. Latency preference ---------------------------------------------------
-
-
-def test_latency_preference_promotes_groq_even_though_it_is_not_first(router):
-    entries = make_entries(ALL_FOUR)  # groq is index 1, not first
-    requirements = RequestRequirements(latency_preference=LatencyPreference.LOW)
-
-    decision = router.route(requirements, entries, now=0.0)
-
-    assert decision.selected == "groq"
-    assert decision.scores["groq"] == 1
-    assert decision.scores["gemini"] == 0
-
-
-def test_latency_preference_normal_has_no_effect(router):
-    entries = make_entries(ALL_FOUR)
-
-    decision = router.route(
-        RequestRequirements(latency_preference=LatencyPreference.NORMAL), entries, now=0.0
-    )
-
-    assert decision.selected == "gemini"
-    assert all(score == 0 for score in decision.scores.values())
-
-
-# --- 4. Reasoning preference --------------------------------------------------
-
-
-def test_reasoning_preference_has_no_effect_since_no_provider_claims_it(router):
-    """Honest, deterministic degenerate case: no provider currently
-    declares ProviderCapability.REASONING (see capabilities.py's
-    docstring), so this soft signal is a documented, tested no-op today -
-    it never crashes and never changes selection, and will start
-    mattering automatically the moment a provider's capability set ever
-    adds REASONING, with no router code changes required."""
-    entries = make_entries(ALL_FOUR)
-
-    decision = router.route(RequestRequirements(reasoning=True), entries, now=0.0)
-
-    assert decision.selected == "gemini"
-    assert all(score == 0 for score in decision.scores.values())
-
-
-# --- 5. Tool-use requirement --------------------------------------------------
-
-
-def test_tool_use_requirement_hard_gates_to_gemini_only(router):
-    entries = make_entries(ALL_FOUR)
-
-    decision = router.route(RequestRequirements(tool_use=True), entries, now=0.0)
-
-    assert decision.eligible == ["gemini"]
-    assert decision.selected == "gemini"
-    assert {c.name for c in decision.excluded} == {"groq", "openrouter", "cloudflare"}
-
-
-# --- 6. Structured-output / search-synthesis requirements ---------------------
-
-
-def test_structured_output_requirement_hard_gates_to_gemini_only(router):
-    entries = make_entries(ALL_FOUR)
-
-    decision = router.route(RequestRequirements(structured_output=True), entries, now=0.0)
-
-    assert decision.eligible == ["gemini"]
+    assert decision.ordered_names == OLD_ORDER
     assert decision.selected == "gemini"
 
 
-def test_search_synthesis_requirement_is_a_soft_preference_not_a_hard_gate(router):
-    """search_synthesis deliberately does NOT exclude anyone (see
-    capabilities.py's docstring: turning search evidence into a cited
-    answer needs no structured/parseable output, so it's architecturally
-    no different from GENERAL_CONVERSATION) - it only nudges Gemini ahead
-    via score, and every other provider remains fully eligible."""
-    entries = make_entries(ALL_FOUR)
+# --- 2. Advisory information never changes the order ------------------------------------------------------------------
 
-    decision = router.route(RequestRequirements(search_synthesis=True), entries, now=0.0)
 
-    assert decision.selected == "gemini"
-    assert decision.scores["gemini"] == 2
-    assert decision.eligible == ALL_FOUR  # nobody excluded
+def test_capability_scores_are_recorded_but_advisory(router):
+    decision = router.route(RequestRequirements(structured_output=True, long_context=True), make_entries(FIXED_ORDER), now=0.0)
+
+    assert decision.scores["gemini"] == 4  # declared for both - recorded...
+    assert decision.scores["groq"] == 0
+    assert decision.ordered_names == FIXED_ORDER  # ...and the order is untouched
+
+
+def test_providers_unvalidated_for_strict_json_are_listed_not_excluded(router):
+    decision = router.route(RequestRequirements(tool_use=True), make_entries(FIXED_ORDER), now=0.0)
+
+    assert decision.unvalidated == ["groq", "openrouter", "cloudflare", "freellmapi"]
     assert decision.excluded == []
+    assert decision.eligible == FIXED_ORDER
 
 
-# --- 7. Unavailable (disabled) providers --------------------------------------
+def test_a_plain_request_lists_nobody_as_unvalidated(router):
+    decision = router.route(RequestRequirements(search_synthesis=True, long_context=True), make_entries(FIXED_ORDER), now=0.0)
+
+    assert decision.unvalidated == []
 
 
-def test_disabled_provider_is_excluded_but_still_in_final_order(router):
-    entries = make_entries(ALL_FOUR)
-    entries[0].health.enabled = False  # gemini
+# --- 3. Unavailable providers keep their place -------------------------------------------------------------------------
+
+
+def test_disabled_provider_is_recorded_and_keeps_its_place(router):
+    entries = make_entries(FIXED_ORDER)
+    entries[0].health.enabled = False  # groq
 
     decision = router.route(RequestRequirements(), entries, now=0.0)
 
-    assert decision.selected == "groq"
-    assert decision.ordered_names[-1] == "gemini"  # still attemptable as a last resort
-    assert ExcludedCandidate(name="gemini", reason="disabled") in decision.excluded
+    assert decision.ordered_names == FIXED_ORDER  # not moved to the back
+    assert decision.selected == "openrouter"  # the first AVAILABLE one, in order
+    assert decision.eligible == FIXED_ORDER[1:]
+    assert ExcludedCandidate(name="groq", reason="disabled") in decision.excluded
 
 
-# --- 8. Cooling-down providers -------------------------------------------------
-
-
-def test_cooling_down_provider_is_excluded_but_still_in_final_order(router):
-    entries = make_entries(ALL_FOUR)
-    entries[0].health.cooldown_until = 100.0  # gemini
+def test_cooling_down_provider_is_recorded_and_keeps_its_place(router):
+    entries = make_entries(FIXED_ORDER)
+    entries[1].health.cooldown_until = 100.0  # openrouter
 
     decision = router.route(RequestRequirements(), entries, now=50.0)
 
+    assert decision.ordered_names == FIXED_ORDER
     assert decision.selected == "groq"
-    assert decision.ordered_names[-1] == "gemini"
-    excluded_reasons = {c.name: c.reason for c in decision.excluded}
-    assert excluded_reasons["gemini"] == "cooling down (50s left)"
+    assert {c.name: c.reason for c in decision.excluded} == {"openrouter": "cooling down (50s left)"}
 
 
 def test_cooldown_that_has_expired_is_not_excluded(router):
-    entries = make_entries(ALL_FOUR)
+    entries = make_entries(FIXED_ORDER)
     entries[0].health.cooldown_until = 100.0
 
     decision = router.route(RequestRequirements(), entries, now=200.0)
 
-    assert decision.selected == "gemini"
+    assert decision.selected == "groq"
     assert decision.excluded == []
 
 
-# --- 9. All candidates excluded ------------------------------------------------
-
-
-def test_all_excluded_degrades_safely_to_configured_order(router):
-    entries = make_entries(ALL_FOUR)
+def test_all_unavailable_still_gives_the_configured_order(router):
+    entries = make_entries(FIXED_ORDER)
     for entry in entries:
         entry.health.enabled = False
 
     decision = router.route(RequestRequirements(tool_use=True), entries, now=0.0)
 
-    # Degrades to exactly the input order - plain M12 behavior - rather
-    # than raising or silently dropping anything.
-    assert decision.ordered_names == ALL_FOUR
+    assert decision.ordered_names == FIXED_ORDER
     assert decision.eligible == []
-    assert len(decision.excluded) == 4
-    assert decision.selected == "gemini"
-    assert "falling back to configured order" in decision.reason
+    assert len(decision.excluded) == 5
+    assert decision.selected == "groq"
+    assert "configured order" in decision.reason
 
 
 def test_empty_entries_list_selects_nothing(router):
@@ -215,38 +172,21 @@ def test_empty_entries_list_selects_nothing(router):
     assert decision.selected is None
 
 
-# --- 10. Deterministic tie-breaking --------------------------------------------
-
-
-def test_tie_break_falls_back_to_configured_order(router):
-    # groq before openrouter in this configured order - both score 0 with
-    # plain requirements, so groq must win on position alone.
-    entries = make_entries(["groq", "openrouter", "gemini", "cloudflare"])
-
-    decision = router.route(RequestRequirements(), entries, now=0.0)
-
-    assert decision.selected == "groq"
-
-
 def test_routing_is_deterministic_across_repeated_calls(router):
-    entries = make_entries(ALL_FOUR)
-    requirements = RequestRequirements(
-        tool_use=True, latency_preference=LatencyPreference.LOW
-    )
+    entries = make_entries(FIXED_ORDER)
+    requirements = RequestRequirements(tool_use=True, latency_preference=LatencyPreference.LOW)
 
     first = router.route(requirements, entries, now=10.0)
     second = router.route(requirements, entries, now=10.0)
 
-    assert first.ordered_names == second.ordered_names
-    assert first.scores == second.scores
-    assert first.selected == second.selected
+    assert first == second
 
 
-# --- 11. Routing decision record ------------------------------------------------
+# --- 4. Routing decision record -----------------------------------------------------------------------------------------
 
 
 def test_decision_record_shape(router):
-    entries = make_entries(ALL_FOUR)
+    entries = make_entries(FIXED_ORDER)
     requirements = RequestRequirements(structured_output=True)
 
     decision = router.route(requirements, entries, now=0.0)
@@ -258,14 +198,13 @@ def test_decision_record_shape(router):
     assert isinstance(decision.excluded, list)
     assert all(isinstance(c, ExcludedCandidate) for c in decision.excluded)
     assert isinstance(decision.scores, dict)
+    assert isinstance(decision.unvalidated, list)
     assert isinstance(decision.reason, str) and decision.reason
 
 
-# --- 12. No secrets in decision records -----------------------------------------
-
-
 def test_decision_record_never_contains_secret_shaped_text(router):
-    entries = make_entries(ALL_FOUR)
+    entries = make_entries(FIXED_ORDER)
+    entries[2].health.enabled = False
     requirements = RequestRequirements(tool_use=True, structured_output=True)
 
     decision = router.route(requirements, entries, now=0.0)
@@ -274,6 +213,7 @@ def test_decision_record_never_contains_secret_shaped_text(router):
         [decision.reason]
         + decision.ordered_names
         + decision.eligible
+        + decision.unvalidated
         + [f"{c.name}:{c.reason}" for c in decision.excluded]
     )
     for forbidden in ("Bearer", "Authorization", "api_key", "sk-", "token="):
@@ -284,7 +224,7 @@ def test_decision_record_never_holds_the_request_message(router):
     # RequestRequirements structurally never stores the raw message (see
     # requirements.py) - this pins that ProviderRouter doesn't add one
     # back in anywhere in the decision record.
-    entries = make_entries(ALL_FOUR)
+    entries = make_entries(FIXED_ORDER)
 
     decision = router.route(RequestRequirements(), entries, now=0.0)
 

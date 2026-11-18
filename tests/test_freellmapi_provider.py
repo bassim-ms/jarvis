@@ -39,7 +39,12 @@ def test_missing_key_does_not_raise_at_construction(monkeypatch):
     FreeLLMAPIProvider()  # must not raise
 
 
-def test_default_base_url_is_localhost_3001():
+def test_default_base_url_is_localhost_3001(monkeypatch):
+    # The code DEFAULT, not the developer's .env (which may point at the desktop app's 127.0.0.1:31415 instead).
+    from app.config import Settings
+
+    monkeypatch.setattr(freellmapi.settings, "freellmapi_base_url", Settings.model_fields["freellmapi_base_url"].default)
+
     assert freellmapi_url() == "http://localhost:3001/v1/chat/completions"
 
 

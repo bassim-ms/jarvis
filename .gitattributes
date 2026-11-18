@@ -1,0 +1,3 @@
+# Windows batch files must keep CRLF line endings: with LF-only endings cmd.exe can miss a `goto` label, and
+# Setup-Jarvis.bat relies on `goto failed` to stop at the step that failed.
+*.bat text eol=crlf

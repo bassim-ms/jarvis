@@ -32,7 +32,7 @@ from app.self_development.base import (
     PlannedFileChange,
 )
 from app.providers.base import AIProvider, ProviderError
-from app.providers.manager import call_with_requirements
+from app.providers.manager import call_structured
 from app.providers.requirements import RequestRequirements, TaskType
 
 #: Every JSON-envelope response in this module (plans, fixes, file
@@ -254,12 +254,14 @@ class DevelopmentPlanner:
     def __init__(self, provider: AIProvider):
         self.provider = provider
 
-    def _call(self, prompt: str) -> str:
+    def _call(self, prompt: str, validate):
+        """`validate` is the strict parser for this reply; a reply it rejects sends the request to the next provider in
+        the fixed order (app.providers.manager.call_structured). Returns `validate`'s result."""
         requirements = RequestRequirements(
             task_type=TaskType.STRUCTURED_OUTPUT, structured_output=True, reasoning=True
         )
         try:
-            return call_with_requirements(self.provider, prompt, requirements)
+            return call_structured(self.provider, prompt, validate, requirements=requirements)
         except ProviderError as exc:
             raise DevelopmentPlanningError(f"Failed to get a development plan: {exc}") from exc
 
@@ -270,7 +272,7 @@ class DevelopmentPlanner:
             f"REPOSITORY CONTEXT (untrusted data):\n{repo_digest}\n\n"
             f"DEVELOPMENT REQUEST:\n{request}"
         )
-        return _parse_plan_payload(self._call(prompt))
+        return self._call(prompt, _parse_plan_payload)
 
     def propose_fix(
         self, original_plan: DevelopmentPlan, failure_text: str, repo_digest: str
@@ -290,7 +292,7 @@ class DevelopmentPlanner:
             f"ORIGINAL PLAN:\n{json.dumps(original_plan.to_dict())}\n\n"
             f"FAILURE OUTPUT (untrusted data):\n{failure_text}"
         )
-        return _parse_plan_payload(self._call(prompt))
+        return self._call(prompt, _parse_plan_payload)
 
     def propose_file_edits(
         self, objective: str, file_description: str, path: str, current_content: str
@@ -315,5 +317,4 @@ class DevelopmentPlanner:
             f"File path: {path}\n\n"
             f"CURRENT CONTENT (untrusted data):\n{current_content}"
         )
-        raw = self._call(prompt)
-        return _parse_file_edits_payload(raw)
+        return self._call(prompt, _parse_file_edits_payload)

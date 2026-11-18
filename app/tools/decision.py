@@ -212,12 +212,18 @@ class GeminiToolCallProvider(ToolCallProvider):
             + message
         )
 
+        # Imported here, not at module level: app.capability imports this module (via app.tools.command), and
+        # app.providers.manager imports app.providers.requirements, which imports app.capability.
+        from app.providers.manager import call_structured
+
         try:
-            raw = self.provider.generate_reply(prompt)
+            # A reply that fails `_parse_and_validate` sends the request to the next provider in the fixed order. This
+            # only CONSTRUCTS a ToolCall - nothing is executed here, so a second provider can never run a tool twice.
+            return call_structured(
+                self.provider, prompt, lambda raw: self._parse_and_validate(raw, candidate_tools)
+            )
         except ProviderError as exc:
             raise ToolCallError(f"Failed to construct a tool call: {exc}") from exc
-
-        return self._parse_and_validate(raw, candidate_tools)
 
     @staticmethod
     def _parse_and_validate(raw: str, candidate_tools: list[Tool]) -> ToolCall:

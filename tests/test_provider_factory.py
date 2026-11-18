@@ -106,18 +106,41 @@ def test_describe_providers_freellmapi_base_url_reflects_configured_setting(monk
     assert infos["freellmapi"].base_url == "http://example.invalid:9000/v1/chat/completions"
 
 
-def test_default_ai_provider_order_is_still_just_the_original_four():
+def test_default_ai_provider_order_is_the_fixed_order_without_freellmapi():
     """Tests the code DEFAULT directly (via pydantic's own field
     introspection), not the live `settings` singleton - a real .env can
     (and often will) override JARVIS_AI_PROVIDER_ORDER, which must never
-    make this test environment-dependent. FreeLLMAPI is deliberately NOT
-    part of this default string - its inclusion is entirely driven by
-    _effective_provider_order() checking JARVIS_FREELLMAPI_API_KEY, not by
-    a static default (see the tests below)."""
+    make this test environment-dependent. The default is the user's FIXED
+    order (Groq -> OpenRouter -> Gemini -> Cloudflare). FreeLLMAPI is
+    deliberately NOT part of this default string - its inclusion, always
+    last, is entirely driven by _effective_provider_order() checking
+    JARVIS_FREELLMAPI_API_KEY, not by a static default (see the tests below)."""
     from app.config import Settings
 
     default_order = Settings.model_fields["ai_provider_order"].default
-    assert default_order.split(",") == ["gemini", "groq", "openrouter", "cloudflare"]
+    assert default_order.split(",") == ["groq", "openrouter", "gemini", "cloudflare"]
+
+
+def test_the_fixed_order_with_a_freellmapi_key_is_the_users_five_in_order(monkeypatch):
+    """Groq -> OpenRouter -> Gemini -> Cloudflare -> FreeLLMAPI: the code default plus a configured FreeLLMAPI key."""
+    from app.config import Settings
+
+    monkeypatch.setattr(factory.settings, "ai_provider_order", Settings.model_fields["ai_provider_order"].default)
+    monkeypatch.setattr(factory.settings, "freellmapi_api_key", "test-key")
+
+    assert factory._effective_provider_order() == ["groq", "openrouter", "gemini", "cloudflare", "freellmapi"]
+    assert [entry.name for entry in factory.build_ai_provider_entries()] == [
+        "groq", "openrouter", "gemini", "cloudflare", "freellmapi",
+    ]
+
+
+def test_default_retry_timeout_and_cooldown_policy_is_bounded():
+    from app.config import Settings
+
+    fields = Settings.model_fields
+    assert fields["ai_provider_retry_count"].default == 1  # at most 2 attempts at one provider
+    assert fields["ai_provider_timeout_seconds"].default == 30.0  # was a hard-coded 120 in every adapter
+    assert fields["ai_provider_max_cooldown_seconds"].default == 86400.0
 
 
 # --- _effective_provider_order() / build_ai_provider_entries() ----------------

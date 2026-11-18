@@ -37,6 +37,70 @@ uvicorn app.main:app --host 127.0.0.1
 | `JARVIS_SELF_DEV_ENABLED` | `false` | Wires the Self-Development Engine. Leave off: its approvals arrive over the anonymous `/chat`. |
 | `JARVIS_COMPUTER_INPUT_ENABLED` | `false` | Unchanged: the computer-input switch (and every action still needs a grant). |
 
+## AI providers: the fixed order (current behaviour)
+
+Every AI call in Jarvis - chat replies, search answers, context reasoning and planning, goal interpretation, Job planning and
+result checks, tool-call construction, self-development planning - goes through one `AIProviderManager`
+(`app/providers/manager.py`) and is tried in exactly this order, set by `JARVIS_AI_PROVIDER_ORDER`:
+
+**Groq -> OpenRouter -> Gemini -> Cloudflare -> FreeLLMAPI** (FreeLLMAPI is appended last whenever its key is set.)
+
+* **Nothing is promoted for a task.** `app/providers/router.py` used to score providers per request (a long prompt or a
+  strict-JSON request put Gemini first); it now returns the configured order every time and keeps capability matches as
+  advisory, logged information only.
+* **Strict-JSON replies are validated, and a bad one moves on.** Workflows that need JSON call `call_structured(...)` with
+  their own validator. A reply that fails it is never used as a result: the next provider in the same order is asked. If none
+  gives a valid reply, the workflow's own error is raised as before. Constructing a tool call or a plan never executes
+  anything, so asking another provider can never run a tool twice (tested).
+* **Bounded waiting.** One attempt may take `JARVIS_AI_PROVIDER_TIMEOUT_SECONDS` (30 s; it was a hard-coded 120 s). A 5xx is
+  retried `JARVIS_AI_PROVIDER_RETRY_COUNT` times (1) on the same provider; a timeout, network, auth or rate-limit error is not.
+  A rate-limited provider rests for as long as **it** says (Gemini's daily quota says "retry in 10h58m"; Groq's per-minute
+  limit says "try again in 450ms"), else `JARVIS_AI_PROVIDER_COOLDOWN_SECONDS` (60 s) - never less than 0 and never more
+  than `JARVIS_AI_PROVIDER_MAX_COOLDOWN_SECONDS` (24 h). The stated wait is read in milliseconds (`ms`, `msec`,
+  `milliseconds`), seconds (`s`, `sec`, `seconds`), minutes (`m`, `min`, `minutes`) and hours (`h`, `hr`, `hours`), whole or
+  decimal, alone or combined (`1h2m3.5s`, `1m30s500ms`, `1 minute and 30 seconds`); anything else (an unknown unit such as
+  "days", zero, no number) falls back to the 60 s default. (Before this fix "450ms" was misread as 450 *minutes*, which would
+  have rested Groq - the first provider - for 7.5 hours.)
+* **Bounded history.** A chat reply's prompt carries the last `JARVIS_CHAT_HISTORY_MAX_MESSAGES` (40) messages, and says
+  plainly when earlier ones are not shown. The stored conversation is never trimmed.
+* **A key is never called valid because it is non-empty.** `GET /providers/status` (and `installer\jarvis_setup.py check`,
+  which asks the running Jarvis on 127.0.0.1) reports each provider's `key_status` from the provider's most recent **real**
+  answer - nothing ever sends a test request to find out:
+
+  | `key_status` | Meaning |
+  |---|---|
+  | `no_key` | no key configured |
+  | `present_not_verified` | a key is set, but no request has reached this provider since Jarvis started (not yet checked) |
+  | `authenticated` | the provider's latest answer was a success: it accepted the key |
+  | `rejected` | the provider's latest answer was 401/403: authentication rejected (wrong, revoked or unauthorised key) |
+  | `unavailable` | the latest attempt failed for a reason that says nothing about the key - unreachable, timeout, 5xx, rate limit, an unusable reply - so the key is not verified |
+
+  A provider that is skipped (resting after a rate limit, or disabled) keeps its last status: it was not asked. The status
+  lives in memory only and starts again at `present_not_verified` each time Jarvis starts.
+
+### FreeLLMAPI addresses: the code default vs. the desktop app
+
+FreeLLMAPI can run in two ways, on two different addresses. Jarvis uses whichever `JARVIS_FREELLMAPI_BASE_URL` names:
+
+| Where the address comes from | Address | When it is right |
+|---|---|---|
+| **Code default** (`app/config.py`, used only when `.env` does not set `JARVIS_FREELLMAPI_BASE_URL`) | `http://localhost:3001/v1` | FreeLLMAPI run with **Docker Compose**, its original setup |
+| **`.env.example`** - and this laptop's `.env` | `http://127.0.0.1:31415/v1` | the **Windows desktop app** (`FreeLLMAPI.exe`), which listens on 127.0.0.1:31415 by default; its actual port is in `%APPDATA%\FreeLLMAPI\config.json` |
+
+The code default was deliberately left at 3001 so an existing Docker setup keeps working unchanged
+(`tests/test_freellmapi_provider.py` pins it); a new install gets 31415 from `.env.example`. If FreeLLMAPI does not answer,
+compare `JARVIS_FREELLMAPI_BASE_URL` with the port in that `config.json`. Either way the key is FreeLLMAPI's own key from its
+**Keys** page (not one of the provider keys FreeLLMAPI holds), and FreeLLMAPI is always tried last.
+
+Tests: `tests/test_provider_fixed_order.py` (every request kind, a failure at every position, validation fallback, retry,
+timeout and cooldown bounds including every duration unit, the tool-runs-once guarantee), `tests/test_provider_router.py`
+and `tests/test_providers_status_endpoint.py` (the key status, end to end through the real FreeLLMAPI adapter).
+
+## Portable installer (requirement 901, foundation)
+
+`Setup-Jarvis.bat` / `Start-Jarvis.bat` and `installer/jarvis_setup.py` (`check`, `init`, `keys`, `migrate`, `package`,
+`launch`). See [installer/README.md](installer/README.md) for what it does and what has and has not been verified.
+
 ## Stack
 
 - **Python 3.11+** with **FastAPI** (web framework) and **uvicorn** (server

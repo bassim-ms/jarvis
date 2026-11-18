@@ -26,6 +26,7 @@ hardware control beyond that yet - those come in later milestones.
 """
 
 import logging
+import time
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Header, HTTPException
@@ -653,6 +654,54 @@ def dev_status() -> dict:
             {"id": session.id, "stage": session.stage.value, "dev_branch": session.dev_branch}
             for session in engine.sessions.values()
         ],
+    }
+
+
+@app.get("/providers/status")
+def providers_status() -> dict:
+    """Read-only state of the AI provider chain, in the exact order every AI call tries it: whether each provider has a key
+    and what its most recent REAL answer said about that key (`key_status`, see app/providers/manager.py KEY_STATUS_TEXT:
+    "no_key", "present_not_verified", "authenticated", "rejected" or "unavailable" - a non-empty key alone is only ever
+    "present_not_verified"), which are enabled and which are resting after a rate limit (and for how long).
+    Building this sends nothing to any provider. Names, models, booleans and counts only - never a key, a token, an
+    account id or a URL."""
+    from app.providers.factory import describe_providers
+    from app.providers.manager import KEY_STATUS_TEXT, AIProviderManager, key_status
+
+    manager = core.provider
+    if not isinstance(manager, AIProviderManager):
+        return {"order": [], "providers": [], "note": "no provider manager is wired"}
+    infos = {info.name: info for info in describe_providers()}
+    models = {
+        "groq": settings.groq_model, "openrouter": settings.openrouter_model, "gemini": settings.gemini_model,
+        "cloudflare": settings.cloudflare_model, "freellmapi": "auto",
+    }
+    now = time.monotonic()
+    providers = []
+    for position, health in enumerate(manager.get_health(), start=1):
+        info = infos.get(health.name)
+        resting = max(0.0, health.cooldown_until - now)
+        key_present = bool(info and info.configured)
+        status = key_status(key_present, health.key_check)
+        providers.append({
+            "position": position,
+            "name": health.name,
+            "display_name": info.display_name if info else health.name,
+            "model": models.get(health.name, ""),
+            "key_present": key_present,
+            "key_status": status,
+            "key_status_text": KEY_STATUS_TEXT[status],
+            "enabled": health.enabled,
+            "consecutive_failures": health.consecutive_failures,
+            "resting_seconds": round(resting),
+        })
+    return {
+        "order": [entry["name"] for entry in providers],
+        "providers": providers,
+        "retry_count": manager.retry_count,
+        "timeout_seconds": settings.ai_provider_timeout_seconds,
+        "default_cooldown_seconds": manager.cooldown_seconds,
+        "max_cooldown_seconds": manager.max_cooldown_seconds,
     }
 
 

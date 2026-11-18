@@ -163,4 +163,5 @@ def create_default_ai_provider_manager() -> AIProviderManager:
         retry_count=settings.ai_provider_retry_count,
         retry_delay_seconds=settings.ai_provider_retry_delay_seconds,
         cooldown_seconds=settings.ai_provider_cooldown_seconds,
+        max_cooldown_seconds=settings.ai_provider_max_cooldown_seconds,
     )

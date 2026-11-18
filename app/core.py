@@ -2129,6 +2129,7 @@ class JarvisCore:
         history: list[Message],
         facts: dict[str, str],
         max_messages: int | None = None,
+        note_omitted: bool = False,
         world_model_context: str = "",
         reasoning_context: str = "",
         planning_context: str = "",
@@ -2165,7 +2166,15 @@ class JarvisCore:
         if history:
             recent = history if max_messages is None else history[-max_messages:]
             history_text = "\n".join(f"{m.role}: {m.content}" for m in recent)
-            parts.append(f"Conversation so far:\n{history_text}")
+            omitted = len(history) - len(recent)
+            if note_omitted and omitted > 0:
+                # Said plainly, so the model never presents the shown window as the whole conversation.
+                parts.append(
+                    f"Conversation so far (the {len(recent)} most recent messages; {omitted} earlier "
+                    f"message{'s are' if omitted != 1 else ' is'} not shown):\n{history_text}"
+                )
+            else:
+                parts.append(f"Conversation so far:\n{history_text}")
         return "\n\n".join(parts)
 
     #: Every ContextSnapshot category this formatter knows how to
@@ -2404,9 +2413,14 @@ class JarvisCore:
         world_model_context = JarvisCore._format_world_model_context(context_snapshot)
         reasoning_context = JarvisCore._format_reasoning_result(reasoning_result)
         planning_context = JarvisCore._format_planning_directive(planning_directive)
+        # Bounded: only the most recent messages are sent (settings.chat_history_max_messages; 0 = all). The stored
+        # conversation is never trimmed - see the setting's comment in app/config.py.
+        limit = settings.chat_history_max_messages
         context = JarvisCore._format_context(
             history,
             facts,
+            max_messages=limit if limit and limit > 0 else None,
+            note_omitted=True,
             world_model_context=world_model_context,
             reasoning_context=reasoning_context,
             planning_context=planning_context,

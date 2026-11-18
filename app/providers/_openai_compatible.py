@@ -27,6 +27,7 @@ implementing AIProvider directly, which is what they do.
 
 import httpx
 
+from app.config import settings
 from app.providers.base import AIProvider, ProviderError
 
 
@@ -68,7 +69,7 @@ class OpenAICompatibleProvider(AIProvider):
                     "model": self._model(),
                     "messages": [{"role": "user", "content": message}],
                 },
-                timeout=120,
+                timeout=settings.ai_provider_timeout_seconds,
             )
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:

@@ -40,6 +40,7 @@ from app.orchestration.base import (
     REQUEST_CONTEXT_KEY,
 )
 from app.providers.base import AIProvider, ProviderError
+from app.providers.manager import call_structured
 from app.providers.gemini import GeminiProvider
 from app.tools.base import Tool
 
@@ -256,11 +257,11 @@ class GeminiPlanner(Planner):
         )
 
         try:
-            raw = self.provider.generate_reply(prompt)
+            # A reply that fails `_parse` sends the request to the next provider in the fixed order. Planning only: no
+            # step runs here, so asking a second provider for a plan can never execute anything twice.
+            return call_structured(self.provider, prompt, self._parse)
         except ProviderError as exc:
             raise PlanningError(f"Failed to get a plan: {exc}") from exc
-
-        return self._parse(raw)
 
     @staticmethod
     def _build_prompt(

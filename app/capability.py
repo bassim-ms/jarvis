@@ -568,14 +568,16 @@ class GeminiCapabilityDecisionProvider(CapabilityDecisionProvider):
     def decide(self, message: str) -> CapabilityDecision:
         prompt = _DECISION_PROMPT + message
 
+        # Imported here, not at module level: app.providers.manager imports app.providers.requirements, which imports this module.
+        from app.providers.manager import call_structured
+
         try:
-            raw = self.provider.generate_reply(prompt)
+            # A reply that fails `_parse_decision` sends the request to the next provider in the fixed order.
+            return call_structured(self.provider, prompt, self._parse_decision)
         except ProviderError as exc:
             raise CapabilityDecisionError(
                 f"Failed to get a capability decision: {exc}"
             ) from exc
-
-        return self._parse_decision(raw)
 
     @staticmethod
     def _parse_decision(raw: str) -> CapabilityDecision:

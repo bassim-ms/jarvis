@@ -48,7 +48,7 @@ class CloudflareProvider(AIProvider):
                 url,
                 headers={"Authorization": f"Bearer {settings.cloudflare_api_key}"},
                 json={"messages": [{"role": "user", "content": message}]},
-                timeout=120,
+                timeout=settings.ai_provider_timeout_seconds,
             )
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:

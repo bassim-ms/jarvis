@@ -44,6 +44,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.providers.base import AIProvider, ProviderError
+from app.providers.manager import call_structured
 
 #: How much of a step's stored result the evaluator is shown. Beyond this
 #: the text is cut and the model is told so (and the verdict records it).
@@ -140,11 +141,11 @@ class GeminiResultEvaluator(ResultEvaluator):
         )
 
         try:
-            raw = self.provider.generate_reply(prompt)
+            # A reply that fails `_parse` sends the request to the next provider in the fixed order.
+            verdict = call_structured(self.provider, prompt, self._parse)
         except ProviderError as exc:
             raise EvaluationError(f"the evaluator is unavailable: {exc}") from exc
 
-        verdict = self._parse(raw)
         return Evaluation(verdict.sufficient, verdict.reason, input_truncated=truncated)
 
     @staticmethod

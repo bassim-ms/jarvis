@@ -615,15 +615,11 @@ def test_generate_reply_without_requirements_is_unaffected_by_m13():
     assert manager.last_routing_decision is None
 
 
-def test_routing_selects_groq_then_m12_falls_back_after_groq_fails():
-    # Mirrors the M13 design's own example: router prefers groq (latency
-    # preference) even though it's not first in configured order, groq
-    # fails, and M12's existing fallback loop moves on to the next
-    # eligible provider in the router's order (openrouter beats gemini on
-    # the deterministic tie-break: both score 0, openrouter is earlier in
-    # configured order).
-    openrouter = FakeProvider(reply="from openrouter")
-    groq = FakeProvider(errors=[ProviderError("Groq returned 500: down")])
+def test_a_routed_request_keeps_the_configured_order_and_falls_back_along_it():
+    # The fixed-order rule: a latency preference no longer puts groq first - the configured order
+    # (openrouter, groq, gemini) is tried exactly as written, and a failure moves to the NEXT one in it.
+    openrouter = FakeProvider(errors=[ProviderError("OpenRouter returned 500: down")])
+    groq = FakeProvider(reply="from groq")
     gemini = FakeProvider(reply="from gemini")
     manager = AIProviderManager(
         [entry("openrouter", openrouter), entry("groq", groq), entry("gemini", gemini)],
@@ -634,26 +630,26 @@ def test_routing_selects_groq_then_m12_falls_back_after_groq_fails():
 
     reply = manager.generate_reply("hi", requirements=requirements)
 
-    assert reply == "from openrouter"
-    assert groq.calls == 1
-    assert gemini.calls == 0  # never reached - openrouter answered right after groq failed
-    assert manager.last_routing_decision.selected == "groq"
-    assert manager.last_routing_decision.ordered_names == ["groq", "openrouter", "gemini"]
+    assert reply == "from groq"
+    assert openrouter.calls == 1  # the first configured provider was asked first, despite groq's latency tier
+    assert gemini.calls == 0  # never reached - groq answered right after openrouter failed
+    assert manager.last_routing_decision.selected == "openrouter"
+    assert manager.last_routing_decision.ordered_names == ["openrouter", "groq", "gemini"]
 
 
-def test_routing_with_unsatisfiable_hard_requirement_degrades_to_configured_order():
+def test_a_strict_json_requirement_excludes_nobody_and_keeps_the_configured_order():
     first = FakeProvider(reply="from first")
     second = FakeProvider(reply="from second")
     manager = AIProviderManager([entry("first", first), entry("second", second)])
-    # Neither fake provider is a registered capability name, so
-    # structured_output can never be satisfied - routing must still fall
-    # back to the manager's own configured order rather than blocking.
+    # Neither fake provider is a registered capability name, so neither is "validated" for structured
+    # output - which is advisory only: both stay eligible, in the configured order.
     requirements = RequestRequirements(structured_output=True)
 
     reply = manager.generate_reply("hi", requirements=requirements)
 
     assert reply == "from first"
-    assert manager.last_routing_decision.eligible == []
+    assert manager.last_routing_decision.eligible == ["first", "second"]
+    assert manager.last_routing_decision.unvalidated == ["first", "second"]
     assert manager.last_routing_decision.ordered_names == ["first", "second"]
 
 
@@ -704,7 +700,8 @@ def test_call_with_requirements_routes_through_a_real_manager():
 
     reply = call_with_requirements(manager, "hi", requirements)
 
-    assert reply == "from groq"  # groq preferred: latency_preference=LOW
+    assert reply == "from gemini"  # the configured order: a latency preference promotes nobody
+    assert groq.calls == 0
     assert manager.last_routing_decision is not None
     assert manager.last_routing_decision.requirements is requirements
 

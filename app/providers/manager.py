@@ -39,17 +39,46 @@ rather than calling generate_reply() directly - see that function's own
 docstring for why.
 """
 
+import logging
 import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import TypeVar
 
 from app.providers.base import AIProvider, ProviderError
 from app.providers.requirements import RequestRequirements
 from app.providers.router import ProviderRouter, RoutingDecision
 
+_log = logging.getLogger("jarvis.providers")
+
 _STATUS_RE = re.compile(r"returned (\d{3}):")
+# How long the PROVIDER says to wait, as it appears in a rate-limit error body: Google's RetryInfo (`"retryDelay": "39507s"`)
+# or prose ("Please retry in 10h58m27.09s", "Please try again in 7m12s", "Please try again in 450ms",
+# "try again in 2 minutes").
+_RETRY_DELAY_FIELD_RE = re.compile(r'retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"')
+# One "<number><unit>" piece. The units, longest spelling first so "ms" is never read as "m" (minutes) followed by "s", and
+# the lookahead stops a unit that runs into more letters ("5 mo", "3 days") from counting as a shorter one.
+_UNIT_PATTERN = (
+    r"milliseconds?|millis|msecs?|ms"
+    r"|seconds?|secs?|s"
+    r"|minutes?|mins?|m"
+    r"|hours?|hrs?|h"
+)
+_DURATION_PART = rf"(\d+(?:\.\d+)?)\s*({_UNIT_PATTERN})(?![a-z])"
+_DURATION_PART_RE = re.compile(_DURATION_PART, re.IGNORECASE)
+_RETRY_PROSE_RE = re.compile(
+    rf"(?:retry|try again) in ((?:\d+(?:\.\d+)?\s*(?:{_UNIT_PATTERN})(?![a-z])[\s,]*(?:and\s+)?)+)", re.IGNORECASE
+)
+_SECONDS_PER_UNIT = {
+    **dict.fromkeys(("milliseconds", "millisecond", "millis", "msecs", "msec", "ms"), 0.001),
+    **dict.fromkeys(("seconds", "second", "secs", "sec", "s"), 1.0),
+    **dict.fromkeys(("minutes", "minute", "mins", "min", "m"), 60.0),
+    **dict.fromkeys(("hours", "hour", "hrs", "hr", "h"), 3600.0),
+}
+
+T = TypeVar("T")
 
 
 class ErrorCategory(str, Enum):
@@ -92,6 +121,58 @@ def classify_error(exc: BaseException) -> ErrorCategory:
     return ErrorCategory.OTHER
 
 
+def stated_retry_seconds(message: str) -> float | None:
+    """The wait a rate-limit error itself asks for, in seconds - or None when it names none. Reads only the two shapes
+    documented above, in milliseconds, seconds, minutes or hours (an integer or a decimal, alone or combined as in
+    "1h2m3.5s"). Anything else - no number, an unknown unit, zero, or a value too large to be a number - is None, and
+    the caller uses its own default cooldown. Never negative: the number pattern has no sign."""
+    match = _RETRY_DELAY_FIELD_RE.search(message)
+    if match:
+        seconds = float(match.group(1))
+    else:
+        match = _RETRY_PROSE_RE.search(message)
+        if not match:
+            return None
+        seconds = sum(
+            float(amount) * _SECONDS_PER_UNIT[unit.lower()] for amount, unit in _DURATION_PART_RE.findall(match.group(1))
+        )
+    return seconds if 0 < seconds < float("inf") else None
+
+
+class KeyCheck(str, Enum):
+    """What the provider's most recent REAL answer said about its key. Learned only from requests Jarvis was making anyway -
+    nothing ever sends a test request to find out - so until a provider has been used, it is NOT_CHECKED."""
+
+    NOT_CHECKED = "not_checked"  # no request has reached this provider since Jarvis started
+    AUTHENTICATED = "authenticated"  # its latest answer was a success: it accepted the key
+    REJECTED = "rejected"  # its latest answer was 401/403 (or the key is not set): the key was refused
+    UNAVAILABLE = "unavailable"  # its latest attempt failed for a reason that says nothing about the key (network, timeout,
+    #                              5xx, rate limit, an unusable reply) - the key is not verified by it
+
+
+#: The key status Jarvis reports for one provider (GET /providers/status, `installer/jarvis_setup.py check`). A non-empty key
+#: is never reported as working on its own: only a real successful answer makes it "authenticated".
+KEY_STATUS_TEXT: dict[str, str] = {
+    "no_key": "no key configured",
+    "present_not_verified": "key present, not verified",
+    "authenticated": "authenticated (the provider accepted the key)",
+    "rejected": "authentication rejected (the provider refused the key)",
+    "unavailable": "unavailable (the last attempt failed before the key could be checked)",
+}
+
+
+def key_status(key_present: bool, key_check: KeyCheck) -> str:
+    """One provider's key status, a KEY_STATUS_TEXT key. Presence alone is only ever "present_not_verified"."""
+    if not key_present:
+        return "no_key"
+    return {
+        KeyCheck.NOT_CHECKED: "present_not_verified",
+        KeyCheck.AUTHENTICATED: "authenticated",
+        KeyCheck.REJECTED: "rejected",
+        KeyCheck.UNAVAILABLE: "unavailable",
+    }[key_check]
+
+
 @dataclass
 class ProviderHealth:
     """Runtime, non-secret health state for one managed provider.
@@ -106,6 +187,8 @@ class ProviderHealth:
     healthy: bool = True
     consecutive_failures: int = 0
     cooldown_until: float = 0.0
+    #: See KeyCheck: updated by every real attempt, never by a test request.
+    key_check: KeyCheck = KeyCheck.NOT_CHECKED
 
     def in_cooldown(self, now: float) -> bool:
         return self.cooldown_until > now
@@ -177,6 +260,7 @@ class AIProviderManager(AIProvider):
         retry_count: int = 2,
         retry_delay_seconds: float = 0.5,
         cooldown_seconds: float = 60.0,
+        max_cooldown_seconds: float = 86400.0,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
     ):
@@ -190,6 +274,9 @@ class AIProviderManager(AIProvider):
         self.retry_count = retry_count
         self.retry_delay_seconds = retry_delay_seconds
         self.cooldown_seconds = cooldown_seconds
+        #: The ceiling on a cooldown the PROVIDER asks for (see `_cooldown_for`): a garbled or hostile "retry in 9999h"
+        #: can never park a provider for longer than this.
+        self.max_cooldown_seconds = max_cooldown_seconds
         self._clock = clock
         self._sleep = sleep
         # M13: set on every generate_reply() call made WITH `requirements`;
@@ -216,6 +303,28 @@ class AIProviderManager(AIProvider):
     def generate_reply(
         self, message: str, *, requirements: RequestRequirements | None = None
     ) -> str:
+        return self._first_acceptable(message, requirements, None)
+
+    def generate_validated(
+        self,
+        message: str,
+        validate: Callable[[str], T],
+        *,
+        requirements: RequestRequirements | None = None,
+    ) -> T:
+        """The first reply, in the fixed provider order, that `validate` accepts - returned as `validate`'s own result.
+
+        For a request whose reply must have a shape (strict JSON, a schema): `validate` is the caller's existing parser /
+        validator, and raises on a reply it rejects. A rejected reply is NOT a result: that provider is passed over for
+        this one request (no retry of the same provider, no cooldown, its health untouched) and the next provider in the
+        same order is asked. Nothing is repaired or guessed here.
+
+        If every provider failed and at least one of them DID answer but was rejected, the LAST rejection is re-raised
+        unchanged - so the caller's own error handling (its own exception type, its own fail-safe) runs exactly as it did
+        when it validated a single reply itself. If no provider answered at all, AllProvidersFailedError as usual."""
+        return self._first_acceptable(message, requirements, validate)
+
+    def _first_acceptable(self, message: str, requirements: RequestRequirements | None, validate):
         if requirements is None:
             # No stale decision from a previous routed call should ever
             # remain visible once a caller makes an unrouted request.
@@ -229,6 +338,7 @@ class AIProviderManager(AIProvider):
             order = [self._entry(name) for name in decision.ordered_names]
 
         errors: list[str] = []
+        last_rejection: Exception | None = None
 
         for entry in order:
             health = entry.health
@@ -251,17 +361,43 @@ class AIProviderManager(AIProvider):
                 # server's own console - never a key/URL/prompt, since exc
                 # is the same secret-safe message already used above.
                 print(f"[ai-provider-manager] {entry.name} failed, falling back: {exc}")
+                _log.warning("provider %s failed (%s); trying the next in order", entry.name, classify_error(exc).value)
                 errors.append(f"{entry.name}: {exc}")
                 continue
 
             health.consecutive_failures = 0
             health.healthy = True
-            print(f"[ai-provider-manager] answered by: {entry.name}")
-            return reply
 
+            if validate is None:
+                print(f"[ai-provider-manager] answered by: {entry.name}")
+                return reply
+            try:
+                accepted = validate(reply)
+            except Exception as rejection:  # noqa: BLE001 - the caller's validator decides; any refusal means "next provider"
+                last_rejection = rejection
+                # The exception's TYPE only: a validator's message can quote the reply.
+                print(f"[ai-provider-manager] {entry.name} answered but its reply failed validation "
+                      f"({type(rejection).__name__}), falling back")
+                _log.warning("provider %s reply rejected by the caller's validation (%s); trying the next in order",
+                             entry.name, type(rejection).__name__)
+                errors.append(f"{entry.name}: reply failed validation ({type(rejection).__name__})")
+                continue
+            print(f"[ai-provider-manager] answered by: {entry.name}")
+            return accepted
+
+        if last_rejection is not None:
+            raise last_rejection
         raise AllProvidersFailedError(
             "All AI providers failed: " + "; ".join(errors)
         )
+
+    def _cooldown_for(self, exc: ProviderError) -> float:
+        """How long to skip a rate-limited provider: what the provider itself asked for when it says (a daily-quota 429
+        names hours, and re-asking every minute only wastes a call each time), else the configured default - never more
+        than `max_cooldown_seconds`, and never negative (a misconfigured negative default or ceiling means "no rest")."""
+        stated = stated_retry_seconds(str(exc))
+        wait = self.cooldown_seconds if stated is None else stated
+        return max(0.0, min(wait, self.max_cooldown_seconds))
 
     def _call_with_retries(self, entry: AIProviderEntry, message: str) -> str:
         health = entry.health
@@ -270,17 +406,18 @@ class AIProviderManager(AIProvider):
         while True:
             attempts += 1
             try:
-                return entry.provider.generate_reply(message)
+                reply = entry.provider.generate_reply(message)
             except ProviderError as exc:
                 health.consecutive_failures += 1
                 category = classify_error(exc)
+                health.key_check = KeyCheck.REJECTED if category is ErrorCategory.AUTH else KeyCheck.UNAVAILABLE
 
                 if category is ErrorCategory.TRANSIENT and attempts <= self.retry_count:
                     self._sleep(self.retry_delay_seconds)
                     continue
 
                 if category is ErrorCategory.RATE_LIMIT:
-                    health.cooldown_until = self._clock() + self.cooldown_seconds
+                    health.cooldown_until = self._clock() + self._cooldown_for(exc)
 
                 health.healthy = False
                 raise
@@ -296,9 +433,13 @@ class AIProviderManager(AIProvider):
                 # (KeyboardInterrupt, SystemExit) are not caught here.
                 health.consecutive_failures += 1
                 health.healthy = False
+                health.key_check = KeyCheck.UNAVAILABLE
                 raise UnexpectedProviderError(
                     f"unexpected {type(exc).__name__} (not a ProviderError)"
                 ) from None
+            # A real answer: whatever the caller later thinks of its content, the provider accepted the key.
+            health.key_check = KeyCheck.AUTHENTICATED
+            return reply
 
 
 def call_with_requirements(
@@ -321,3 +462,23 @@ def call_with_requirements(
     if isinstance(provider, AIProviderManager):
         return provider.generate_reply(message, requirements=requirements)
     return provider.generate_reply(message)
+
+
+def call_structured(
+    provider: AIProvider,
+    message: str,
+    validate: Callable[[str], T],
+    *,
+    requirements: RequestRequirements | None = None,
+) -> T:
+    """Ask for a reply that must pass `validate` (the caller's own strict parser), and return `validate`'s result.
+
+    THE one seam for every strict-JSON workflow (capability decision, tool-call construction, context reasoning and
+    planning, goal interpretation, Job planning, result evaluation, self-development planning): with the application's
+    AIProviderManager, a reply that fails validation sends the request to the NEXT provider in the fixed order (see
+    AIProviderManager.generate_validated) instead of failing the whole request on the first provider's bad JSON. With any
+    other AIProvider (a test fake, a single injected provider) it is exactly what every caller did before: one call, then
+    `validate` on its reply, the validator's own exception propagating unchanged."""
+    if isinstance(provider, AIProviderManager):
+        return provider.generate_validated(message, validate, requirements=requirements)
+    return validate(provider.generate_reply(message))
