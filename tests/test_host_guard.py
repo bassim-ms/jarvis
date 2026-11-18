@@ -199,6 +199,7 @@ ROUTES = [
     ("POST", "/chat", {"message": "hello"}), ("POST", "/device/chat", {"message": "hello"}), ("POST", "/device/check-in", None),
 ]
 HOSTILE = ["evil.example", "evil.example:8000", "localhost.evil.example", "192.168.1.5:8000", "0.0.0.0:8000", "testserver"]
+GUARD_REFUSAL = "Forbidden: this server only answers requests addressed to a loopback Host."
 
 
 def test_the_production_app_has_the_guard_and_not_starlettes_port_stripping_one():
@@ -260,7 +261,8 @@ def test_the_guard_covers_every_route_the_application_actually_has_including_doc
     for route in main.app.routes:
         methods = sorted((getattr(route, "methods", None) or {"GET"}) - {"HEAD", "OPTIONS"}) or ["GET"]
         routes[route.path] = methods[0]
-    assert {"/chat", "/device/chat", "/device/check-in", "/health", "/dev/ping", "/dev/status", "/docs", "/redoc", "/openapi.json"} <= set(routes)
+    assert {"/chat", "/device/chat", "/device/check-in", "/health", "/dev/ping", "/dev/status", "/docs", "/redoc", "/openapi.json",
+            "/", "/dashboard", "/api/overview", "/api/tasks", "/providers/status"} <= set(routes)
 
     real_core = main.core
     monkeypatch.setattr(main, "core", Tripwire())  # hostile phase: if any request got through, the core would blow up
@@ -274,7 +276,10 @@ def test_the_guard_covers_every_route_the_application_actually_has_including_doc
     monkeypatch.setattr(main, "core", real_core)  # loopback phase: the real application, with POST bodies that stop at validation or authentication
     for path, method in routes.items():
         body = {} if method == "POST" else None
-        assert client.request(method, path, json=body, headers={"Host": "localhost:8000"}).status_code != 403, (method, path)  # not caught by the guard
+        response = client.request(method, path, json=body, headers={"Host": "localhost:8000"}, follow_redirects=False)
+        # Not caught by the GUARD. A route may still answer 403 for a reason of its own - the dashboard refuses a change that lacks its
+        # X-Jarvis-Dashboard header (app/dashboard/api.py) - so the guard's refusal is recognised by its own exact text.
+        assert not (response.status_code == 403 and response.text == GUARD_REFUSAL), (method, path)
     for method in ("GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"):
         assert client.request(method, "/no/such/route", headers={"Host": "[::1]:8000"}).status_code in (404, 405)
 

@@ -96,6 +96,32 @@ Tests: `tests/test_provider_fixed_order.py` (every request kind, a failure at ev
 timeout and cooldown bounds including every duration unit, the tool-runs-once guarantee), `tests/test_provider_router.py`
 and `tests/test_providers_status_endpoint.py` (the key status, end to end through the real FreeLLMAPI adapter).
 
+## Dashboard (Slice 1): Jarvis in your browser
+
+Start Jarvis (`Start-Jarvis.bat`, or `uvicorn app.main:app --host 127.0.0.1 --port 8000`) and open
+**http://127.0.0.1:8000/dashboard** (or just http://127.0.0.1:8000/). One page, no install, nothing loaded from the internet:
+
+* **Chat** with Jarvis (the existing `POST /chat`); the conversation is remembered by this browser and restored on reload.
+  "New conversation" starts a fresh one.
+* **Waiting for you** - questions and confirmations a Job is waiting on, with **Approve / Decline** or an answer box. These
+  send the ordinary `answer <code>: ...` chat message, so the existing InteractionResolver decides, exactly as in chat.
+* **Tasks** - add (text, priority, due date), mark done, cancel, filter. Every change runs the existing `create_task` /
+  `complete_task` / `cancel_task` tool through `core.tools`, so the same validation and permission levels apply; a tool that
+  needs confirmation is never confirmed by the dashboard (it answers 409).
+* **Reminders** (active, soonest first, with repeating ones marked), **Jobs** (newest first, status and outcome),
+  **Notes** (expand to read in full) and **AI providers** (the fixed order and each key's status).
+* The panels refresh every 15 s. Reading the dashboard never calls an AI provider; only a chat message does.
+
+Safety: every route is loopback-only (the app-wide Host guard, which also stops DNS rebinding). A change must carry the
+`X-Jarvis-Dashboard: 1` header and, when the browser names its origin, come from 127.0.0.1 / localhost - a page on another
+site can't add that header without a CORS preflight, which this server never grants. The page sends a strict
+Content-Security-Policy (own scripts only, no inline code, no framing), and its script writes every value as text, never HTML.
+
+Code: `app/dashboard/` (`api.py` routes, `static/` page). Tests: `tests/test_dashboard.py` (52: every route, the
+cross-site refusals, the tool path, a stored `<img onerror>` staying text, the real app's wiring, packaging). Checked in a
+real browser against the real app in a sandbox with a stub AI provider: chat round-trip and reload, a reminder set by chat
+appearing, add / done on a task, phone width (no sideways scrolling), no console errors.
+
 ## Portable installer (requirement 901, foundation)
 
 `Setup-Jarvis.bat` / `Start-Jarvis.bat` and `installer/jarvis_setup.py` (`check`, `init`, `keys`, `migrate`, `package`,

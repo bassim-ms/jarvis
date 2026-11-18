@@ -21,8 +21,9 @@ it also wires up local Windows computer-control tools (see
 app/computer/) for ordinary interactive TOOL-capability chat ONLY - a
 separate ToolRegistry from `core.tools`, deliberately never reachable
 from M15 Job planning or AutomationEngine (see this file's own
-`core.computer_tools` wiring below). No dashboard, browser agent, or
-hardware control beyond that yet - those come in later milestones.
+`core.computer_tools` wiring below). Since Dashboard Slice 1, it also
+serves the local web dashboard (app/dashboard/) at /dashboard. No browser
+agent or hardware control beyond that yet - those come in later milestones.
 """
 
 import logging
@@ -44,6 +45,7 @@ from app.config import settings
 from app.context_engine.factory import create_default_context_engine
 from app.context_planning.factory import create_default_context_planner
 from app.context_reasoning.factory import create_default_context_reasoner
+from app.dashboard import DashboardSources, build_dashboard_router
 from app.action_proposal import ActionProposalService, ExecutionHandoff, ResultReports
 from app.focus import FocusService
 from app.host_guard import LoopbackHostMiddleware
@@ -713,6 +715,22 @@ def health_check() -> dict:
         "app": settings.app_name,
         "environment": settings.environment,
     }
+
+
+# The local web dashboard (app/dashboard/): Jarvis's main interface in a browser at http://127.0.0.1:8000/dashboard. It reads the SAME
+# stores built above and changes data only through the SAME ToolRegistry chat uses (`core.tools`, so each tool's permission level
+# applies); chat goes through the existing POST /chat. Loopback only, like every route (LoopbackHostMiddleware).
+app.include_router(build_dashboard_router(DashboardSources(
+    tasks=_task_store,
+    reminders=_reminder_store,
+    notes=_note_store,
+    jobs=_job_store,
+    interactions=_interaction_store,
+    tools=core.tools,
+    memory=core.memory,
+    provider_status=providers_status,
+    health=health_check,
+)))
 
 
 class ChatRequest(BaseModel):

@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Jarvis</title>
+  <link rel="stylesheet" href="/dashboard/style.css">
+  <script src="/dashboard/app.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="dot" id="health-dot" title="Server status"></span> Jarvis</div>
+    <div class="status" id="status-line">Connecting...</div>
+    <div class="clock" id="clock"></div>
+  </header>
+
+  <main class="layout">
+    <section class="card chat" aria-label="Chat">
+      <div class="card-head">
+        <h2>Chat</h2>
+        <button type="button" class="ghost" id="new-chat">New conversation</button>
+      </div>
+      <div class="messages" id="messages" aria-live="polite"></div>
+      <form class="composer" id="chat-form">
+        <textarea id="chat-input" rows="2" placeholder="Ask Jarvis anything..." maxlength="8000" required></textarea>
+        <button type="submit" id="chat-send">Send</button>
+      </form>
+    </section>
+
+    <div class="side">
+      <section class="card" aria-label="Waiting for you" id="waiting-card">
+        <div class="card-head"><h2>Waiting for you</h2><span class="badge" id="waiting-count">0</span></div>
+        <ul class="list" id="waiting-list"></ul>
+      </section>
+
+      <section class="card" aria-label="Tasks">
+        <div class="card-head">
+          <h2>Tasks</h2>
+          <select id="task-filter" aria-label="Show tasks">
+            <option value="todo">Open</option>
+            <option value="done">Done</option>
+            <option value="cancelled">Cancelled</option>
+            <option value="all">All</option>
+          </select>
+        </div>
+        <form class="inline-form" id="task-form">
+          <input id="task-text" type="text" placeholder="New task..." maxlength="500" required>
+          <select id="task-priority" aria-label="Priority">
+            <option value="low">Low</option>
+            <option value="medium" selected>Medium</option>
+            <option value="high">High</option>
+          </select>
+          <input id="task-due" type="date" aria-label="Due date">
+          <button type="submit">Add</button>
+        </form>
+        <ul class="list" id="task-list"></ul>
+      </section>
+
+      <section class="card" aria-label="Reminders">
+        <div class="card-head"><h2>Reminders</h2><span class="badge" id="reminder-count">0</span></div>
+        <ul class="list" id="reminder-list"></ul>
+      </section>
+
+      <section class="card" aria-label="Jobs">
+        <div class="card-head"><h2>Jobs</h2><span class="badge" id="job-count">0</span></div>
+        <ul class="list" id="job-list"></ul>
+      </section>
+
+      <section class="card" aria-label="Notes">
+        <div class="card-head"><h2>Notes</h2></div>
+        <ul class="list" id="note-list"></ul>
+      </section>
+
+      <section class="card" aria-label="AI providers">
+        <div class="card-head"><h2>AI providers</h2></div>
+        <ol class="list providers" id="provider-list"></ol>
+      </section>
+    </div>
+  </main>
+
+  <div class="toast" id="toast" role="status" hidden></div>
+</body>
+</html>
