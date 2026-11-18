@@ -112,15 +112,33 @@ Start Jarvis (`Start-Jarvis.bat`, or `uvicorn app.main:app --host 127.0.0.1 --po
   **Notes** (expand to read in full) and **AI providers** (the fixed order and each key's status).
 * The panels refresh every 15 s. Reading the dashboard never calls an AI provider; only a chat message does.
 
+**Slice 2** adds tabs beside the chat:
+
+* **Today** - the panels above, now with actions: reminders **Pause / Resume / Done / Cancel**, Jobs **Pause / Resume /
+  Cancel** and an expandable **Plan and progress** (each step's tool and status, attempts, result or error, last event).
+  Every action runs the existing tool (`pause_reminder`, `resume_job`, `cancel_job`, ...) through `core.tools`; cancelling
+  asks first. Cancelling a Job also withdraws its waiting question (the existing `cancel_job` behaviour).
+* **Projects** - the World Model: projects (status, priority) with their goals (target date, linked tasks), open
+  commitments, active blockers and upcoming events. Read-only.
+* **Memory** - what Jarvis remembers (stored facts), preferences, and what the memory policy staged as *not confirmed*
+  (shown so you can see what Jarvis is unsure about; never used as fact). Read-only.
+* **Automations** - each automation's schedule, action, next run and last run, with **Enable / Disable / Cancel** through
+  the existing automation tools. Running one by hand is not offered here.
+* **Calendar** - the next 7 days from Google Calendar, cached for 60 s (so the 15 s refresh never hammers Google) with a
+  Refresh button. When the calendar is not connected it says how to connect it; a calendar error is shown as a fixed
+  sentence, never the provider's own text.
+
 Safety: every route is loopback-only (the app-wide Host guard, which also stops DNS rebinding). A change must carry the
 `X-Jarvis-Dashboard: 1` header and, when the browser names its origin, come from 127.0.0.1 / localhost - a page on another
 site can't add that header without a CORS preflight, which this server never grants. The page sends a strict
 Content-Security-Policy (own scripts only, no inline code, no framing), and its script writes every value as text, never HTML.
 
-Code: `app/dashboard/` (`api.py` routes, `static/` page). Tests: `tests/test_dashboard.py` (52: every route, the
-cross-site refusals, the tool path, a stored `<img onerror>` staying text, the real app's wiring, packaging). Checked in a
-real browser against the real app in a sandbox with a stub AI provider: chat round-trip and reload, a reminder set by chat
-appearing, add / done on a task, phone width (no sideways scrolling), no console errors.
+Code: `app/dashboard/` (`api.py` routes, `static/` page). Tests: `tests/test_dashboard.py` (73: every route, the
+cross-site refusals, the tool path for every action, a stored `<img onerror>` staying text, the calendar cache and its
+fixed error sentences, the real app's wiring, packaging). Checked in a real browser against the real app in a sandbox with
+a stub AI provider: chat round-trip and reload, a reminder set by chat appearing, task add / done, reminder pause / resume,
+Job pause and its plan staying open across refreshes, every tab with seeded data, automation disable / enable, phone width
+(no sideways scrolling).
 
 ## Portable installer (requirement 901, foundation)
 

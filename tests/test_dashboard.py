@@ -450,3 +450,261 @@ def test_the_dashboard_files_ship_in_the_portable_package():
 
     assert {"app/dashboard/api.py", "app/dashboard/static/index.html", "app/dashboard/static/app.js",
             "app/dashboard/static/style.css"} <= shipped
+
+
+# --- Slice 2: reminder / Job / automation controls, Job detail, automations, calendar, memory, World Model -----------------------
+
+from app.automation.base import ExecutionOutcome, Trigger, TriggerType  # noqa: E402
+from app.automation.sqlite_store import SQLiteAutomationStore  # noqa: E402
+from app.automation.tools import CancelAutomationTool, DisableAutomationTool, EnableAutomationTool  # noqa: E402
+from app.calendar.base import CalendarEvent, CalendarProviderError  # noqa: E402
+from app.orchestration.tools import CancelJobTool, PauseJobTool, ResumeJobTool  # noqa: E402
+from app.reminders.tools import CancelReminderTool, CompleteReminderTool, PauseReminderTool, ResumeReminderTool  # noqa: E402
+from app.tools.decision import ToolCall  # noqa: E402
+from app.world_model.base import BlockerSeverity, Priority, TaskRefType  # noqa: E402
+from app.world_model.factory import create_default_world_model_service, create_default_world_model_store  # noqa: E402
+
+
+class FakeCalendar:
+    def __init__(self, events=None, error=None):
+        self.events, self.error, self.calls = events or [], error, []
+
+    def list_events(self, time_min=None, time_max=None, max_results=20):
+        self.calls.append((time_min, time_max, max_results))
+        if self.error is not None:
+            raise self.error
+        return self.events
+
+
+class Candidate:
+    def __init__(self, key, value, confidence):
+        self.id, self.kind, self.key, self.value = "c1", "fact", key, value
+        self.confidence, self.created_at = confidence, "2026-11-18T08:00:00+00:00"
+
+
+@pytest.fixture
+def full(world, tmp_path):
+    """`world` plus everything Slice 2 reads and the real tools it acts through."""
+    sources, _ = world
+    sources.automations = SQLiteAutomationStore(str(tmp_path / "automations.db"))
+    sources.world_model = create_default_world_model_service(create_default_world_model_store(str(tmp_path / "world.db")))
+    sources.calendar = FakeCalendar()
+    sources.memory_candidates = lambda: [Candidate("favourite filament", "PETG", 0.6)]
+    clock = {"now": datetime(2026, 11, 18, 9, 0, tzinfo=timezone.utc)}
+    sources.clock = lambda: clock["now"]
+    for tool in (PauseReminderTool(sources.reminders), ResumeReminderTool(sources.reminders), CancelReminderTool(sources.reminders),
+                 CompleteReminderTool(sources.reminders), PauseJobTool(sources.jobs), ResumeJobTool(sources.jobs),
+                 CancelJobTool(sources.jobs, interactions=sources.interactions), EnableAutomationTool(sources.automations),
+                 DisableAutomationTool(sources.automations), CancelAutomationTool(sources.automations)):
+        sources.tools.register(tool)
+    app = FastAPI()
+    app.add_middleware(LoopbackHostMiddleware)
+    app.include_router(build_dashboard_router(sources))
+    return sources, TestClient(app, base_url="http://127.0.0.1:8000"), clock
+
+
+def test_a_reminder_can_be_paused_resumed_and_cancelled_through_its_tools(full):
+    sources, http, _ = full
+    reminder = sources.reminders.create("Water the plants", "2026-11-20T18:00:00+00:00")
+    base = f"/api/reminders/{reminder.id}"
+
+    assert http.post(f"{base}/pause", json={}, headers=DASHBOARD).status_code == 200
+    assert sources.reminders.get(reminder.id).status.value == "paused"
+    assert http.post(f"{base}/resume", json={}, headers=DASHBOARD).status_code == 200
+    assert sources.reminders.get(reminder.id).status.value == "pending"
+    assert http.post(f"{base}/cancel", json={}, headers=DASHBOARD).status_code == 200
+    assert sources.reminders.get(reminder.id).status.value == "cancelled"
+    assert [name for name, _ in sources.tools.ran] == ["pause_reminder", "resume_reminder", "cancel_reminder"]
+    assert http.get("/api/reminders").json()["reminders"] == []
+
+
+def test_a_job_can_be_paused_resumed_and_cancelled_through_its_tools(full):
+    sources, http, _ = full
+    job = sources.jobs.create("Research filament prices")
+    base = f"/api/jobs/{job.id}"
+
+    assert http.post(f"{base}/pause", json={}, headers=DASHBOARD).status_code == 200
+    assert sources.jobs.get(job.id).status.value == "paused"
+    assert http.post(f"{base}/resume", json={}, headers=DASHBOARD).status_code == 200
+    assert sources.jobs.get(job.id).status.value != "paused"
+    assert http.post(f"{base}/cancel", json={}, headers=DASHBOARD).status_code == 200
+    assert sources.jobs.get(job.id).status.value == "cancelled"
+    assert http.post(f"{base}/cancel", json={}, headers=DASHBOARD).status_code == 400  # the tool's own refusal: already finished
+    assert [name for name, _ in sources.tools.ran] == ["pause_job", "resume_job", "cancel_job", "cancel_job"]
+
+
+def test_cancelling_a_job_also_withdraws_its_waiting_question(full):
+    sources, http, _ = full
+    job, _ = sources.interactions.create_job_awaiting_input(goal="Book a table", context={}, conversation_id=None,
+                                                            prompt="For how many people?")
+    assert len(http.get("/api/interactions").json()["interactions"]) == 1
+
+    assert http.post(f"/api/jobs/{job.id}/cancel", json={}, headers=DASHBOARD).status_code == 200
+
+    assert http.get("/api/interactions").json()["interactions"] == []
+
+
+@pytest.mark.parametrize("path", ["/api/reminders/x/explode", "/api/jobs/x/delete", "/api/automations/x/run"])
+def test_only_the_listed_actions_exist(full, path):
+    sources, http, _ = full
+
+    assert http.post(path, json={}, headers=DASHBOARD).status_code == 404
+    assert sources.tools.ran == []
+
+
+@pytest.mark.parametrize("path", ["/api/reminders/x/pause", "/api/jobs/x/cancel", "/api/automations/x/disable"])
+def test_every_new_action_is_refused_from_anywhere_but_the_dashboard(full, path):
+    sources, http, _ = full
+
+    assert http.post(path, json={}).status_code == 403
+    assert http.post(path, json={}, headers={**DASHBOARD, "Origin": "https://evil.example"}).status_code == 403
+    assert sources.tools.ran == []
+
+
+def test_job_detail_shows_the_plan_and_its_progress(full):
+    from app.orchestration.base import Plan, PlanStep
+
+    sources, http, _ = full
+    job = sources.jobs.create("Find PETG prices and save a note")
+    job.plan = Plan(steps=[PlanStep(id="s1", tool_name="web_search", arguments={"query": "PETG price"}),
+                           PlanStep(id="s2", tool_name="save_note", arguments={"title": "PETG"}, depends_on=["s1"])])
+    sources.jobs.save(job)
+
+    detail = http.get(f"/api/jobs/{job.id}").json()
+
+    assert [step["tool"] for step in detail["steps"]] == ["web_search", "save_note"]
+    assert [step["status"] for step in detail["steps"]] == ["pending", "pending"]
+    assert detail["steps"][1]["depends_on"] == ["s1"] and "PETG price" in detail["steps"][0]["arguments"]
+
+
+def test_a_job_without_a_plan_yet_has_an_empty_step_list(full):
+    sources, http, _ = full
+    job = sources.jobs.create("Plan my week")
+
+    detail = http.get(f"/api/jobs/{job.id}").json()
+
+    assert detail["steps"] == [] and detail["status"] == "pending" and detail["active"] is True
+    assert http.get("/api/jobs/missing").status_code == 404
+
+
+def test_automations_are_listed_with_their_schedule_and_last_run_and_can_be_switched(full):
+    sources, http, _ = full
+    every_day = sources.automations.create("Daily brief", Trigger(type=TriggerType.TIME, recurrence=parse_recurrence("days")), [],
+                                           ToolCall(tool_name="morning_brief"), next_run_at="2026-11-19T06:00:00+00:00")
+    sources.automations.record_execution(every_day.id, "2026-11-18T06:00:00+00:00", ExecutionOutcome.SUCCESS, "ok",
+                                         next_run_at="2026-11-19T06:00:00+00:00")
+    manual = sources.automations.create("Tidy notes", Trigger(type=TriggerType.MANUAL), [], ToolCall(tool_name="list_notes"))
+
+    listed = {a["name"]: a for a in http.get("/api/automations").json()["automations"]}
+
+    assert listed["Daily brief"]["every"] == "1 days" and listed["Daily brief"]["action"] == "morning_brief"
+    assert listed["Daily brief"]["last_run"]["outcome"] == "success" and listed["Daily brief"]["runs"] == 1
+    assert listed["Tidy notes"]["trigger"] == "manual" and listed["Tidy notes"]["last_run"] is None
+
+    assert http.post(f"/api/automations/{manual.id}/disable", json={}, headers=DASHBOARD).status_code == 200
+    assert sources.automations.get(manual.id).status.value == "disabled"
+    assert http.post(f"/api/automations/{manual.id}/enable", json={}, headers=DASHBOARD).status_code == 200
+    assert http.post(f"/api/automations/{manual.id}/cancel", json={}, headers=DASHBOARD).status_code == 200
+    assert sources.automations.get(manual.id).status.value == "cancelled"
+    assert "run_automation" not in [name for name, _ in sources.tools.ran]  # running one is not offered here
+
+
+def test_without_automations_the_panel_says_so(world):
+    _, http = world
+
+    assert http.get("/api/automations").json() == {"available": False, "automations": []}
+    assert http.post("/api/automations/x/enable", json={}, headers=DASHBOARD).status_code == 404
+
+
+def test_the_calendar_shows_the_next_days_and_is_cached_so_refreshing_does_not_ask_google_each_time(full):
+    sources, http, clock = full
+    sources.calendar.events = [CalendarEvent(id="e1", title="Physics class", start="2026-11-19T08:00:00+04:00",
+                                             end="2026-11-19T09:30:00+04:00", location="Room 4")]
+
+    first = http.get("/api/calendar").json()
+    http.get("/api/calendar")  # within the cache window
+    clock["now"] += timedelta(seconds=61)
+    http.get("/api/calendar")  # after it
+    http.get("/api/calendar?refresh=true")  # the Refresh button
+
+    assert first["connected"] is True and first["events"][0]["title"] == "Physics class"
+    assert len(sources.calendar.calls) == 3
+    time_min, time_max, _ = sources.calendar.calls[0]
+    assert time_min.startswith("2026-11-18T09:00") and time_max.startswith("2026-11-25T09:00")
+    assert http.get("/api/calendar?days=999").json()["days"] == 31
+
+
+@pytest.mark.parametrize("error, expected", [
+    (CalendarProviderError("Calendar is not authorized yet - run the OAuth setup flow first"), "not connected yet"),
+    (CalendarProviderError("Failed to reach Google Calendar: token=SECRET123 response body"), "could not be read just now"),
+])
+def test_a_calendar_failure_is_a_fixed_sentence_never_the_providers_own_text(full, error, expected):
+    sources, http, _ = full
+    sources.calendar.error = error
+
+    body = http.get("/api/calendar").json()
+
+    assert body["connected"] is False and expected in body["message"]
+    assert "SECRET123" not in http.get("/api/calendar?refresh=true").text
+
+
+def test_the_memory_browser_shows_facts_preferences_and_unconfirmed_candidates(full):
+    sources, http, _ = full
+    sources.memory.save_fact("printer", "Bambu Lab P1S")
+    sources.world_model.create_preference("reply_length", "short", category="communication")
+
+    body = http.get("/api/memory").json()
+
+    assert body["facts"] == [{"key": "printer", "value": "Bambu Lab P1S"}]
+    assert body["preferences"][0]["key"] == "reply_length" and body["preferences"][0]["category"] == "communication"
+    assert body["candidates"][0]["value"] == "PETG" and body["candidates"][0]["confidence"] == 0.6
+
+
+def test_the_world_model_view_shows_projects_with_their_goals_and_what_is_open(full):
+    sources, http, _ = full
+    wm = sources.world_model
+    arm = wm.create_project("Robotic arm", description="6-DOF arm", priority=Priority.HIGH)
+    goal = wm.create_goal(arm.id, "Print the base", target_date="2026-11-30")
+    wm.link_task(TaskRefType.TASK, "task-1", goal_id=goal.id)
+    wm.create_project("Old thing")
+    wm.create_commitment("Send the quote to the client", due_at="2026-11-21T12:00:00+00:00")
+    wm.create_blocker("Nozzle not heating", severity=BlockerSeverity.HIGH)
+
+    body = http.get("/api/world").json()
+
+    assert {p["name"] for p in body["projects"]} == {"Robotic arm", "Old thing"}
+    arm_view = next(p for p in body["projects"] if p["name"] == "Robotic arm")
+    assert arm_view["priority"] == "high" and arm_view["goals"][0]["title"] == "Print the base"
+    assert arm_view["goals"][0]["linked_tasks"] == 1 and arm_view["goals"][0]["target_date"] == "2026-11-30"
+    assert body["commitments"][0]["title"] == "Send the quote to the client"
+    assert body["blockers"][0]["severity"] == "high"
+
+
+def test_without_a_world_model_the_view_says_so(world):
+    _, http = world
+
+    assert http.get("/api/world").json()["available"] is False
+    assert http.get("/api/memory").json() == {"facts": [], "preferences": [], "candidates": []}
+    assert http.get("/api/calendar").json()["connected"] is False
+
+
+def test_the_page_has_every_slice_2_view_and_its_script_handles_them():
+    html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    script = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+
+    for name in ("today", "projects", "memory", "automations", "calendar"):
+        assert f'data-tab="{name}"' in html and f'data-panel="{name}"' in html
+    for path in ("/api/world", "/api/memory", "/api/automations", "/api/calendar", "/api/jobs/", "/api/reminders/"):
+        assert path in script
+    assert "window.confirm" in script  # cancelling asks first
+
+
+def test_the_dashboard_only_reads_memory_and_the_world_model():
+    """Memory and the World Model change only through the memory write policy (app/memory_policy/); the dashboard shows them and
+    never writes either - so it is no path for promoting a note, a chat line or anything else into memory."""
+    source = (Path(__file__).resolve().parent.parent / "app" / "dashboard" / "api.py").read_text(encoding="utf-8")
+
+    for write in ("save_fact", "delete_fact", ".create_", ".update_", ".transition_", ".link_task", ".delete_preference",
+                  ".add_blocker_link", ".add_resource_link", ".apply(", ".commit_pending("):
+        assert write not in source, write
+    assert not re.search(r"^\s*(from|import) app\.notes", source, re.MULTILINE)

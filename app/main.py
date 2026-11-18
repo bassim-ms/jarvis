@@ -730,6 +730,10 @@ app.include_router(build_dashboard_router(DashboardSources(
     memory=core.memory,
     provider_status=providers_status,
     health=health_check,
+    automations=_automation_store,
+    calendar=_calendar_provider,
+    world_model=_world_model_service,
+    memory_candidates=core.memory_writer.candidates_for_context,
 )))
 
 

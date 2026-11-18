@@ -14,6 +14,16 @@ computer only (127.0.0.1 - the app-wide loopback Host guard applies to every rou
                                          "answer <code>: ..." - the existing InteractionResolver)
     GET  /api/conversations/{id}/messages   a conversation's history, to restore the chat panel
 
+  Slice 2:
+    POST /api/reminders/{id}/pause|resume|complete|cancel      - the EXISTING reminder tools
+    POST /api/jobs/{id}/pause|resume|cancel                    - the EXISTING Job tools
+    POST /api/automations/{id}/enable|disable|cancel           - the EXISTING automation tools
+    GET  /api/jobs/{id}                  a Job's plan, step progress and recent events
+    GET  /api/automations                schedule, action, next and last run
+    GET  /api/calendar?days=7            Google Calendar, cached 60 s (?refresh=true to bypass)
+    GET  /api/memory                     stored facts, preferences, unconfirmed candidates
+    GET  /api/world                      World Model: projects with goals, open commitments, blockers, upcoming events
+
 Chat itself uses the existing POST /chat. Reading the dashboard never calls an AI provider; only sending a chat message does.
 """
 

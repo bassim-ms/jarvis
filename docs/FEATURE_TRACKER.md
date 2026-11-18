@@ -28,7 +28,7 @@ Status: **Done** = implemented, tested and pushed. **Partial** = a working part 
 | 440 | Migration verification | Done (this laptop) | integrity + row-count comparison per database; byte-identical source |
 | 901 | Portable installer package (addendum) | Partial | all of the above; not yet tested on a second laptop |
 
-## Batch 2 - the web dashboard, Slice 1 (2026-11-18)
+## Batch 2 - the web dashboard, Slice 1 (2026-11-18, commit 4648663)
 
 | Spec # | Feature | Status | Evidence |
 |---|---|---|---|
@@ -44,10 +44,24 @@ Status: **Done** = implemented, tested and pushed. **Partial** = a working part 
 Security for every dashboard route: loopback-only Host guard; changes need the `X-Jarvis-Dashboard` header and a local origin
 (cross-site requests refused - also checked against the live server); strict Content-Security-Policy; values rendered as text.
 
+## Batch 3 - the web dashboard, Slice 2 (2026-11-18)
+
+| Spec # | Feature | Status | Evidence |
+|---|---|---|---|
+| 465 | Reminder dashboard | Done | + Pause / Resume / Done / Cancel through the existing reminder tools - `tests/test_dashboard.py`; browser-checked (pause, resume) |
+| 468 | Job-status dashboard | Done | + Pause / Resume / Cancel through the existing Job tools, plan steps with status, attempts, result/error, last event - tests; browser-checked (pause, plan stays open across refreshes) |
+| 207 | Safe task cancellation | Partial | cancelling a Job from the dashboard goes through `cancel_job`, which also withdraws its waiting question (tested); asks before cancelling |
+| 201 | Execution progress tracking | Partial | per-step status and attempts visible for every Job |
+| 466 | Calendar dashboard | Partial | next 7 days from Google Calendar, cached 60 s, fixed error sentences (tested with a fake provider). Not checked against a live Google account: calendar is not connected on this laptop |
+| 467 | Automation dashboard | Done | schedule, action, next/last run; Enable / Disable / Cancel through the existing tools - tests; browser-checked (disable, enable) |
+| 469 | Memory browser | Done | stored facts, preferences and unconfirmed candidates (read-only) - tests; browser-checked. Editing (104) not yet |
+| 470 | World-model browser | Partial | projects, goals, commitments, blockers, upcoming events (read-only) - tests; browser-checked. Resources and relationships not shown yet |
+| 471 | Project dashboard | Done | projects with status, priority, description and goals (read-only) |
+| 472 | Goal dashboard | Done | goals per project with status, target date and linked tasks (read-only) |
+
 ## Next batches
 
-1. **Dashboard Slice 2** - 465 / 468 / 207 (reminder and Job pause / resume / cancel through the existing tools, Job step
-   detail), 466 calendar dashboard, 467 automation dashboard, 469 memory browser, 470 world-model browser, 471 project and
-   472 goal dashboards.
+1. **Provider observability** (70-74, 885): per-provider latency, success/failure history, reliability score and quota
+   hints from real requests, shown on the dashboard.
 2. **Remote access** (secure, no open router ports), then the hardware sections (25 Bambu Lab P1S, 27 robotic arm, 29 lights)
    as the devices become available for real testing - simulated tests will be labelled as simulated.

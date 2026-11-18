@@ -28,6 +28,15 @@
     </section>
 
     <div class="side">
+      <nav class="tabs" role="tablist" aria-label="Views">
+        <button type="button" role="tab" class="tab active" data-tab="today" aria-selected="true">Today</button>
+        <button type="button" role="tab" class="tab" data-tab="projects" aria-selected="false">Projects</button>
+        <button type="button" role="tab" class="tab" data-tab="memory" aria-selected="false">Memory</button>
+        <button type="button" role="tab" class="tab" data-tab="automations" aria-selected="false">Automations</button>
+        <button type="button" role="tab" class="tab" data-tab="calendar" aria-selected="false">Calendar</button>
+      </nav>
+
+      <div class="tab-panel" data-panel="today">
       <section class="card" aria-label="Waiting for you" id="waiting-card">
         <div class="card-head"><h2>Waiting for you</h2><span class="badge" id="waiting-count">0</span></div>
         <ul class="list" id="waiting-list"></ul>
@@ -75,6 +84,59 @@
         <div class="card-head"><h2>AI providers</h2></div>
         <ol class="list providers" id="provider-list"></ol>
       </section>
+      </div>
+
+      <div class="tab-panel" data-panel="projects" hidden>
+        <section class="card" aria-label="Projects and goals">
+          <div class="card-head"><h2>Projects and goals</h2></div>
+          <ul class="list" id="project-list"></ul>
+        </section>
+        <section class="card" aria-label="Commitments">
+          <div class="card-head"><h2>Open commitments</h2><span class="badge" id="commitment-count">0</span></div>
+          <ul class="list" id="commitment-list"></ul>
+        </section>
+        <section class="card" aria-label="Blockers">
+          <div class="card-head"><h2>Blockers</h2><span class="badge" id="blocker-count">0</span></div>
+          <ul class="list" id="blocker-list"></ul>
+        </section>
+        <section class="card" aria-label="Upcoming events">
+          <div class="card-head"><h2>Upcoming (World Model)</h2></div>
+          <ul class="list" id="world-event-list"></ul>
+        </section>
+      </div>
+
+      <div class="tab-panel" data-panel="memory" hidden>
+        <section class="card" aria-label="Remembered facts">
+          <div class="card-head"><h2>What Jarvis remembers</h2><span class="badge" id="fact-count">0</span></div>
+          <ul class="list" id="fact-list"></ul>
+        </section>
+        <section class="card" aria-label="Preferences">
+          <div class="card-head"><h2>Preferences</h2></div>
+          <ul class="list" id="preference-list"></ul>
+        </section>
+        <section class="card" aria-label="Not confirmed">
+          <div class="card-head"><h2>Not confirmed yet</h2><span class="badge" id="candidate-count">0</span></div>
+          <p class="hint">Things Jarvis noticed but is not sure about. Nothing here is used as a fact.</p>
+          <ul class="list" id="candidate-list"></ul>
+        </section>
+      </div>
+
+      <div class="tab-panel" data-panel="automations" hidden>
+        <section class="card" aria-label="Automations">
+          <div class="card-head"><h2>Automations</h2><span class="badge" id="automation-count">0</span></div>
+          <ul class="list" id="automation-list"></ul>
+        </section>
+      </div>
+
+      <div class="tab-panel" data-panel="calendar" hidden>
+        <section class="card" aria-label="Calendar">
+          <div class="card-head">
+            <h2>Next 7 days</h2>
+            <button type="button" class="ghost" id="calendar-refresh">Refresh</button>
+          </div>
+          <ul class="list" id="calendar-list"></ul>
+        </section>
+      </div>
     </div>
   </main>
 

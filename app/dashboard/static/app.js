@@ -210,15 +210,71 @@ async function taskAction(taskId, action, button) {
   refresh();
 }
 
+/* One action through the server (which runs the EXISTING tool for it), then a toast and a refresh. */
+async function act(path, button, confirmText) {
+  if (confirmText && !window.confirm(confirmText)) return;
+  if (button) button.disabled = true;
+  try {
+    const data = await api(path, { method: "POST" });
+    toast(data.message || "Done.");
+  } catch (error) {
+    toast(error.message, true);
+  }
+  refresh();
+}
+
+function actionButton(label, path, options = {}) {
+  const button = el("button", { className: `small ${options.style || ""}`.trim(), text: label, attrs: { type: "button" } });
+  button.addEventListener("click", () => act(path, button, options.confirm));
+  return button;
+}
+
 function renderReminders(data) {
   const list = $("reminder-list");
   list.replaceChildren();
   $("reminder-count").textContent = String(data.reminders.length);
   if (!data.reminders.length) list.append(emptyItem("No reminders."));
   for (const reminder of data.reminders) {
-    const sub = [when(reminder.due_at), reminder.repeats ? "repeats" : "", reminder.status !== "pending" ? reminder.status : ""]
+    const sub = [when(reminder.due_at), reminder.repeats ? `repeats (${reminder.schedule})` : "", reminder.status !== "pending" ? reminder.status : ""]
       .filter(Boolean).join(" - ");
-    list.append(el("li", {}, [el("div", { text: reminder.text }), el("div", { className: "sub", text: sub })]));
+    const base = `/api/reminders/${encodeURIComponent(reminder.id)}`;
+    const actions = el("div", { className: "actions" });
+    if (reminder.status === "paused") actions.append(actionButton("Resume", `${base}/resume`));
+    else if (reminder.status === "triggered") actions.append(actionButton("Done", `${base}/complete`));
+    else actions.append(actionButton("Pause", `${base}/pause`, { style: "secondary" }));
+    actions.append(actionButton("Cancel", `${base}/cancel`, { style: "danger", confirm: `Cancel the reminder "${reminder.text}"?` }));
+    list.append(el("li", {}, [el("div", { className: "row" }, [
+      el("div", { className: "grow" }, [el("div", { text: reminder.text }), el("div", { className: "sub", text: sub })]),
+      actions,
+    ])]));
+  }
+}
+
+const openJobs = new Set();  // Job details stay open across the 15 s refresh
+
+async function loadJobDetail(jobId, box) {
+  try {
+    const job = await api(`/api/jobs/${encodeURIComponent(jobId)}`);
+    const parts = [];
+    if (job.confirmation_message) parts.push(el("div", { className: "sub", text: `Waiting for approval: ${job.confirmation_message}` }));
+    if (job.steps.length) {
+      const steps = el("ol", { className: "steps" });
+      for (const step of job.steps) {
+        const extra = step.error ? ` - ${step.error}` : step.result ? ` - ${step.result}` : "";
+        steps.append(el("li", {}, [el("strong", { text: step.tool }), document.createTextNode(" "), pill(step.status),
+          document.createTextNode(`${step.attempts > 1 ? ` (${step.attempts} attempts)` : ""}${extra}`)]));
+      }
+      parts.push(steps);
+    } else {
+      parts.push(el("div", { className: "sub", text: "No plan yet." }));
+    }
+    if (job.events.length) {
+      const last = job.events[job.events.length - 1];
+      parts.push(el("div", { className: "sub", text: `Last event: ${last.kind}${last.detail ? " - " + last.detail : ""} (${when(last.at)})` }));
+    }
+    box.replaceChildren(...parts);
+  } catch (error) {
+    box.replaceChildren(el("div", { className: "sub", text: `Could not load the plan: ${error.message}` }));
   }
 }
 
@@ -229,11 +285,155 @@ function renderJobs(data) {
   if (!data.jobs.length) list.append(emptyItem("No Jobs yet."));
   for (const job of data.jobs.slice(0, 10)) {
     const outcome = job.error || job.result || "";
+    const base = `/api/jobs/${encodeURIComponent(job.id)}`;
+    const actions = el("div", { className: "actions" });
+    if (job.status === "paused") actions.append(actionButton("Resume", `${base}/resume`));
+    else if (job.active) actions.append(actionButton("Pause", `${base}/pause`, { style: "secondary" }));
+    if (job.active) actions.append(actionButton("Cancel", `${base}/cancel`, { style: "danger", confirm: "Cancel this Job? Steps already done stay done." }));
+    const detail = el("div");
+    const details = el("details", {}, [el("summary", { text: "Plan and progress" }), detail]);
+    details.addEventListener("toggle", () => {
+      if (details.open) { openJobs.add(job.id); loadJobDetail(job.id, detail); } else { openJobs.delete(job.id); }
+    });
+    if (openJobs.has(job.id)) details.open = true;
     list.append(el("li", {}, [
-      el("div", { className: "row" }, [el("div", { className: "grow", text: job.goal }), pill(job.status)]),
+      el("div", { className: "row" }, [el("div", { className: "grow", text: job.goal }), pill(job.status), actions]),
       el("div", { className: "sub", text: `${when(job.updated_at)}${outcome ? " - " + outcome : ""}` }),
+      details,
     ]));
   }
+}
+
+/* ---------------------------------------------------------------- Slice 2 views */
+
+function renderWorld(data) {
+  const projects = $("project-list");
+  projects.replaceChildren();
+  if (!data.available) projects.append(emptyItem("The World Model is not available."));
+  else if (!data.projects.length) projects.append(emptyItem("No projects yet. Tell Jarvis about one in chat."));
+  for (const project of data.projects) {
+    const goals = el("ul", { className: "goals" });
+    for (const goal of project.goals) {
+      const sub = [goal.target_date ? `by ${goal.target_date}` : "", goal.linked_tasks ? `${goal.linked_tasks} linked task${goal.linked_tasks === 1 ? "" : "s"}` : ""]
+        .filter(Boolean).join(" - ");
+      goals.append(el("li", {}, [el("div", { className: "row" }, [el("div", { className: "grow", text: goal.title }), pill(goal.status)]),
+        sub ? el("div", { className: "sub", text: sub }) : null]));
+    }
+    if (!project.goals.length) goals.append(el("li", { className: "sub", text: "No goals yet." }));
+    projects.append(el("li", {}, [
+      el("div", { className: "row" }, [el("strong", { className: "grow", text: project.name }), pill(project.priority), pill(project.status)]),
+      project.description ? el("div", { className: "sub", text: project.description }) : null,
+      goals,
+    ]));
+  }
+  const commitments = $("commitment-list");
+  commitments.replaceChildren();
+  $("commitment-count").textContent = String(data.commitments.length);
+  if (!data.commitments.length) commitments.append(emptyItem("No open commitments."));
+  for (const item of data.commitments) {
+    commitments.append(el("li", {}, [el("div", { text: item.title }), el("div", { className: "sub", text: item.due_at ? `due ${when(item.due_at)}` : "no due date" })]));
+  }
+  const blockers = $("blocker-list");
+  blockers.replaceChildren();
+  $("blocker-count").textContent = String(data.blockers.length);
+  if (!data.blockers.length) blockers.append(emptyItem("Nothing is blocked."));
+  for (const item of data.blockers) {
+    blockers.append(el("li", {}, [el("div", { className: "row" }, [el("div", { className: "grow", text: item.title }), pill(item.severity)]),
+      item.description ? el("div", { className: "sub", text: item.description }) : null]));
+  }
+  const events = $("world-event-list");
+  events.replaceChildren();
+  if (!data.events.length) events.append(emptyItem("No upcoming events."));
+  for (const item of data.events.slice(0, 15)) {
+    events.append(el("li", {}, [el("div", { text: item.title }), el("div", { className: "sub", text: [when(item.starts_at), item.location].filter(Boolean).join(" - ") })]));
+  }
+}
+
+function renderMemory(data) {
+  const facts = $("fact-list");
+  facts.replaceChildren();
+  $("fact-count").textContent = String(data.facts.length);
+  if (!data.facts.length) facts.append(emptyItem("Nothing remembered yet. Say \"remember that ...\" in chat."));
+  for (const fact of data.facts) {
+    facts.append(el("li", {}, [el("div", { className: "kv" }, [el("span", { className: "k", text: fact.key }), el("span", { text: fact.value })])]));
+  }
+  const preferences = $("preference-list");
+  preferences.replaceChildren();
+  if (!data.preferences.length) preferences.append(emptyItem("No preferences yet."));
+  for (const item of data.preferences) {
+    preferences.append(el("li", {}, [el("div", { className: "kv" }, [el("span", { className: "k", text: item.key }), el("span", { text: item.value })]),
+      el("div", { className: "sub", text: `${item.category} - ${item.source}` })]));
+  }
+  const candidates = $("candidate-list");
+  candidates.replaceChildren();
+  $("candidate-count").textContent = String(data.candidates.length);
+  if (!data.candidates.length) candidates.append(emptyItem("Nothing waiting."));
+  for (const item of data.candidates) {
+    candidates.append(el("li", {}, [el("div", { className: "kv" }, [el("span", { className: "k", text: item.key }), el("span", { text: item.value })]),
+      el("div", { className: "sub", text: `${item.kind} - confidence ${Math.round((item.confidence || 0) * 100)}%` })]));
+  }
+}
+
+function renderAutomations(data) {
+  const list = $("automation-list");
+  list.replaceChildren();
+  $("automation-count").textContent = String(data.automations.filter((item) => item.status === "enabled").length);
+  if (!data.available) list.append(emptyItem("Automations are not available."));
+  else if (!data.automations.length) list.append(emptyItem("No automations yet. Ask Jarvis in chat to create one."));
+  for (const item of data.automations) {
+    const base = `/api/automations/${encodeURIComponent(item.id)}`;
+    const actions = el("div", { className: "actions" });
+    if (item.status === "enabled") actions.append(actionButton("Disable", `${base}/disable`, { style: "secondary" }));
+    if (item.status === "disabled") actions.append(actionButton("Enable", `${base}/enable`));
+    if (item.status !== "cancelled") actions.append(actionButton("Cancel", `${base}/cancel`, { style: "danger", confirm: `Cancel the automation "${item.name}"? This cannot be undone.` }));
+    const trigger = item.every ? `every ${item.every}` : item.trigger.replace(/_/g, " ");
+    const last = item.last_run ? `last run ${when(item.last_run.at)}: ${item.last_run.outcome}` : "never run";
+    list.append(el("li", {}, [
+      el("div", { className: "row" }, [el("div", { className: "grow", text: item.name }), pill(item.status), actions]),
+      el("div", { className: "sub", text: `${trigger} - runs ${item.action}${item.next_run_at && item.status === "enabled" ? " - next " + when(item.next_run_at) : ""}` }),
+      el("div", { className: "sub", text: `${last} (${item.runs} run${item.runs === 1 ? "" : "s"})` }),
+    ]));
+  }
+}
+
+function renderCalendar(data) {
+  const list = $("calendar-list");
+  list.replaceChildren();
+  if (!data.connected) { list.append(emptyItem(data.message || "Calendar is not connected.")); return; }
+  if (!data.events.length) list.append(emptyItem("Nothing in the next 7 days."));
+  for (const event of data.events) {
+    list.append(el("li", {}, [el("div", { text: event.title || "(no title)" }),
+      el("div", { className: "sub", text: [when(event.start), event.location].filter(Boolean).join(" - ") })]));
+  }
+}
+
+const TAB_VIEWS = {
+  projects: ["/api/world", renderWorld],
+  memory: ["/api/memory", renderMemory],
+  automations: ["/api/automations", renderAutomations],
+  calendar: ["/api/calendar", renderCalendar],
+};
+const TAB_KEY = "jarvis.tab";
+let currentTab = "today";
+
+async function loadTab(name, force = false) {
+  const view = TAB_VIEWS[name];
+  if (!view) return;
+  const path = force && name === "calendar" ? `${view[0]}?refresh=true` : view[0];
+  try { view[1](await api(path)); } catch (error) { toast(`Could not load ${name}: ${error.message}`, true); }
+}
+
+function showTab(name) {
+  if (!document.querySelector(`.tab-panel[data-panel="${name}"]`)) name = "today";
+  currentTab = name;
+  writeStored(TAB_KEY, name);
+  for (const tab of document.querySelectorAll(".tab")) {
+    const active = tab.dataset.tab === name;
+    tab.classList.toggle("active", active);
+    tab.setAttribute("aria-selected", active ? "true" : "false");
+  }
+  for (const panel of document.querySelectorAll(".tab-panel")) panel.hidden = panel.dataset.panel !== name;
+  loadTab(name);
 }
 
 function renderInteractions(data) {
@@ -304,6 +504,7 @@ async function refresh() {
     $("health-dot").className = "dot bad";
     $("status-line").textContent = "Jarvis is not answering - is the server running?";
   }
+  if (currentTab !== "today" && currentTab !== "calendar") await loadTab(currentTab);  // the calendar refreshes on demand
   refreshing = false;
 }
 
@@ -351,6 +552,9 @@ document.addEventListener("DOMContentLoaded", () => {
     refresh();
   });
   $("task-filter").addEventListener("change", refresh);
+  for (const tab of document.querySelectorAll(".tab")) tab.addEventListener("click", () => showTab(tab.dataset.tab));
+  $("calendar-refresh").addEventListener("click", () => loadTab("calendar", true));
+  showTab(readStored(TAB_KEY) || "today");
 
   tickClock();
   setInterval(tickClock, 30000);

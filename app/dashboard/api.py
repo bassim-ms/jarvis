@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -27,8 +27,8 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
+from app.calendar.base import CalendarProviderError
 from app.memory.base import MemoryStore
-from app.notes.base import NoteStore
 from app.orchestration.interactions import InteractionStore
 from app.reminders.base import ReminderStatus, ReminderStore
 from app.scheduling.schedule import ScheduleKind
@@ -67,6 +67,20 @@ JOB_TEXT_CHARS = 500
 ACTIVE_REMINDER_STATUSES = (ReminderStatus.PENDING, ReminderStatus.TRIGGERED, ReminderStatus.PAUSED)
 ACTIVE_JOB_STATUSES = {"pending", "planning", "awaiting_confirmation", "awaiting_input", "running", "paused"}
 
+#: dashboard action -> the EXISTING tool that performs it (each runs through ToolRegistry.execute, so its permission level applies).
+REMINDER_ACTIONS = {"pause": "pause_reminder", "resume": "resume_reminder", "cancel": "cancel_reminder",
+                    "complete": "complete_reminder"}
+JOB_ACTIONS = {"pause": "pause_job", "resume": "resume_job", "cancel": "cancel_job"}
+AUTOMATION_ACTIONS = {"enable": "enable_automation", "disable": "disable_automation", "cancel": "cancel_automation"}
+
+CALENDAR_CACHE_SECONDS = 60  # the 15 s panel refresh must not ask Google every time
+CALENDAR_MAX_DAYS = 31
+MAX_EVENTS = 50
+MAX_JOB_EVENTS = 40
+STEP_TEXT_CHARS = 300
+CALENDAR_NOT_CONNECTED = "Google Calendar is not connected yet - run: python -m app.calendar.authorize"
+CALENDAR_UNAVAILABLE = "Google Calendar could not be read just now."
+
 
 @dataclass
 class DashboardSources:
@@ -74,7 +88,7 @@ class DashboardSources:
 
     tasks: TaskStore
     reminders: ReminderStore
-    notes: NoteStore
+    notes: Any  # NoteStore: .list(limit=) / .get(id) - read only; the dashboard never turns a note into memory
     jobs: Any  # JobStore: `.list(status=None)` and `.get(job_id)`
     interactions: InteractionStore
     tools: ToolRegistry
@@ -82,6 +96,11 @@ class DashboardSources:
     provider_status: Callable[[], dict]
     health: Callable[[], dict]
     clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)
+    # Slice 2 - optional, so a dashboard without them still works (their panels say "not available"):
+    automations: Any = None  # AutomationStore: .list() / .get_executions(id)
+    calendar: Any = None  # CalendarProvider: .list_events(time_min, time_max, max_results)
+    world_model: Any = None  # WorldModelService (its .store lists every entity)
+    memory_candidates: Callable[[], list] | None = None  # MemoryWriteService.candidates_for_context - staged, unconfirmed
 
 
 class NewTask(BaseModel):
@@ -293,6 +312,184 @@ def build_dashboard_router(sources: DashboardSources) -> APIRouter:
             }
             for item in pending
         ]}
+
+    # --- Slice 2: acting on reminders, Jobs and automations through their EXISTING tools -------------------------------------
+
+    def _act(actions: dict[str, str], action: str, id_param: str, item_id: str) -> dict:
+        tool = actions.get(action)
+        if tool is None:
+            raise HTTPException(status_code=404, detail=f"unknown action: {action}")
+        result = _tool_outcome(sources, tool, {id_param: item_id})
+        return {"message": result.message or "Done.", "data": result.data if isinstance(result.data, dict) else None}
+
+    @router.post("/api/reminders/{reminder_id}/{action}", dependencies=[Depends(require_dashboard_request)])
+    def reminder_action(reminder_id: str, action: str, body: TaskAction | None = None) -> dict:
+        return _act(REMINDER_ACTIONS, action, "reminder_id", reminder_id)
+
+    @router.post("/api/jobs/{job_id}/{action}", dependencies=[Depends(require_dashboard_request)])
+    def job_action(job_id: str, action: str, body: TaskAction | None = None) -> dict:
+        return _act(JOB_ACTIONS, action, "job_id", job_id)
+
+    @router.post("/api/automations/{automation_id}/{action}", dependencies=[Depends(require_dashboard_request)])
+    def automation_action(automation_id: str, action: str, body: TaskAction | None = None) -> dict:
+        if sources.automations is None:
+            raise HTTPException(status_code=404, detail="automations are not available")
+        return _act(AUTOMATION_ACTIONS, action, "automation_id", automation_id)
+
+    @router.get("/api/jobs/{job_id}")
+    def job_detail(job_id: str) -> dict:
+        job = sources.jobs.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="no such Job")
+        steps = job.plan.steps if job.plan else []
+        return {
+            "id": job.id,
+            "goal": job.goal,
+            "status": _value(job.status),
+            "active": _value(job.status) in ACTIVE_JOB_STATUSES,
+            "created_at": job.created_at,
+            "updated_at": job.updated_at,
+            "result": job.final_result,
+            "error": job.error,
+            "confirmation_message": job.confirmation_message,
+            "replan_count": job.replan_count,
+            "steps": [
+                {
+                    "id": step.id,
+                    "tool": step.tool_name,
+                    "status": _value(step.status),
+                    "attempts": step.attempts,
+                    "depends_on": list(step.depends_on or []),
+                    "arguments": _short(str(step.arguments), STEP_TEXT_CHARS) if step.arguments else "",
+                    "result": _short(None if step.result is None else str(step.result), STEP_TEXT_CHARS),
+                    "error": _short(step.error, STEP_TEXT_CHARS),
+                }
+                for step in steps
+            ],
+            "events": [
+                {"at": event.timestamp, "kind": event.kind, "detail": _short(event.detail, STEP_TEXT_CHARS), "step_id": event.step_id}
+                for event in job.events[-MAX_JOB_EVENTS:]
+            ],
+        }
+
+    # --- Slice 2: automations, calendar, memory and the World Model (read-only) ---------------------------------------------
+
+    @router.get("/api/automations")
+    def list_automations() -> dict:
+        if sources.automations is None:
+            return {"available": False, "automations": []}
+        items = []
+        for automation in sources.automations.list():
+            runs = sources.automations.get_executions(automation.id)
+            last = max(runs, key=lambda run: run.executed_at) if runs else None
+            trigger = automation.trigger
+            every = None
+            if trigger.recurrence is not None:
+                every = f"{trigger.recurrence.interval} {_value(trigger.recurrence.unit)}"
+            items.append({
+                "id": automation.id,
+                "name": automation.name,
+                "status": _value(automation.status),
+                "trigger": _value(trigger.type),
+                "every": every,
+                "action": automation.action.tool_name,
+                "next_run_at": automation.next_run_at,
+                "runs": len(runs),
+                "last_run": None if last is None else {"at": last.executed_at, "outcome": _value(last.outcome),
+                                                       "detail": _short(last.detail, STEP_TEXT_CHARS)},
+            })
+        order = {"enabled": 0, "disabled": 1, "cancelled": 2}
+        items.sort(key=lambda item: (order.get(item["status"], 3), item["next_run_at"] or "~", item["name"].lower()))
+        return {"available": True, "automations": items}
+
+    calendar_cache: dict[str, Any] = {}
+
+    @router.get("/api/calendar")
+    def calendar(days: int = 7, refresh: bool = False) -> dict:
+        if sources.calendar is None:
+            return {"connected": False, "events": [], "message": "No calendar is configured."}
+        days = max(1, min(days, CALENDAR_MAX_DAYS))
+        now = sources.clock()
+        cached = calendar_cache.get(days)
+        if cached and not refresh and (now - cached["at"]).total_seconds() < CALENDAR_CACHE_SECONDS:
+            return cached["data"]
+        try:
+            events = sources.calendar.list_events(time_min=now.isoformat(), time_max=(now + timedelta(days=days)).isoformat(),
+                                                  max_results=MAX_EVENTS)
+            data = {"connected": True, "days": days, "fetched_at": now.isoformat(), "events": [
+                {"id": e.id, "title": e.title, "start": e.start, "end": e.end, "location": e.location} for e in events
+            ]}
+        except CalendarProviderError as exc:
+            # Never the provider's own text: it can carry a vendor response. A fixed sentence says what to do.
+            message = CALENDAR_NOT_CONNECTED if "not authorized" in str(exc).lower() else CALENDAR_UNAVAILABLE
+            data = {"connected": False, "days": days, "fetched_at": now.isoformat(), "events": [], "message": message}
+        calendar_cache[days] = {"at": now, "data": data}
+        return data
+
+    @router.get("/api/memory")
+    def memory() -> dict:
+        facts = sources.memory.get_facts()
+        preferences = sources.world_model.get_preferences() if sources.world_model is not None else []
+        candidates = sources.memory_candidates() if sources.memory_candidates is not None else []
+        return {
+            "facts": [{"key": key, "value": value} for key, value in sorted(facts.items())],
+            "preferences": [
+                {"id": p.id, "key": p.key, "value": p.value, "category": p.category, "source": _value(p.source),
+                 "confidence": p.confidence, "updated_at": p.updated_at}
+                for p in sorted(preferences, key=lambda p: (p.category, p.key))
+            ],
+            # Staged by the memory policy, NOT confirmed: shown so the user can see what Jarvis is unsure about.
+            "candidates": [
+                {"id": c.id, "kind": _value(c.kind), "key": c.key, "value": c.value, "confidence": c.confidence,
+                 "created_at": c.created_at}
+                for c in candidates
+            ],
+        }
+
+    @router.get("/api/world")
+    def world() -> dict:
+        if sources.world_model is None:
+            return {"available": False, "projects": [], "commitments": [], "blockers": [], "events": []}
+        store = sources.world_model.store
+        project_order = {"active": 0, "paused": 1, "completed": 2, "archived": 3}
+        projects = sorted(store.list_projects(), key=lambda p: (project_order.get(_value(p.status), 4), p.name.lower()))
+        goal_order = {"active": 0, "paused": 1, "achieved": 2, "abandoned": 3}
+        out_projects = []
+        for project in projects:
+            goals = sorted(store.list_goals(project_id=project.id),
+                           key=lambda g: (goal_order.get(_value(g.status), 4), g.target_date or "~", g.title.lower()))
+            out_projects.append({
+                "id": project.id,
+                "name": project.name,
+                "description": project.description,
+                "status": _value(project.status),
+                "priority": _value(project.priority),
+                "linked_tasks": len(store.list_task_links(project_id=project.id)),
+                "goals": [
+                    {"id": g.id, "title": g.title, "description": g.description, "status": _value(g.status),
+                     "priority": _value(g.priority), "target_date": g.target_date,
+                     "linked_tasks": len(store.list_task_links(goal_id=g.id))}
+                    for g in goals
+                ],
+            })
+        now = sources.clock().isoformat()
+        return {
+            "available": True,
+            "projects": out_projects,
+            "commitments": [
+                {"id": c.id, "title": c.title, "status": _value(c.status), "priority": _value(c.priority), "due_at": c.due_at}
+                for c in sorted(sources.world_model.get_open_commitments(), key=lambda c: c.due_at or "~")
+            ],
+            "blockers": [
+                {"id": b.id, "title": b.title, "description": b.description, "severity": _value(b.severity),
+                 "detected_at": b.detected_at}
+                for b in sources.world_model.get_active_blockers()
+            ],
+            "events": [
+                {"id": e.id, "title": e.title, "starts_at": e.starts_at, "ends_at": e.ends_at, "location": e.location}
+                for e in sources.world_model.get_upcoming_events(after=now)[:MAX_EVENTS]
+            ],
+        }
 
     @router.get("/api/conversations/{conversation_id}/messages")
     def conversation_messages(conversation_id: str) -> dict:
