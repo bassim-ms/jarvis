@@ -8,6 +8,7 @@ project dependency), so no extra SDK is needed for a single call.
 import httpx
 
 from app.config import settings
+from app.providers import usage
 from app.providers.base import AIProvider, ProviderError
 
 GEMINI_URL = (
@@ -50,6 +51,8 @@ class GeminiProvider(AIProvider):
 
         data = response.json()
         try:
-            return data["candidates"][0]["content"]["parts"][0]["text"]
+            text = data["candidates"][0]["content"]["parts"][0]["text"]
         except (KeyError, IndexError) as exc:
             raise GeminiError(f"Unexpected Gemini response: {data}") from exc
+        usage.note_gemini(data)  # token counts only, for the provider statistics (app/providers/stats.py)
+        return text

@@ -187,7 +187,7 @@ def build_dashboard_router(sources: DashboardSources) -> APIRouter:
         status = sources.provider_status()
         providers = [
             {key: entry.get(key) for key in ("position", "name", "display_name", "model", "key_status", "key_status_text",
-                                              "enabled", "resting_seconds")}
+                                              "enabled", "resting_seconds", "stats")}
             for entry in status.get("providers", [])
         ]
         jobs = sources.jobs.list()

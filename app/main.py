@@ -661,7 +661,8 @@ def dev_status() -> dict:
 
 @app.get("/providers/status")
 def providers_status() -> dict:
-    """Read-only state of the AI provider chain, in the exact order every AI call tries it: whether each provider has a key
+    """Read-only state of the AI provider chain, in the exact order every AI call tries it, with each provider's statistics
+    from real requests (`stats`, see app/providers/stats.py): whether each provider has a key
     and what its most recent REAL answer said about that key (`key_status`, see app/providers/manager.py KEY_STATUS_TEXT:
     "no_key", "present_not_verified", "authenticated", "rejected" or "unavailable" - a non-empty key alone is only ever
     "present_not_verified"), which are enabled and which are resting after a rate limit (and for how long).
@@ -696,6 +697,9 @@ def providers_status() -> dict:
             "enabled": health.enabled,
             "consecutive_failures": health.consecutive_failures,
             "resting_seconds": round(resting),
+            # From REAL attempts only (app/providers/stats.py), persisted across restarts: latency, outcomes by kind, rate
+            # limits, reliability WITH its sample size, requests and tokens today. Counts and timestamps - never text.
+            "stats": manager.stats_snapshot(health.name),
         })
     return {
         "order": [entry["name"] for entry in providers],

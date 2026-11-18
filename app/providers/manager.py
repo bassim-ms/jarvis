@@ -41,15 +41,19 @@ docstring for why.
 
 import logging
 import re
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
 from typing import TypeVar
 
+from app.providers import usage
 from app.providers.base import AIProvider, ProviderError
 from app.providers.requirements import RequestRequirements
 from app.providers.router import ProviderRouter, RoutingDecision
+from app.providers.stats import ProviderStats, ProviderStatsStore, load_stats
 
 _log = logging.getLogger("jarvis.providers")
 
@@ -189,6 +193,9 @@ class ProviderHealth:
     cooldown_until: float = 0.0
     #: See KeyCheck: updated by every real attempt, never by a test request.
     key_check: KeyCheck = KeyCheck.NOT_CHECKED
+    #: Latency, outcomes, rate limits, tokens and daily counts from real attempts (app/providers/stats.py) - persisted when
+    #: the manager has a stats store. Updated only under the manager's statistics lock.
+    stats: ProviderStats = field(default_factory=ProviderStats)
 
     def in_cooldown(self, now: float) -> bool:
         return self.cooldown_until > now
@@ -263,12 +270,28 @@ class AIProviderManager(AIProvider):
         max_cooldown_seconds: float = 86400.0,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
+        stats_store: ProviderStatsStore | None = None,
+        timer: Callable[[], float] = time.perf_counter,
+        wall_clock: Callable[[], datetime] = lambda: datetime.now().astimezone(),
+        daily_request_limits: dict[str, int] | None = None,
     ):
         if not entries:
             raise ValueError("AIProviderManager needs at least one provider.")
         names = [entry.name for entry in entries]
         if len(names) != len(set(names)):
             raise ValueError(f"Duplicate provider names: {names}")
+        # Provider statistics (app/providers/stats.py): loaded from the store (if any) so they survive a restart; every real
+        # attempt is recorded and saved under one lock, so concurrent requests on different threads never lose a count.
+        self.stats_store = stats_store
+        self._timer = timer
+        self.wall_clock = wall_clock
+        #: Optional, user-configured daily request limits per provider (quota awareness only - nothing is blocked by them).
+        self.daily_request_limits = dict(daily_request_limits or {})
+        self._stats_lock = threading.Lock()
+        self._stats_save_failed = False
+        loaded = load_stats(stats_store, names)
+        for entry in entries:
+            entry.health.stats = loaded[entry.name]
 
         self.entries = list(entries)
         self.retry_count = retry_count
@@ -289,6 +312,26 @@ class AIProviderManager(AIProvider):
         """Current health snapshot for every registered provider, in
         priority order. Safe to log/expose - see ProviderHealth."""
         return [entry.health for entry in self.entries]
+
+    def stats_snapshot(self, name: str) -> dict:
+        """One provider's statistics as of now (see ProviderStats.snapshot) - read under the statistics lock."""
+        entry = self._entry(name)
+        with self._stats_lock:
+            return entry.health.stats.snapshot(self.wall_clock(), self.daily_request_limits.get(name))
+
+    def _record(self, entry: AIProviderEntry, ok: bool, started: float, kind: str | None, tokens: int | None) -> None:
+        """Record one REAL attempt and persist the provider's state. Never raises: a statistics problem must not change the
+        outcome of an AI request (a failed save is logged once, by type)."""
+        try:
+            latency_ms = (self._timer() - started) * 1000.0
+            with self._stats_lock:
+                entry.health.stats.record(ok, latency_ms, self.wall_clock(), kind=kind, tokens=tokens)
+                if self.stats_store is not None:
+                    self.stats_store.save(entry.name, entry.health.stats.to_state())
+        except Exception as exc:  # noqa: BLE001
+            if not self._stats_save_failed:
+                self._stats_save_failed = True
+                _log.warning("provider statistics could not be recorded (%s); requests continue", type(exc).__name__)
 
     def set_enabled(self, name: str, enabled: bool) -> None:
         """Enable/disable a registered provider by name at runtime."""
@@ -405,11 +448,14 @@ class AIProviderManager(AIProvider):
 
         while True:
             attempts += 1
+            usage.clear()
+            started = self._timer()
             try:
                 reply = entry.provider.generate_reply(message)
             except ProviderError as exc:
                 health.consecutive_failures += 1
                 category = classify_error(exc)
+                self._record(entry, False, started, category.value, usage.take())
                 health.key_check = KeyCheck.REJECTED if category is ErrorCategory.AUTH else KeyCheck.UNAVAILABLE
 
                 if category is ErrorCategory.TRANSIENT and attempts <= self.retry_count:
@@ -434,11 +480,13 @@ class AIProviderManager(AIProvider):
                 health.consecutive_failures += 1
                 health.healthy = False
                 health.key_check = KeyCheck.UNAVAILABLE
+                self._record(entry, False, started, "unexpected", usage.take())
                 raise UnexpectedProviderError(
                     f"unexpected {type(exc).__name__} (not a ProviderError)"
                 ) from None
             # A real answer: whatever the caller later thinks of its content, the provider accepted the key.
             health.key_check = KeyCheck.AUTHENTICATED
+            self._record(entry, True, started, None, usage.take())
             return reply
 
 

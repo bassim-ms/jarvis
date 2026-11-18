@@ -17,6 +17,7 @@ Model config: JARVIS_CLOUDFLARE_MODEL (see app/config.py for the default)
 import httpx
 
 from app.config import settings
+from app.providers import usage
 from app.providers.base import AIProvider, ProviderError
 
 CLOUDFLARE_URL = (
@@ -67,6 +68,8 @@ class CloudflareProvider(AIProvider):
             raise CloudflareError(f"Cloudflare reported failure: {data.get('errors')}")
 
         try:
-            return data["result"]["response"]
+            text = data["result"]["response"]
         except (KeyError, TypeError) as exc:
             raise CloudflareError(f"Unexpected Cloudflare response: {data}") from exc
+        usage.note_openai(data["result"])  # Workers AI reports `usage` inside `result` (when it does); counts only
+        return text

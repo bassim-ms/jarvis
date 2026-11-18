@@ -22,6 +22,7 @@ DATA_FILE_SETTINGS: tuple[str, ...] = (
     "tasks_db_path",
     "notes_db_path",
     "orchestration_db_path",
+    "provider_stats_db_path",
     "voice_device_credential_file",
     "log_file",
 )
@@ -110,6 +111,12 @@ class Settings(BaseSettings):
     # How long ONE HTTP attempt to a provider may take (connect / send / wait for the reply), in seconds. Was a hard-coded
     # 120 in every adapter, so a provider that accepted the request and never answered held the whole chain for two minutes.
     ai_provider_timeout_seconds: float = 30.0
+    # Provider statistics (app/providers/stats.py): latency, outcomes, rate limits, token and request counts per day, from REAL
+    # requests only - never a key, prompt or reply. Kept in this small database so they survive a restart.
+    provider_stats_db_path: str = "jarvis_provider_stats.db"
+    # Optional daily request limits per provider, for quota awareness on the dashboard - e.g. "groq=1000,gemini=250" (use the
+    # limits of YOUR plan). Nothing is blocked by them; empty = no limits shown.
+    ai_provider_daily_request_limits: str = ""
 
     # Memory (local SQLite persistence for conversations and user facts)
     memory_db_path: str = "jarvis_memory.db"

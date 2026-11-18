@@ -44,7 +44,7 @@ Status: **Done** = implemented, tested and pushed. **Partial** = a working part 
 Security for every dashboard route: loopback-only Host guard; changes need the `X-Jarvis-Dashboard` header and a local origin
 (cross-site requests refused - also checked against the live server); strict Content-Security-Policy; values rendered as text.
 
-## Batch 3 - the web dashboard, Slice 2 (2026-11-18)
+## Batch 3 - the web dashboard, Slice 2 (2026-11-18, commit 3edb183)
 
 | Spec # | Feature | Status | Evidence |
 |---|---|---|---|
@@ -59,9 +59,26 @@ Security for every dashboard route: loopback-only Host guard; changes need the `
 | 471 | Project dashboard | Done | projects with status, priority, description and goals (read-only) |
 | 472 | Goal dashboard | Done | goals per project with status, target date and linked tasks (read-only) |
 
+## Batch 4 - provider observability (2026-11-18)
+
+| Spec # | Feature | Status | Evidence |
+|---|---|---|---|
+| 70 | Provider health monitoring | Done | key status + persistent statistics per provider in `GET /providers/status` and on the dashboard - `tests/test_provider_stats.py`, `tests/test_providers_status_endpoint.py`; checked end to end against the real app in a sandbox |
+| 71 | Provider latency measurement | Done | every real attempt timed; smoothed average over answered attempts + last attempt - tests |
+| 72 | Provider reliability scoring | Done | share answered of the last 50 ACTUAL attempts, always with its sample size; none = "nothing measured" (never an invented 100%) - tests; dashboard shows "answered/sample" |
+| 73 | Provider cost tracking | Partial | token counts per provider and day, as the providers report them (Groq/OpenRouter/FreeLLMAPI/Cloudflare `usage`, Gemini `usageMetadata`) - tests with the real adapters on fake HTTP. A money cost is deliberately NOT computed (`cost: null`): no reliable price for OpenRouter's "auto" route |
+| 74 | Provider quota tracking | Partial | requests, failures, rate limits and tokens per day (31 days kept), plus usage against a user-configured daily limit - tests. Provider-side limits and reset times are not read from the providers |
+| 885 | Provider quota monitoring | Partial | the same counts, shown live on the dashboard per provider; nothing is blocked by a limit |
+| - | Statistics survive restarts | Done | `jarvis_provider_stats.db`, validated on load (untrusted rows start again from empty) - restart tests + a real server restart in the sandbox with identical numbers before and after |
+| 161, 132 | Context-aware reasoning / Context Engine (bug fix) | Done | a goal with a date-only target date made every chat request fail (naive vs aware datetime TypeError) in the Context Engine scorer and the deterministic reasoner - fixed, with regression tests |
+
+Privacy: the stored rows hold counts, durations, timestamps and failure kinds only - a test sends a secret-looking prompt and
+error through the manager and checks none of it reaches the database. Concurrency: 8 threads x 50 requests and 6 threads
+recording directly lose no count. The provider order is unchanged.
+
 ## Next batches
 
-1. **Provider observability** (70-74, 885): per-provider latency, success/failure history, reliability score and quota
-   hints from real requests, shown on the dashboard.
-2. **Remote access** (secure, no open router ports), then the hardware sections (25 Bambu Lab P1S, 27 robotic arm, 29 lights)
-   as the devices become available for real testing - simulated tests will be labelled as simulated.
+1. **Remote access** (secure, no open router ports) - the brief's "major requirement".
+2. **Memory editing (104) and the rest of section 4** on the dashboard's Memory tab, through the memory write policy.
+3. The hardware sections (25 Bambu Lab P1S, 27 robotic arm, 29 lights) as the devices become available for real testing -
+   simulated tests will be labelled as simulated.

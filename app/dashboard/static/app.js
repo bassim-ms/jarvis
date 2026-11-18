@@ -171,8 +171,26 @@ function renderOverview(data) {
       el("span", { className: "sub", text: `${provider.model || ""}${resting}` }),
       document.createTextNode(" "),
       pill(provider.enabled === false ? "disabled" : provider.key_status || "unknown"),
+      el("div", { className: "sub", text: providerStatsLine(provider.stats) }),
     ]));
   }
+}
+
+/* What the provider's REAL requests show. The answered share is always given as "answered / sample" - never a bare
+   percentage, so 2 lucky requests never read as "100% reliable". */
+function providerStatsLine(stats) {
+  if (!stats || !stats.reliability_sample) return "No requests yet - nothing measured.";
+  const parts = [`${stats.reliability_answered}/${stats.reliability_sample} answered (last ${stats.reliability_sample} request${stats.reliability_sample === 1 ? "" : "s"})`];
+  if (stats.avg_latency_ms !== null) parts.push(`~${stats.avg_latency_ms} ms`);
+  const today = stats.today || {};
+  let todayText = `${today.requests || 0} today`;
+  if (today.request_limit) todayText += ` of ${today.request_limit}`;
+  if (today.tokens) todayText += `, ${today.tokens} tokens`;
+  parts.push(todayText);
+  if (today.rate_limited) parts.push(`rate-limited ${today.rate_limited}x today`);
+  if (stats.last_success_at) parts.push(`last answered ${when(stats.last_success_at)}`);
+  if (stats.last_failure_kind && stats.last_failure_at) parts.push(`last failure: ${stats.last_failure_kind.replace(/_/g, " ")} ${when(stats.last_failure_at)}`);
+  return parts.join(" - ");
 }
 
 function renderTasks(data) {

@@ -28,6 +28,7 @@ implementing AIProvider directly, which is what they do.
 import httpx
 
 from app.config import settings
+from app.providers import usage
 from app.providers.base import AIProvider, ProviderError
 
 
@@ -88,8 +89,10 @@ class OpenAICompatibleProvider(AIProvider):
 
         data = response.json()
         try:
-            return data["choices"][0]["message"]["content"]
+            content = data["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
             raise self.error_cls(
                 f"Unexpected {self.display_name} response: {data}"
             ) from exc
+        usage.note_openai(data)  # token counts only, for the provider statistics (app/providers/stats.py)
+        return content

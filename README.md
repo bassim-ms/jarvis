@@ -78,6 +78,31 @@ result checks, tool-call construction, self-development planning - goes through 
   A provider that is skipped (resting after a rate limit, or disabled) keeps its last status: it was not asked. The status
   lives in memory only and starts again at `present_not_verified` each time Jarvis starts.
 
+### Provider statistics (spec 70-74, 885)
+
+Every REAL attempt at a provider is measured by the manager (`app/providers/stats.py`) - nothing ever sends a test request,
+and a provider that is resting or disabled was not asked, so nothing is recorded for it:
+
+* latency (smoothed average of answered attempts, and the last attempt), answered / failed, each failure's **kind**
+  (`transient`, `rate_limit`, `network`, `auth`, `other`, `unexpected` - never the error's text), rate-limit hits;
+* **reliability** = the share of the last 50 actual attempts that got an answer, always shown with its sample size
+  ("4/4 answered (last 4 requests)" - never a bare "100%"); no attempts yet means "nothing measured", not a number;
+* requests, failures, rate limits and **tokens per day** (tokens as the provider itself reported them - numbers only), and,
+  if you set `JARVIS_AI_PROVIDER_DAILY_REQUEST_LIMITS` (e.g. `groq=1000,gemini=250`, from your own plan), what is left today.
+  Nothing is blocked by a limit. A money **cost is not estimated** (the free tiers cost nothing and OpenRouter's "auto" price
+  varies by model, so a figure would be invented) - `cost` is `null`.
+
+They are saved after every attempt in `jarvis_provider_stats.db` (`JARVIS_PROVIDER_STATS_DB_PATH`, inside
+`JARVIS_DATA_DIR` when set) and loaded at start, so they **survive a restart**. A stored row that is unreadable, from a newer
+format or internally inconsistent is not trusted - that provider starts again from empty. The rows hold counts, durations,
+timestamps and failure kinds only: no key, prompt, reply or error text (tested). Recording is thread-safe, and a failure to
+save never changes an AI request's outcome. Shown in `GET /providers/status` (`stats`) and on the dashboard's provider panel.
+
+Found while checking this end to end: a World Model goal with a date-only target date (e.g. `2026-11-30`) made **every chat
+request fail** - the Context Engine scorer and the deterministic reasoner compared it with an aware timestamp and raised a
+`TypeError`. Both now read a value without a timezone in the same zone as "now" (UTC in the reasoner) and a date-only value as
+the end of that day (`tests/test_context_engine_scoring.py`, `tests/test_context_reasoning_deterministic.py`).
+
 ### FreeLLMAPI addresses: the code default vs. the desktop app
 
 FreeLLMAPI can run in two ways, on two different addresses. Jarvis uses whichever `JARVIS_FREELLMAPI_BASE_URL` names:

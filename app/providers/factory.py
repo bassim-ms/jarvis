@@ -19,6 +19,8 @@ will need: a local/browser provider is still just another AIProvider
 implementation registered here.
 """
 
+import logging
+
 from app.config import settings
 from app.providers.base import AIProvider, ProviderInfo
 from app.providers.cloudflare import CLOUDFLARE_URL, CloudflareProvider
@@ -27,6 +29,7 @@ from app.providers.gemini import GEMINI_URL, GeminiProvider
 from app.providers.groq import GROQ_URL, GroqProvider
 from app.providers.manager import AIProviderEntry, AIProviderManager
 from app.providers.openrouter import OPENROUTER_URL, OpenRouterProvider
+from app.providers.stats import ProviderStatsStore, SQLiteProviderStatsStore
 
 PROVIDER_FACTORIES: dict[str, type[AIProvider]] = {
     "gemini": GeminiProvider,
@@ -164,4 +167,29 @@ def create_default_ai_provider_manager() -> AIProviderManager:
         retry_delay_seconds=settings.ai_provider_retry_delay_seconds,
         cooldown_seconds=settings.ai_provider_cooldown_seconds,
         max_cooldown_seconds=settings.ai_provider_max_cooldown_seconds,
+        stats_store=create_default_stats_store(),
+        daily_request_limits=parse_daily_limits(settings.ai_provider_daily_request_limits),
     )
+
+
+def create_default_stats_store() -> ProviderStatsStore | None:
+    """The provider statistics database (settings.provider_stats_db_path, placed in JARVIS_DATA_DIR when that is set). If it
+    cannot be opened, statistics are kept in memory only - Jarvis still starts."""
+    try:
+        return SQLiteProviderStatsStore(settings.provider_stats_db_path)
+    except Exception as exc:  # noqa: BLE001 - statistics must never stop Jarvis from starting
+        logging.getLogger("jarvis.providers").warning(
+            "provider statistics database could not be opened (%s); statistics will not survive a restart", type(exc).__name__
+        )
+        return None
+
+
+def parse_daily_limits(text: str) -> dict[str, int]:
+    """"groq=1000, gemini=250" -> {"groq": 1000, "gemini": 250}. A malformed or non-positive entry is ignored."""
+    limits: dict[str, int] = {}
+    for part in (text or "").split(","):
+        name, separator, value = part.partition("=")
+        name, value = name.strip().lower(), value.strip()
+        if separator and name and value.isdigit() and int(value) > 0:
+            limits[name] = int(value)
+    return limits
