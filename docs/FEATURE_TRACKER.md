@@ -59,7 +59,7 @@ Security for every dashboard route: loopback-only Host guard; changes need the `
 | 471 | Project dashboard | Done | projects with status, priority, description and goals (read-only) |
 | 472 | Goal dashboard | Done | goals per project with status, target date and linked tasks (read-only) |
 
-## Batch 4 - provider observability (2026-11-18)
+## Batch 4 - provider observability (2026-11-18, commits c787fd5 fix, ec480df feature)
 
 | Spec # | Feature | Status | Evidence |
 |---|---|---|---|
@@ -75,6 +75,17 @@ Security for every dashboard route: loopback-only Host guard; changes need the `
 Privacy: the stored rows hold counts, durations, timestamps and failure kinds only - a test sends a secret-looking prompt and
 error through the manager and checks none of it reaches the database. Concurrency: 8 threads x 50 requests and 6 threads
 recording directly lose no count. The provider order is unchanged.
+
+## Batch 5 - reliability: health report and verified backups (2026-11-18)
+
+| Spec # | Feature | Status | Evidence |
+|---|---|---|---|
+| 457 | Database integrity checks | Done | every database: read-only `PRAGMA quick_check` + row counts; damaged / non-database files reported - `tests/test_diagnostics.py`; shown on the System tab (browser-checked) |
+| 458 | Service health checks | Done | reminder scheduler, automation engine, Job engine (running / not running / off by setting) and the provider chain - tests; browser-checked |
+| 452 | Resource monitoring | Partial | free disk (warning below 1 GB / 5%), database size, process memory (Windows: read via the OS; tested), threads, uptime. No history or CPU yet |
+| 456 | Backup verification | Done | verified backups (SQLite backup API, integrity + row counts, SHA-256 manifest) and later re-verification (changed / missing / damaged / unreadable manifest / path escape all caught) - tests; browser-checked (12 files backed up and verified) |
+| 460 | Reliability reporting | Partial | one report with an overall ok / warning / failing status and its reasons. Not yet a report over time |
+| 453 | Failure alerts | Planned | the report shows problems when looked at; nothing notifies yet |
 
 ## Next batches
 

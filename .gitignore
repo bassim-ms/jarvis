@@ -23,3 +23,6 @@ sandbox/
 .vscode/
 .idea/
 jarvis_*device*.json
+
+# Verified backups hold copies of your databases and identity files (app/diagnostics/backup.py)
+backups/

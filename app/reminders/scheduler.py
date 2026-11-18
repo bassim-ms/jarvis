@@ -100,6 +100,10 @@ class ReminderScheduler:
         )
         self._thread.start()
 
+    def is_running(self) -> bool:
+        """True while the background thread is alive (read by the System health view - app/diagnostics)."""
+        return self._thread is not None and self._thread.is_alive()
+
     def stop(self, timeout: float | None = 5.0) -> None:
         """Signal the background thread to stop and wait for it to exit.
         No-op if it isn't running."""

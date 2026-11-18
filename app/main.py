@@ -29,6 +29,7 @@ agent or hardware control beyond that yet - those come in later milestones.
 import logging
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel
@@ -41,11 +42,12 @@ from app.observation.defaults import (
     create_default_observation_engine,
     register_observation_tools,
 )
-from app.config import settings
+from app.config import DATA_FILE_SETTINGS, settings
 from app.context_engine.factory import create_default_context_engine
 from app.context_planning.factory import create_default_context_planner
 from app.context_reasoning.factory import create_default_context_reasoner
 from app.dashboard import DashboardSources, build_dashboard_router
+from app.diagnostics import Diagnostics
 from app.action_proposal import ActionProposalService, ExecutionHandoff, ResultReports
 from app.focus import FocusService
 from app.host_guard import LoopbackHostMiddleware
@@ -721,6 +723,46 @@ def health_check() -> dict:
     }
 
 
+# Reliability (app/diagnostics/, spec 452 / 456-458 / 460): a read-only health report over the running app's own databases, background
+# services and resources, plus verified backups (databases + identity files, never .env or the device credential) into `backups/`
+# (inside JARVIS_DATA_DIR when set; git-ignored).
+_started_at = datetime.now().astimezone()
+
+
+def _scheduler_probe(scheduler, label):
+    def probe():
+        if not settings.background_schedulers_enabled:
+            return None, "off (JARVIS_BACKGROUND_SCHEDULERS_ENABLED=false)"
+        return (True, "running") if scheduler.is_running() else (False, f"{label} is not running")
+    return probe
+
+
+def _providers_probe():
+    status = providers_status()
+    providers = status.get("providers", [])
+    usable = [p for p in providers if p.get("key_present") and p.get("key_status") != "rejected" and p.get("enabled", True)]
+    authenticated = sum(1 for p in providers if p.get("key_status") == "authenticated")
+    if not usable:
+        return False, "no AI provider has a usable key"
+    return True, f"{len(usable)} of {len(providers)} usable ({authenticated} authenticated since start)"
+
+
+diagnostics = Diagnostics(
+    databases=[(name, Path(getattr(settings, name))) for name in DATA_FILE_SETTINGS if name.endswith("_db_path")]
+    + [("world_model_db_path", Path(_WORLD_MODEL_DB_PATH))],
+    data_folder=Path(settings.data_dir or "."),
+    backup_root=Path(settings.in_data_dir("backups")),
+    services={
+        "Reminder scheduler": _scheduler_probe(reminder_scheduler, "the reminder scheduler"),
+        "Automation engine": _scheduler_probe(automation_engine, "the automation engine"),
+        "Job engine": _scheduler_probe(job_engine, "the Job engine"),
+        "AI providers": _providers_probe,
+    },
+    backup_files=[Path(settings.personality_file_path), Path(settings.user_profile_file_path)],
+    started_at=_started_at,
+)
+
+
 # The local web dashboard (app/dashboard/): Jarvis's main interface in a browser at http://127.0.0.1:8000/dashboard. It reads the SAME
 # stores built above and changes data only through the SAME ToolRegistry chat uses (`core.tools`, so each tool's permission level
 # applies); chat goes through the existing POST /chat. Loopback only, like every route (LoopbackHostMiddleware).
@@ -738,6 +780,7 @@ app.include_router(build_dashboard_router(DashboardSources(
     calendar=_calendar_provider,
     world_model=_world_model_service,
     memory_candidates=core.memory_writer.candidates_for_context,
+    diagnostics=diagnostics,
 )))
 
 

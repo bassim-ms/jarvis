@@ -165,6 +165,29 @@ a stub AI provider: chat round-trip and reload, a reminder set by chat appearing
 Job pause and its plan staying open across refreshes, every tab with seeded data, automation disable / enable, phone width
 (no sideways scrolling).
 
+## Reliability: health report and verified backups (spec 452, 456-458, 460)
+
+The dashboard's **System** tab (and `GET /api/system`) reports, read-only:
+
+* **Services** - the reminder scheduler, automation engine and Job engine (running / not running / off by setting), and whether
+  the AI provider chain has a usable key.
+* **Databases** - every Jarvis database checked with `PRAGMA quick_check` and row counts, opened read-only; a missing one is
+  "not created yet" (normal before first use), an unreadable or damaged one is a problem.
+* **Resources** - free disk space (a warning below 1 GB or 5%), database size, Jarvis's memory and threads, uptime.
+* An overall status: **failing** (a problem above), **warning** (low disk, no backup yet) or **ok**.
+
+**Back up now** writes a new folder `backups/<YYYYMMDD-HHMMSS>/` (inside `JARVIS_DATA_DIR` when set; git-ignored) with a
+consistent copy of every database (SQLite's backup API, safe while Jarvis runs), `personality.md`, `user_profile.md` and
+`BACKUP_MANIFEST.json` (each file's SHA-256, size and row counts). Every copy is integrity-checked and compared with its
+source before the backup is reported done; a backup that cannot be verified is removed and reported as failed. **Verify**
+re-checks a backup later against its manifest (present, unchanged, sound). Never in a backup: `.env` (API keys) and the device
+credential. Nothing is ever overwritten or deleted - old backups stay until you remove them.
+
+Code: `app/diagnostics/`. Tests: `tests/test_diagnostics.py` (34: sound / missing / non-database / damaged databases, the
+backup's contents and exclusions, originals untouched, same-second backups, a failed copy leaving nothing behind, tampered /
+missing / unreadable-manifest / path-escaping backups, the report's statuses, dashboard-only actions). Checked in a real
+browser against the real app in a sandbox: report, Back up now (12 files, verified), Verify.
+
 ## Portable installer (requirement 901, foundation)
 
 `Setup-Jarvis.bat` / `Start-Jarvis.bat` and `installer/jarvis_setup.py` (`check`, `init`, `keys`, `migrate`, `package`,

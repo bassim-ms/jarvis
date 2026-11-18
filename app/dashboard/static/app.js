@@ -425,11 +425,81 @@ function renderCalendar(data) {
   }
 }
 
+function megabytes(bytes) {
+  if (bytes === null || bytes === undefined) return "?";
+  const mb = bytes / 1024 / 1024;
+  if (mb >= 1024) return `${(mb / 1024).toFixed(1)} GB`;
+  return `${mb.toFixed(mb < 10 ? 1 : 0)} MB`;
+}
+
+function renderSystem(data) {
+  const status = $("system-status");
+  const findings = $("system-findings");
+  findings.replaceChildren();
+  if (!data.available) { status.textContent = "not available"; return; }
+  status.textContent = data.status;
+  status.className = `pill ${data.status === "ok" ? "completed" : data.status === "warning" ? "paused" : "failed"}`;
+  for (const problem of data.problems) findings.append(el("li", { className: "", text: `Problem: ${problem}` }));
+  for (const warning of data.warnings) findings.append(el("li", { className: "muted", text: warning }));
+
+  const services = $("service-list");
+  services.replaceChildren();
+  for (const service of data.services) {
+    const word = service.ok === true ? "ok" : service.ok === false ? "failed" : "off";
+    services.append(el("li", {}, [el("div", { className: "row" }, [el("div", { className: "grow", text: service.name }),
+      el("span", { className: `pill ${service.ok === true ? "completed" : service.ok === false ? "failed" : "disabled"}`, text: word })]),
+      el("div", { className: "sub", text: service.detail })]));
+  }
+  const r = data.resources || {};
+  const disk = r.disk ? `${megabytes(r.disk.free_bytes)} free disk (${r.disk.free_percent}%)` : "disk unknown";
+  const uptime = data.uptime_seconds === null ? "" : ` - up ${Math.floor(data.uptime_seconds / 3600)} h ${Math.floor((data.uptime_seconds % 3600) / 60)} min`;
+  $("resource-line").textContent = `${disk} - databases ${megabytes(r.databases_bytes)} - memory ${megabytes(r.process_memory_bytes)} - ${r.threads} threads${uptime} - checked ${when(data.checked_at)}`;
+
+  const databases = $("database-list");
+  databases.replaceChildren();
+  for (const db of data.databases) {
+    const word = db.ok === true ? "ok" : db.ok === false ? "failed" : "not created";
+    const sub = db.ok === true ? `${db.tables} table${db.tables === 1 ? "" : "s"}, ${db.rows} rows, ${megabytes(db.size_bytes)}` : db.detail;
+    databases.append(el("li", {}, [el("div", { className: "row" }, [el("div", { className: "grow", text: db.file }), pill(word === "ok" ? "completed" : word === "failed" ? "failed" : "pending")]),
+      el("div", { className: "sub", text: sub })]));
+  }
+  loadBackups();
+}
+
+async function loadBackups() {
+  const list = $("backup-list");
+  try {
+    const data = await api("/api/system/backups");
+    list.replaceChildren();
+    if (!data.backups.length) list.append(emptyItem("No backup yet."));
+    for (const backup of data.backups.slice(0, 10)) {
+      const result = el("div", { className: "sub" });
+      const verify = el("button", { className: "small secondary", text: "Verify", attrs: { type: "button" } });
+      verify.addEventListener("click", async () => {
+        verify.disabled = true;
+        try {
+          const report = await api(`/api/system/backups/${encodeURIComponent(backup.name)}/verify`, { method: "POST" });
+          result.textContent = report.ok ? `Verified: all ${report.files} files present, unchanged and sound.` : `NOT OK: ${report.problems.join("; ")}`;
+        } catch (error) { result.textContent = `Could not verify: ${error.message}`; }
+        verify.disabled = false;
+      });
+      list.append(el("li", {}, [
+        el("div", { className: "row" }, [el("div", { className: "grow", text: backup.created_at ? when(backup.created_at) : backup.name }), verify]),
+        el("div", { className: "sub", text: `${backup.files} files, ${megabytes(backup.size_bytes)}${backup.unreadable ? " - manifest unreadable" : ""}` }),
+        result,
+      ]));
+    }
+  } catch (error) {
+    list.replaceChildren(emptyItem(`Backups could not be listed: ${error.message}`));
+  }
+}
+
 const TAB_VIEWS = {
   projects: ["/api/world", renderWorld],
   memory: ["/api/memory", renderMemory],
   automations: ["/api/automations", renderAutomations],
   calendar: ["/api/calendar", renderCalendar],
+  system: ["/api/system", renderSystem],
 };
 const TAB_KEY = "jarvis.tab";
 let currentTab = "today";
@@ -572,6 +642,18 @@ document.addEventListener("DOMContentLoaded", () => {
   $("task-filter").addEventListener("change", refresh);
   for (const tab of document.querySelectorAll(".tab")) tab.addEventListener("click", () => showTab(tab.dataset.tab));
   $("calendar-refresh").addEventListener("click", () => loadTab("calendar", true));
+  $("backup-now").addEventListener("click", async () => {
+    const button = $("backup-now");
+    button.disabled = true;
+    try {
+      const made = await api("/api/system/backup", { method: "POST" });
+      toast(`Backed up and verified: ${made.files} files (${megabytes(made.size_bytes)}).`);
+    } catch (error) {
+      toast(error.message, true);
+    }
+    button.disabled = false;
+    loadTab("system");
+  });
   showTab(readStored(TAB_KEY) || "today");
 
   tickClock();

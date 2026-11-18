@@ -286,6 +286,10 @@ class JobEngine:
         )
         self._thread.start()
 
+    def is_running(self) -> bool:
+        """True while the background thread is alive (read by the System health view - app/diagnostics)."""
+        return self._thread is not None and self._thread.is_alive()
+
     def stop(self, timeout: float | None = 5.0) -> None:
         self._stop_event.set()
         if self._thread is not None:

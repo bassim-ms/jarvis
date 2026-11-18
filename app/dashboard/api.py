@@ -28,6 +28,7 @@ from fastapi.responses import FileResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
 from app.calendar.base import CalendarProviderError
+from app.diagnostics.backup import BackupError
 from app.memory.base import MemoryStore
 from app.orchestration.interactions import InteractionStore
 from app.reminders.base import ReminderStatus, ReminderStore
@@ -101,6 +102,7 @@ class DashboardSources:
     calendar: Any = None  # CalendarProvider: .list_events(time_min, time_max, max_results)
     world_model: Any = None  # WorldModelService (its .store lists every entity)
     memory_candidates: Callable[[], list] | None = None  # MemoryWriteService.candidates_for_context - staged, unconfirmed
+    diagnostics: Any = None  # app.diagnostics.Diagnostics - health report, verified backups (spec 452, 456-458, 460)
 
 
 class NewTask(BaseModel):
@@ -490,6 +492,39 @@ def build_dashboard_router(sources: DashboardSources) -> APIRouter:
                 for e in sources.world_model.get_upcoming_events(after=now)[:MAX_EVENTS]
             ],
         }
+
+    # --- System: health report and verified backups (app/diagnostics) ----------------------------------------------------
+
+    def _diagnostics():
+        if sources.diagnostics is None:
+            raise HTTPException(status_code=404, detail="diagnostics are not available")
+        return sources.diagnostics
+
+    @router.get("/api/system")
+    def system_report() -> dict:
+        if sources.diagnostics is None:
+            return {"available": False}
+        return {"available": True, **sources.diagnostics.report()}
+
+    @router.get("/api/system/backups")
+    def system_backups() -> dict:
+        return {"backups": _diagnostics().backups()}
+
+    @router.post("/api/system/backup", dependencies=[Depends(require_dashboard_request)])
+    def system_backup(body: TaskAction | None = None) -> dict:
+        try:
+            return _diagnostics().backup()
+        except BackupError as exc:
+            raise HTTPException(status_code=500, detail=f"The backup failed and was not kept: {exc}")
+
+    @router.post("/api/system/backups/{name}/verify", dependencies=[Depends(require_dashboard_request)])
+    def system_verify(name: str, body: TaskAction | None = None) -> dict:
+        try:
+            return _diagnostics().verify(name)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="not a backup name")
+        except FileNotFoundError:
+            raise HTTPException(status_code=404, detail="no such backup")
 
     @router.get("/api/conversations/{conversation_id}/messages")
     def conversation_messages(conversation_id: str) -> dict:

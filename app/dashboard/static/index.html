@@ -34,6 +34,7 @@
         <button type="button" role="tab" class="tab" data-tab="memory" aria-selected="false">Memory</button>
         <button type="button" role="tab" class="tab" data-tab="automations" aria-selected="false">Automations</button>
         <button type="button" role="tab" class="tab" data-tab="calendar" aria-selected="false">Calendar</button>
+        <button type="button" role="tab" class="tab" data-tab="system" aria-selected="false">System</button>
       </nav>
 
       <div class="tab-panel" data-panel="today">
@@ -125,6 +126,27 @@
         <section class="card" aria-label="Automations">
           <div class="card-head"><h2>Automations</h2><span class="badge" id="automation-count">0</span></div>
           <ul class="list" id="automation-list"></ul>
+        </section>
+      </div>
+
+      <div class="tab-panel" data-panel="system" hidden>
+        <section class="card" aria-label="System health">
+          <div class="card-head"><h2>Health</h2><span class="pill" id="system-status">-</span></div>
+          <ul class="list" id="system-findings"></ul>
+          <ul class="list" id="service-list"></ul>
+          <div class="sub" id="resource-line"></div>
+        </section>
+        <section class="card" aria-label="Databases">
+          <div class="card-head"><h2>Databases</h2></div>
+          <ul class="list" id="database-list"></ul>
+        </section>
+        <section class="card" aria-label="Backups">
+          <div class="card-head">
+            <h2>Backups</h2>
+            <button type="button" class="small" id="backup-now">Back up now</button>
+          </div>
+          <p class="hint">Databases, personality.md and user_profile.md - verified copies. Your API keys (.env) and the device credential are never backed up.</p>
+          <ul class="list" id="backup-list"></ul>
         </section>
       </div>
 
