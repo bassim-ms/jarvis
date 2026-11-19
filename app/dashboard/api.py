@@ -106,6 +106,9 @@ class DashboardSources:
     # The memory write policy (MemoryWriteService): the ONLY way the dashboard changes memory - list what is kept with its
     # provenance, and forget one exact item in two confirmed steps (spec 93, 104). The dashboard never deletes memory itself.
     memory_policy: Any = None
+    # Remote access (app/remote/api.py RemoteAccess): status, connected devices and sessions; end a session or revoke a
+    # device. The dashboard never registers or trusts a device - that is the local admin command's alone.
+    remote: Any = None
 
 
 class NewTask(BaseModel):
@@ -560,6 +563,34 @@ def build_dashboard_router(sources: DashboardSources) -> APIRouter:
             raise HTTPException(status_code=400, detail="not a backup name")
         except FileNotFoundError:
             raise HTTPException(status_code=404, detail="no such backup")
+
+    # --- Remote access: status, devices, sessions; revoke (local dashboard only) --------------------------------------
+
+    def _remote():
+        if sources.remote is None:
+            raise HTTPException(status_code=404, detail="remote access is not available")
+        return sources.remote
+
+    @router.get("/api/remote")
+    def remote_overview() -> dict:
+        if sources.remote is None:
+            return {"available": False}
+        return {"available": True, **sources.remote.overview()}
+
+    @router.post("/api/remote/sessions/{session_id}/end", dependencies=[Depends(require_dashboard_request)])
+    def remote_end_session(session_id: str, body: TaskAction | None = None) -> dict:
+        if not _remote().end_session(session_id):
+            raise HTTPException(status_code=404, detail="no such session")
+        return {"message": "Session ended. The device must open a new session to continue."}
+
+    @router.post("/api/remote/devices/{device_id}/revoke", dependencies=[Depends(require_dashboard_request)])
+    def remote_revoke_device(device_id: str, body: TaskAction | None = None) -> dict:
+        try:
+            result = _remote().revoke_device(device_id)
+        except Exception as exc:  # DeviceError: unknown device or already revoked
+            raise HTTPException(status_code=400, detail=str(exc) or "cannot revoke that device")
+        return {"message": f"Revoked {result['name']}: it can never connect again ({result['sessions_ended']} session(s) ended).",
+                **result}
 
     @router.get("/api/conversations/{conversation_id}/messages")
     def conversation_messages(conversation_id: str) -> dict:

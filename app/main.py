@@ -48,6 +48,7 @@ from app.context_planning.factory import create_default_context_planner
 from app.context_reasoning.factory import create_default_context_reasoner
 from app.dashboard import DashboardSources, build_dashboard_router
 from app.diagnostics import Diagnostics
+from app.remote.api import RemoteAccess, build_remote_router, parse_remote_hosts
 from app.action_proposal import ActionProposalService, ExecutionHandoff, ResultReports
 from app.focus import FocusService
 from app.host_guard import LoopbackHostMiddleware
@@ -330,6 +331,18 @@ register_memory_tools(core.tools, core.memory_writer)
 # policy's); registering and trusting a device happen only in the admin command (python -m app.devices.admin).
 _device_registry = DeviceRegistry(SQLiteDeviceStore.for_job_store(_job_store))
 device_gateway = DeviceGateway(_device_registry)
+
+# Remote access (app/remote/): OFF by default. Sessions for devices that are registered AND trusted with the local admin
+# command, signed requests (replay / tamper / expiry checked), trust re-checked on every request. Reached only through an
+# outbound-only encrypted tunnel to a configured private host name - never a forwarded port - and only on /remote/...
+remote_access = RemoteAccess(
+    gateway=device_gateway,
+    registry=_device_registry,
+    enabled=lambda: settings.remote_access_enabled,
+    hosts=lambda: parse_remote_hosts(settings.remote_access_hosts) if settings.remote_access_enabled else frozenset(),
+    session_ttl=timedelta(hours=max(0.05, settings.remote_session_hours)),
+    max_sessions_per_device=settings.remote_max_sessions_per_device,
+)
 device_operations = DeviceOperations(
     _device_registry,
     DeviceRevocationConfirmer(_interaction_store, mark_surfaced=core.interaction_resolver.mark_surfaced),
@@ -633,7 +646,7 @@ app = FastAPI(title=settings.app_name, lifespan=_lifespan)
 # route to the anonymous /chat. It is an ADDITIONAL safeguard only: the server must still be bound to the loopback interface
 # (`uvicorn app.main:app --host 127.0.0.1`; the unused `host` default in config.py is not what binds it) and anything that needs trust still needs
 # authentication (/device/chat).
-app.add_middleware(LoopbackHostMiddleware)
+app.add_middleware(LoopbackHostMiddleware, remote_hosts=remote_access.hosts)
 
 @app.get("/dev/ping")
 def dev_ping() -> str:
@@ -782,6 +795,7 @@ app.include_router(build_dashboard_router(DashboardSources(
     memory_candidates=core.memory_writer.candidates_for_context,
     diagnostics=diagnostics,
     memory_policy=core.memory_writer,
+    remote=remote_access,
 )))
 
 
@@ -899,3 +913,12 @@ def _chat(request: ChatRequest, device: DeviceContext | None) -> ChatResponse:
         ],
         job_id=job_id,
     )
+
+
+def _remote_chat(message: str, conversation_id: str | None, device: DeviceContext) -> dict:
+    """A remote device's chat: exactly the /device/chat path (the Gateway-authenticated DeviceContext, the same core, tools,
+    permission levels and confirmation rules)."""
+    return _chat(ChatRequest(message=message, conversation_id=conversation_id), device).model_dump()
+
+
+app.include_router(build_remote_router(remote_access, _remote_chat))

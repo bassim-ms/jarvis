@@ -37,6 +37,15 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8000
 
+    # Remote access (app/remote) - OFF by default. When on, requests addressed to one of `remote_access_hosts` (your computer's
+    # private tailnet name, e.g. "jarvis-pc.tail1234.ts.net", reached through an outbound-only encrypted tunnel such as
+    # `tailscale serve` - never a forwarded router port) may reach /remote/... only, from devices registered AND trusted with
+    # the local admin command. Every other route stays loopback-only.
+    remote_access_enabled: bool = False
+    remote_access_hosts: str = ""
+    remote_session_hours: float = 12.0
+    remote_max_sessions_per_device: int = 5
+
     # Gemini (AI provider)
     gemini_api_key: str = ""
     gemini_model: str = "gemini-3.8-flash"

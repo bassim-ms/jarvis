@@ -165,6 +165,46 @@ a stub AI provider: chat round-trip and reload, a reminder set by chat appearing
 Job pause and its plan staying open across refreshes, every tab with seeded data, automation disable / enable, phone width
 (no sideways scrolling).
 
+## Remote access (off by default)
+
+Reach your Jarvis from your own, explicitly approved devices **without opening a router port** and without exposing this
+computer to the internet. Jarvis keeps listening on 127.0.0.1 only; the remote path is an encrypted, outbound-only private
+network to this computer's private name, and only the remote API (`/remote/...`) answers there. The dashboard, the anonymous
+`/chat`, `/providers/status`, `/dev` and the API docs stay loopback-only.
+
+**Not yet tested from a genuinely separate device or through a real tunnel** - everything below is tested in-process and
+against the real app on this laptop over loopback (see Tests).
+
+To turn it on (your steps - nothing here installs software or changes your network):
+
+1. Install **Tailscale** (free personal plan) on this computer and the other device, signed in to the same account. Then on
+   this computer: `tailscale serve --bg 8000` - HTTPS on the computer's private tailnet name (e.g.
+   `jarvis-pc.tail1234.ts.net`), reachable only by devices in YOUR tailnet. Do **not** use `tailscale funnel` (that is public).
+2. In `.env`: `JARVIS_REMOTE_ACCESS_ENABLED=true` and `JARVIS_REMOTE_ACCESS_HOSTS=jarvis-pc.tail1234.ts.net`; restart Jarvis.
+3. Approve the device on THIS computer (the only way a device is ever approved):
+   `python -m app.devices.admin register --name "My laptop" --type computer --credential-file laptop.cred`, then
+   `python -m app.devices.admin trust "My laptop"`. Move `laptop.cred` to that device over a channel you trust; keep it private.
+4. On that device (Python 3.11+, only `app/remote/client.py` and `app/remote/signing.py` are needed):
+   `python -m app.remote.client --url https://jarvis-pc.tail1234.ts.net --credential-file laptop.cred chat "hello"`.
+
+How it is protected:
+
+* **Devices** - registered and trusted only with the local admin command (the app never registers or trusts a device); the
+  credential is stored only as a hash. **Revoke** on the dashboard's Remote tab (or `admin revoke`) is immediate and final.
+* **Sessions** - the credential is used once to open a session (12 h, `JARVIS_REMOTE_SESSION_HOURS`; at most 5 per device;
+  in memory only, so a restart ends them all). After that every request is **signed** with the session key (HMAC-SHA256 over
+  method, path, timestamp, nonce and body): a captured request cannot be **replayed** (nonce remembered, timestamp must be
+  within 60 s), **changed** (signature), or used by someone holding only the session id (the key never travels again). The
+  device's trust is re-checked on every request.
+* **Permissions** - a remote message takes exactly the `/device/chat` path: READ and SAFE_ACTION tools run; CONFIRM and
+  DANGEROUS are never executed from chat (they come back as "confirmation required") - tested for every level.
+* Every authentication failure is the same `401 remote authentication failed`; nothing says why.
+* **Reconnection** - the client re-opens an expired session once, and retries a lost request with the same request id, so
+  Jarvis answers it once, never twice.
+
+Dashboard **Remote** tab: on / off, the allowed host, devices (trust, online, last seen), each live session (last used,
+requests, expiry) with **End**, and **Revoke**. Code: `app/remote/`. Tests: `tests/test_remote_access.py` (74).
+
 ## Memory you control: what is kept, where it came from, and forgetting one item (spec 93, 104)
 
 The dashboard's **Memory** tab lists **what you told Jarvis to keep** - preferences, notes and your date of birth, worded the way

@@ -35,6 +35,8 @@ _PORT = re.compile(r"[0-9]{1,5}")
 _FORBIDDEN = frozenset(" \t\r\n\x00\\/@?#%")
 _IPV6_LOOPBACK = ipaddress.IPv6Address("::1")
 MAX_HOST_CHARS = 255
+#: The only path prefix a remote (non-loopback, configured) host may reach - see LoopbackHostMiddleware.remote_hosts.
+REMOTE_PREFIX = "/remote/"
 
 
 def _port_ok(port: str) -> bool:
@@ -77,8 +79,26 @@ def is_loopback_host(value: object) -> bool:
 class LoopbackHostMiddleware:
     """Pure ASGI middleware: HTTP and WebSocket requests without exactly one loopback Host header are refused (HTTP 403 / WebSocket close)."""
 
-    def __init__(self, app):
+    def __init__(self, app, remote_hosts=None):
         self.app = app
+        # Remote access (app/remote): a callable returning the host names remote requests may be addressed to - EMPTY while
+        # remote access is off (the default). Such a host is let through ONLY for an HTTP request under /remote/; every other
+        # route (the dashboard, the anonymous /chat, /providers/status, /dev, the docs) stays loopback-only.
+        self.remote_hosts = remote_hosts
+
+    def _remote_allowed(self, scope, host: str) -> bool:
+        if self.remote_hosts is None or scope["type"] != "http":
+            return False
+        path = scope.get("path", "")
+        if not path.startswith(REMOTE_PREFIX) or ".." in path:
+            return False
+        name = host.lower().rstrip(".")
+        name = name.rsplit(":", 1)[0] if name.count(":") == 1 and _port_ok(name.rsplit(":", 1)[1]) else name
+        try:
+            allowed = self.remote_hosts()
+        except Exception:  # noqa: BLE001 - a broken setting means "not allowed", never "allowed"
+            return False
+        return bool(allowed) and name in allowed
 
     async def __call__(self, scope, receive, send):
         if scope["type"] not in ("http", "websocket"):
@@ -86,7 +106,7 @@ class LoopbackHostMiddleware:
             return
         hosts = [value for name, value in scope.get("headers", []) if name.lower() == b"host"]
         host = hosts[0].decode("latin-1") if len(hosts) == 1 else None
-        if host is not None and is_loopback_host(host):
+        if host is not None and (is_loopback_host(host) or self._remote_allowed(scope, host)):
             await self.app(scope, receive, send)
             return
         shown = "(missing or repeated)" if host is None else repr(host[:80])

@@ -87,7 +87,7 @@ recording directly lose no count. The provider order is unchanged.
 | 460 | Reliability reporting | Partial | one report with an overall ok / warning / failing status and its reasons. Not yet a report over time |
 | 453 | Failure alerts | Planned | the report shows problems when looked at; nothing notifies yet |
 
-## Batch 6 - memory you control (2026-11-18)
+## Batch 6 - memory you control (2026-11-18, commit 0812e7e)
 
 | Spec # | Feature | Status | Evidence |
 |---|---|---|---|
@@ -95,6 +95,18 @@ recording directly lose no count. The provider order is unchanged.
 | 93 | Memory provenance | Done (view) | each kept item shown with its wording, stored value, origin ("you asked me to remember it" / "you told me"), action and time from the audit journal; the journal itself as "Recent memory changes" - tests; browser-checked |
 | 469 | Memory browser | Done | (batch 3) now shows the policy's view - kept items with provenance, unconfirmed candidates, history |
 | - | Forgetting leaves no trace of the content | Done | a forgotten item's content-derived key is replaced by an opaque reference in the journal and its staged candidate is deleted (chat and dashboard) - tests check nothing on disk still names it. Items forgotten before this change keep their old key |
+
+## Batch 7 - secure remote access (2026-11-19)
+
+No numbered spec feature is "remote access" itself; it is the original brief's major requirement and the base of these:
+
+| Spec # | Feature | Status | Evidence |
+|---|---|---|---|
+| 722 | Phone-to-PC communication | Partial | a separate device talks to this PC over the remote API with signed, replay-proof sessions (`app/remote/`, client `python -m app.remote.client`) - `tests/test_remote_access.py` (74) in-process, plus the real client against the real app over loopback in a sandbox. NOT yet tested from a genuinely separate device or through a real tunnel; no phone app yet |
+| 728 | Unified device identity | Partial | remote devices are the existing registered devices (one registry, one gateway); trust re-checked on every request |
+| 894 | One permission system across devices | Partial | a remote message takes exactly the /device/chat path: READ / SAFE_ACTION run, CONFIRM / DANGEROUS never execute from chat - tested per level against the real app |
+| - | Revocable devices and sessions | Done | dashboard Remote tab: sessions with End, devices with Revoke (immediate, final); admin-command revocation also stops live sessions - tests; browser-checked (revoked device then refused) |
+| - | Off by default, loopback-only otherwise | Done | `JARVIS_REMOTE_ACCESS_ENABLED=false`; a configured private host reaches /remote/ only - tests for every other route |
 
 ## Next batches
 

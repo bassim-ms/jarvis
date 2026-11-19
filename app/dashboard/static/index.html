@@ -35,6 +35,7 @@
         <button type="button" role="tab" class="tab" data-tab="automations" aria-selected="false">Automations</button>
         <button type="button" role="tab" class="tab" data-tab="calendar" aria-selected="false">Calendar</button>
         <button type="button" role="tab" class="tab" data-tab="system" aria-selected="false">System</button>
+        <button type="button" role="tab" class="tab" data-tab="remote" aria-selected="false">Remote</button>
       </nav>
 
       <div class="tab-panel" data-panel="today">
@@ -148,6 +149,18 @@
           </div>
           <p class="hint">Databases, personality.md and user_profile.md - verified copies. Your API keys (.env) and the device credential are never backed up.</p>
           <ul class="list" id="backup-list"></ul>
+        </section>
+      </div>
+
+      <div class="tab-panel" data-panel="remote" hidden>
+        <section class="card" aria-label="Remote access">
+          <div class="card-head"><h2>Remote access</h2><span class="pill" id="remote-state">-</span></div>
+          <div class="sub" id="remote-detail"></div>
+          <p class="hint">Devices are added and approved only on this computer: <code>python -m app.devices.admin register --name NAME --type laptop --credential-file FILE</code>, then <code>trust NAME</code>. No router port is ever opened: remote access goes through an encrypted private network (e.g. Tailscale) to this computer's private name.</p>
+        </section>
+        <section class="card" aria-label="Devices">
+          <div class="card-head"><h2>Devices</h2><span class="badge" id="remote-session-count">0</span></div>
+          <ul class="list" id="remote-devices"></ul>
         </section>
       </div>
 

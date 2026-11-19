@@ -59,6 +59,17 @@ class DeviceGateway:
             self._fail(f"device is {device.trust_state.value}", device_id)
         return self._context(self.registry.view(device))
 
+    def session_context(self, device_id: object) -> DeviceContext:
+        """The context for a device whose remote SESSION signature was just verified (app/remote). A session exists only
+        because this gateway authenticated the device's credential when it was created; the device's trust is re-read here
+        on EVERY request, so revoking a device stops its sessions at once. Anything but a TRUSTED device fails."""
+        if not isinstance(device_id, str) or not device_id or len(device_id) > MAX_ID_CHARS:
+            self._fail("malformed", None)
+        device = self.registry.get(device_id)
+        if device is None or device.trust_state is not TrustState.TRUSTED:
+            self._fail("session for a device that is not trusted", device_id)
+        return self._context(self.registry.view(device))
+
     def check_in(self, device_id: object, credential: object) -> Device:
         """An authenticated "I am alive": ONLINE, last_seen = now. No background process is involved."""
         context = self.authenticate(device_id, credential)

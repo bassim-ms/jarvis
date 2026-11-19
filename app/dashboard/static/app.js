@@ -527,12 +527,46 @@ async function loadBackups() {
   }
 }
 
+function renderRemote(data) {
+  const state = $("remote-state");
+  const detail = $("remote-detail");
+  const list = $("remote-devices");
+  list.replaceChildren();
+  if (!data.available) { state.textContent = "not available"; return; }
+  state.textContent = data.enabled ? "on" : "off";
+  state.className = `pill ${data.enabled ? "running" : "disabled"}`;
+  detail.textContent = data.enabled
+    ? `Reachable only at ${data.hosts.join(", ") || "(no host configured - nothing can reach it remotely)"} and only on /remote/. Sessions last ${data.session_hours} h. ${data.active_sessions} active session(s).`
+    : "Off (the default). Nothing outside this computer can reach Jarvis. To turn it on, see README: Remote access.";
+  $("remote-session-count").textContent = String(data.active_sessions);
+  if (!data.devices.length) list.append(emptyItem("No devices registered."));
+  for (const device of data.devices) {
+    const actions = el("div", { className: "actions" });
+    if (device.trust !== "revoked") {
+      actions.append(actionButton("Revoke", `/api/remote/devices/${encodeURIComponent(device.device_id)}/revoke`,
+        { style: "danger", confirm: `Revoke "${device.name}"? It will be disconnected now and can never connect again (register it anew to bring it back).` }));
+    }
+    const sessions = el("ul", { className: "goals" });
+    for (const session of device.sessions) {
+      const end = actionButton("End", `/api/remote/sessions/${encodeURIComponent(session.session_id)}/end`, { style: "secondary", confirm: "End this session now?" });
+      sessions.append(el("li", {}, [el("div", { className: "row" }, [
+        el("div", { className: "grow sub", text: `session ${session.session} - last used ${when(session.last_used)}, ${session.requests} requests, until ${when(session.expires_at)}` }), end])]));
+    }
+    list.append(el("li", {}, [
+      el("div", { className: "row" }, [el("div", { className: "grow", text: device.name }), pill(device.trust), actions]),
+      el("div", { className: "sub", text: `${device.type} - ${device.status}${device.last_seen ? " - last seen " + when(device.last_seen) : ""}` }),
+      device.sessions.length ? sessions : null,
+    ]));
+  }
+}
+
 const TAB_VIEWS = {
   projects: ["/api/world", renderWorld],
   memory: ["/api/memory", renderMemory],
   automations: ["/api/automations", renderAutomations],
   calendar: ["/api/calendar", renderCalendar],
   system: ["/api/system", renderSystem],
+  remote: ["/api/remote", renderRemote],
 };
 const TAB_KEY = "jarvis.tab";
 let currentTab = "today";
