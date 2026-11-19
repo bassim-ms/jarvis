@@ -893,7 +893,12 @@ def test_no_log_record_of_any_logger_carries_a_value_a_digest_a_key_or_a_length(
     with pytest.raises(ComputerControlError):
         backend.move_mouse(777, 513)  # switched off
     registry_text = "\n".join(f"{r.name} {r.getMessage()} | {r.msg} | {r.args!r} | {r.exc_text or ''} | {r.exc_info!r}" for r in caplog.records)
-    everything = registry_text + repr(grant) + repr(backend.gate) + str(vars(caplog.records[0]))
+    # Every field of a record EXCEPT the numbers the OS / logging assign on their own (process and thread ids, timestamps,
+    # line numbers): those carry no value from the steps, but a process id like 12348 contains "1234" and failed this test
+    # by chance. Everything that can carry content - message, args, name, path, function, exception - is still scanned.
+    _ASSIGNED = {"process", "thread", "created", "msecs", "relativeCreated", "lineno", "taskName"}
+    record_fields = str({key: value for key, value in vars(caplog.records[0]).items() if key not in _ASSIGNED})
+    everything = registry_text + repr(grant) + repr(backend.gate) + record_fields
 
     macs = [grant._mac(step.canonical()).hex() for step in steps]
     assert any("grant issued" in r.getMessage() for r in caplog.records) and any("action=type_text" in r.getMessage() for r in caplog.records)
